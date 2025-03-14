@@ -1,6 +1,9 @@
-import tempfile
-import sys
 import os
+import re
+import pytest
+import sys
+import tempfile
+import warnings
 import ubelt as ub
 
 
@@ -130,6 +133,41 @@ def test_duplicate_function_autoprofile():
     assert 'Function: func4' in raw_output
 
     temp_dpath.delete()
+
+
+def test_ast_profle_transformer_deprecation():
+    """
+    Test that `line_profiler.autoprofile.ast_profle_transformer`
+    properly aliases to
+    `line_profiler.autoprofile.ast_profile_transformer` with
+    `DeprecationWarning`s.
+    """
+
+    from line_profiler.autoprofile import ast_profile_transformer as new
+
+    old_name = 'line_profiler.autoprofile.ast_profle_transformer'
+    new_name = 'line_profiler.autoprofile.ast_profile_transformer'
+    warning_msg = (f'`{old_name}.{{0}}` is deprecated; use '
+                   f'`{new_name}.{{0}}` instead').format
+    # 1. Test direct import
+    with pytest.warns(DeprecationWarning,
+                      match=re.escape(warning_msg('AstProfileTransformer'))):
+        from line_profiler.autoprofile.ast_profle_transformer import AstProfileTransformer
+        assert AstProfileTransformer is new.AstProfileTransformer
+    # 2. Test attribute access post-import
+    with pytest.warns(DeprecationWarning,
+                      match=re.escape(warning_msg('ast_create_profile_node'))):
+        from line_profiler.autoprofile import ast_profle_transformer as old
+        assert old.ast_create_profile_node is new.ast_create_profile_node
+    # 3. Test that `.__getattr__()` (and thus the `DeprecationWarning`)
+    # is not invoked the second time, due to how the name has already
+    # been added to the namespace
+    assert 'AstProfileTransformer' in vars(old)
+    with warnings.catch_warnings():
+        warnings.filterwarnings('error',
+                                re.escape(warning_msg('AstProfileTransformer')),
+                                DeprecationWarning)
+        assert old.AstProfileTransformer is new.AstProfileTransformer
 
 
 def _write_demo_module(temp_dpath):
