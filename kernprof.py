@@ -51,12 +51,12 @@ which displays:
 
 .. code::
 
-    usage: kernprof [-h] [-V] [-l] [-b] [-o OUTFILE] [-s SETUP] [-v] [-r] [-u UNIT] [-z] [-i [OUTPUT_INTERVAL]] [-p PROF_MOD] [-m] [--prof-imports] script ...
+    usage: kernprof [-h] [-V] [-l] [-b] [-o OUTFILE] [-s SETUP] [-v] [-r] [-u UNIT] [-z] [-i [OUTPUT_INTERVAL]] [-p PROF_MOD] [-c | -m] [--prof-imports] script ...
 
     Run and profile a python script.
 
     positional arguments:
-      script                The python script file to run
+      script                The python script file to run (pass '-' to read from stdin into a temporary file, which is then added to `-p` and profiled)
       args                  Optional script arguments
 
     options:
@@ -77,7 +77,8 @@ which displays:
       -p PROF_MOD, --prof-mod PROF_MOD
                             List of modules, functions and/or classes to profile specified by their name or path. List is comma separated, adding the current script path profiles
                             full script. Only works with line_profiler -l, --line-by-line
-      -m, --module          Treat `script` as a Python module, running it like `python -m script` (implies `-p script` if `-p` is not otherwise supplied)
+      -c, --command         Treat `script` as a literal python script, running it like `python -c script` (the script is written to a temporary file, which is then added to `-p` and profiled)
+      -m, --module          Treat `script` as a Python module, running it like `python -m script` (implies `-p script` if `-p` is not otherwise provided)
       --prof-imports        If specified, modules specified to `--prof-mod` will also autoprofile modules that they import. Only works with line_profiler -l, --line-by-line
 """
 import builtins
@@ -293,12 +294,10 @@ def _python_command():
     Return a command that corresponds to :py:obj:`sys.executable`.
     """
     import shutil
-    if shutil.which('python') == sys.executable:
-        return 'python'
-    elif shutil.which('python3') == sys.executable:
-        return 'python3'
-    else:
-        return sys.executable
+    for abbr in 'python', 'python3':
+        if os.path.samefile(shutil.which(abbr), sys.executable):
+            return abbr
+    return sys.executable
 
 
 def main(args=None):
@@ -340,19 +339,74 @@ def main(args=None):
                         help="List of modules, functions and/or classes to profile specified by their name or path. "
                         "List is comma separated, adding the current script path profiles full script. "
                         "Only works with line_profiler -l, --line-by-line")
-    parser.add_argument('-m', '--module', action='store_true',
-                        help="Treat `script` as a Python module, running it like "
-                        "`python -m script` "
-                        "(implies `-p script` if `-p` is not otherwise provided)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-c', '--command', action='store_true',
+                       help="Treat `script` as a literal python script, running it like "
+                       "`python -c script` "
+                       "(the script is written to a temporary file, which is "
+                       "then added to `-p` and profiled)")
+    group.add_argument('-m', '--module', action='store_true',
+                       help="Treat `script` as a Python module, running it like "
+                       "`python -m script` "
+                       "(implies `-p script` if `-p` is not otherwise provided)")
     parser.add_argument('--prof-imports', action='store_true',
                         help="If specified, modules specified to `--prof-mod` will also autoprofile modules that they import. "
                         "Only works with line_profiler -l, --line-by-line")
 
-    parser.add_argument('script', help='The python script file to run')
+    parser.add_argument('script',
+                        help="The python script file to run "
+                        "(pass '-' to read from stdin into a temporary file, "
+                        "which is then added to `-p` and profiled)")
     parser.add_argument('args', nargs='...', help='Optional script arguments')
 
     options = parser.parse_args(args)
+    tempfile_source_and_content = None
+    if options.command:
+        tempfile_source_and_content = 'command', options.script
+    elif options.script == '-' and not options.module:
+        tempfile_source_and_content = 'stdin', sys.stdin.read()
 
+    if not tempfile_source_and_content:
+        return _main(options)
+
+    # Importing `ast` is IIRC somewhat expensive, so don't do that if we
+    # don't have to
+    import ast
+    import tempfile
+
+    source, content = tempfile_source_and_content
+    file_prefix = f'kernprof-{source}-'
+    with tempfile.NamedTemporaryFile(mode='w',
+                                     prefix=file_prefix,
+                                     suffix='.py') as fobj:
+        # Set up the script to be run
+        try:
+            content = ast.unparse(ast.parse(content))
+        except (
+                # `ast.unparse()` unavailable in Python < 3.9
+                AttributeError,
+                # Big module - shouldn't happen since the script should
+                # just be one inline thing (except when reading from
+                # stdin), which can't be all that complicated
+                RecursionError):
+            pass
+        print(content, file=fobj, flush=True)
+        options.script = fobj.name
+        # Add the tempfile to `--prof-mod`
+        if options.prof_mod:
+            options.prof_mod += ',' + fobj.name
+        else:
+            options.prof_mod = fobj.name
+        # Set the output file to somewhere nicer (also take care of
+        # possible filename clash)
+        if not options.outfile:
+            _, options.outfile = tempfile.mkstemp(dir=os.curdir,
+                                                  prefix=file_prefix,
+                                                  suffix='.lprof')
+        return _main(options)
+
+
+def _main(options):
     if not options.outfile:
         extension = 'lprof' if options.line_by_line else 'prof'
         options.outfile = '%s.%s' % (os.path.basename(options.script), extension)

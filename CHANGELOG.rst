@@ -6,7 +6,7 @@ Changes
 * FIX: win32 encoding issues
 * ENH: Add support for ``sys.monitoring`` (Python >= 3.12)
 * FIX: Fixed issue when calling ``kernprof`` with neither the ``-l`` nor ``-b`` flag
-* ENH: Added CLI argument ``-m`` to ``kernprof`` for (auto-)profiling module/package execution instead of that of scripts.
+* ENH: Added CLI arguments ``-m`` and ``-c`` to ``kernprof`` for (auto-)profiling module/package/inline-script execution instead of that of script files; passing ``'-'`` as the script-file name now also reads from and profiles ``stdin``
 
 4.2.0
 ~~~~~
