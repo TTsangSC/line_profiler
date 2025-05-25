@@ -15,6 +15,7 @@ Changes
 * ENH: In Python >=3.11, profiled objects are reported using their qualified name.
 * ENH: Highlight final summary using rich if enabled
 * ENH: Made it possible to use multiple profiler instances simultaneously
+* FIX: ``LineProfiler`` now caches the existing ``sys`` trace callback in ``.enable()`` and restores it in ``.disable()``, instead of always discarding it on the way out; also added experimental support for calling (instead of suspending) said callback during profiling #333
 
 4.2.0
 ~~~~~
