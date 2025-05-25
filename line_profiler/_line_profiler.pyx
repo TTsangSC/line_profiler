@@ -235,7 +235,7 @@ list[tuple[int, int, int]]]):
         self.unit = unit
 
 
-cdef class ThreadState:
+cdef class _ThreadState:
     """
     Helper object for holding the thread-local state; documentations are
     for reference only, and all APIs are to be considered private and
@@ -243,7 +243,7 @@ cdef class ThreadState:
     """
     cdef TraceCallback *callback
     cdef public object active_instances  # type: set[LineProfiler]
-    cdef public int _wrap_trace
+    cdef int _wrap_trace
 
     def __init__(self, instances=(), wrap_trace=False):
         self.active_instances = set(instances)
@@ -382,7 +382,7 @@ cdef class LineProfiler:
     cdef public object threaddata
 
     # This is shared between instances and threads
-    _all_thread_states = {}  # type: dict[int, ThreadState]
+    _all_thread_states = {}  # type: dict[int, _ThreadState]
 
     def __init__(self, *functions, wrap_trace=None):
         self.functions = []
@@ -469,12 +469,17 @@ cdef class LineProfiler:
             self.threaddata.enable_count = value
 
     # These two are shared between instances, but thread-local
+    # (Ideally speaking they could've been class attributes...)
 
     property wrap_trace:
         def __get__(self):
             return self._thread_state.wrap_trace
         def __set__(self, wrap_trace):
-            self._thread_state.wrap_trace = wrap_trace
+            # Make sure we have a thread state
+            state = self._thread_state
+            # Sync values between all thread states
+            for state in self._all_thread_states.values():
+                state.wrap_trace = wrap_trace
 
     property _thread_state:
         def __get__(self):
@@ -483,16 +488,23 @@ cdef class LineProfiler:
                 return self._all_thread_states[thread_id]
             except KeyError:
                 pass
+            # First profiler instance on the thread, get the correct
+            # `wrap_trace` value and set up a `_ThreadState`
+            try:
+                state, *_ = self._all_thread_states.values()
+            except ValueError:
+                # First thread in the interpretor: load default
+                # `wrap_trace` value from the environment
+                # (TODO: migrate to `line_profiler.cli_utils.boolean()`
+                # after merging #335)
+                from os import environ
 
-            # First instance, load default `wrap_trace` value from the
-            # environment
-            # (TODO: migrate to `line_profiler.cli_utils.boolean()`
-            # after merging #335)
-            from os import environ
-
-            env = environ.get('LINE_PROFILE_WRAP_TRACE', '').lower()
-            wrap_trace = env not in {'', '0', 'off', 'false', 'no'}
-            self._all_thread_states[thread_id] = state = ThreadState(
+                env = environ.get('LINE_PROFILE_WRAP_TRACE', '').lower()
+                wrap_trace = env not in {'', '0', 'off', 'false', 'no'}
+            else:
+                # Fetch the `.wrap_trace` value from an existing state
+                wrap_trace = state.wrap_trace
+            self._all_thread_states[thread_id] = state = _ThreadState(
                 wrap_trace=wrap_trace)
             return state
 
@@ -633,7 +645,7 @@ cdef extern int python_trace_callback(object state_,
        https://github.com/python/cpython/blob/de2a4036/Include/cpython/\
 pystate.h#L16
     """
-    cdef ThreadState state
+    cdef _ThreadState state
     cdef object prof_
     cdef LineProfiler prof
     cdef LastTime old
@@ -645,7 +657,7 @@ pystate.h#L16
     cdef unordered_map[int64, LineTime] line_entries
     cdef uint64 linenum
 
-    state = <ThreadState>state_
+    state = <_ThreadState>state_
 
     if what == PyTrace_LINE or what == PyTrace_RETURN:
         # Normally we'd need to DECREF the return from get_frame_code,
