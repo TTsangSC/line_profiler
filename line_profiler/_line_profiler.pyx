@@ -152,16 +152,18 @@ else:
 
 def label(code):
     """
-    Return a (filename, first_lineno, _name) tuple for a given code object.
+    Return a ``(filename, first_lineno, _name)`` tuple for a given code
+    object.
 
-    This is the similar labelling as used by the cProfile module in Python 2.5.
+    This is the similar labelling as used by the :py:mod:`cProfile`
+    module in Python 2.5.
 
     Note:
-        In Python >=3.11 we use we return qualname for _name.
+        In Python >= 3.11 we use we return qualname for ``_name``.
         In older versions of Python we just return name.
     """
     if isinstance(code, str):
-        return ('~', 0, code)    # built-in functions ('~' sorts at the end)
+        return ('~', 0, code)  # built-in functions ('~' sorts at the end)
     else:
         if HAS_CO_QUALNAME:
             return (code.co_filename, code.co_firstlineno, code.co_qualname)
@@ -189,7 +191,7 @@ def disable_line_events(trace_func: Callable) -> Callable:
 
 cpdef _code_replace(func, co_code):
     """
-    Implements CodeType.replace for Python < 3.8
+    Implements :py:mod:`types.CodeType.replace` for Python < 3.8
     """
     try:
         code = func.__code__
@@ -217,11 +219,13 @@ class LineStats(object):
 
     Attributes:
 
-        timings (dict):
-            Mapping from (filename, first_lineno, function_name) of the
-            profiled function to a list of (lineno, nhits, total_time) tuples
-            for each profiled line. total_time is an integer in the native
-            units of the timer.
+        timings (dict[tuple[str, int, str], \
+list[tuple[int, int, int]]]):
+            Mapping from ``(filename, first_lineno, function_name)`` of
+            the profiled function to a list of
+            ``(lineno, nhits, total_time)`` tuples for each profiled
+            line. ``total_time`` is an integer in the native units of
+            the timer.
 
         unit (float):
             The number of seconds per timer unit.
@@ -419,13 +423,17 @@ cdef class LineProfiler:
                 code = func.__func__.__code__
             except AttributeError:
                 import warnings
-                warnings.warn("Could not extract a code object for the object %r" % (func,))
+                warnings.warn(
+                    "Could not extract a code object for the object %r"
+                    % (func,))
                 return
 
         if code.co_code in self.dupes_map:
             self.dupes_map[code.co_code] += [code]
-            # code hash already exists, so there must be a duplicate function. add no-op
-            co_padding : bytes = NOP_BYTES * (len(self.dupes_map[code.co_code]) + 1)
+            # code hash already exists, so there must be a duplicate
+            # function. add no-op
+            co_padding : bytes = NOP_BYTES * (len(self.dupes_map[code.co_code])
+                                              + 1)
             co_code = code.co_code + co_padding
             CodeType = type(code)
             code = _code_replace(func, co_code=co_code)
@@ -435,10 +443,14 @@ cdef class LineProfiler:
                 func.__func__.__code__ = code
         else:
             self.dupes_map[code.co_code] = [code]
-        # TODO: Since each line can be many bytecodes, this is kinda inefficient
-        # See if this can be sped up by not needing to iterate over every byte
+        # TODO: Since each line can be many bytecodes, this is kinda
+        # inefficient
+        # See if this can be sped up by not needing to iterate over
+        # every byte
         for offset, byte in enumerate(code.co_code):
-            code_hash = compute_line_hash(hash((code.co_code)), PyCode_Addr2Line(<PyCodeObject*>code, offset))
+            code_hash = compute_line_hash(
+                hash((code.co_code)),
+                PyCode_Addr2Line(<PyCodeObject*>code, offset))
             if not self._c_code_map.count(code_hash):
                 try:
                     self.code_hash_map[code].append(code_hash)
@@ -492,8 +504,9 @@ cdef class LineProfiler:
         self.enable_count += 1
 
     def disable_by_count(self):
-        """ Disable the profiler if the number of disable requests matches the
-        number of enable requests.
+        """
+        Disable the profiler if the number of disable requests matches
+        (or exceeds) the number of enable requests.
         """
         if self.enable_count > 0:
             self.enable_count -= 1
@@ -523,8 +536,9 @@ cdef class LineProfiler:
     @property
     def code_map(self):
         """
-        line_profiler 4.0 no longer directly maintains code_map, but this will
-        construct something similar for backwards compatibility.
+        :py:mod:`line_profiler` 4.0 no longer directly maintains
+        :py:attr:`~.code_map`, but this will construct something similar
+        for backwards compatibility.
         """
         c_code_map = self.c_code_map
         code_hash_map = self.code_hash_map
@@ -544,8 +558,9 @@ cdef class LineProfiler:
     @property
     def last_time(self):
         """
-        line_profiler 4.0 no longer directly maintains last_time, but this will
-        construct something similar for backwards compatibility.
+        :py:mod:`line_profiler` 4.0 no longer directly maintains
+        :py:attr:`~.last_time`, but this will construct something similar
+        for backwards compatibility.
         """
         c_last_time = (<dict>self._c_last_time)[threading.get_ident()]
         code_hash_map = self.code_hash_map
@@ -574,25 +589,33 @@ cdef class LineProfiler:
                 entries += list(cmap[entry].values())
             key = label(code)
 
-            # Merge duplicate line numbers, which occur for branch entrypoints like `if`
+            # Merge duplicate line numbers, which occur for branch
+            # entry points like `if`
             nhits_by_lineno = {}
             total_time_by_lineno = {}
 
             for line_dict in entries:
-                 _, lineno, total_time, nhits = line_dict.values()
-                 nhits_by_lineno[lineno] = nhits_by_lineno.setdefault(lineno, 0) + nhits
-                 total_time_by_lineno[lineno] = total_time_by_lineno.setdefault(lineno, 0) + total_time
+                _, lineno, total_time, nhits = line_dict.values()
+                nhits_by_lineno[lineno] = (
+                    nhits_by_lineno.setdefault(lineno, 0) + nhits)
+                total_time_by_lineno[lineno] = (
+                    total_time_by_lineno.setdefault(lineno, 0) + total_time)
 
-            entries = [(lineno, nhits, total_time_by_lineno[lineno]) for lineno, nhits in nhits_by_lineno.items()]
+            entries = [(lineno, nhits, total_time_by_lineno[lineno])
+                       for lineno, nhits in nhits_by_lineno.items()]
             entries.sort()
 
-            # NOTE: v4.x may produce more than one entry per line. For example:
+            # NOTE: v4.x may produce more than one entry per line. For
+            # example:
             #   1:  for x in range(10):
             #   2:      pass
-            #  will produce a 1-hit entry on line 1, and 10-hit entries on lines 1 and 2
-            #  This doesn't affect `print_stats`, because it uses the last entry for a given line (line number is
-            #  used a dict key so earlier entries are overwritten), but to keep compatability with other tools,
-            #  let's only keep the last entry for each line
+            #  will produce a 1-hit entry on line 1, and 10-hit entries
+            #  on lines 1 and 2
+            #  This doesn't affect `print_stats`, because it uses the
+            #  last entry for a given line (line number is used a dict
+            #  key so earlier entries are overwritten), but to keep
+            #  compatability with other tools, let's only keep the last
+            #  entry for each line
             # Remove all but the last entry for each line
             entries = list({e[0]: e for e in entries}.values())
             stats[key] = entries
