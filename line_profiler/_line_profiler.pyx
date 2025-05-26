@@ -44,7 +44,7 @@ ctypedef long long int int64
 
 cdef extern from "Python_wrapper.h":
     """
-    inline PyObject* get_frame_code(PyFrameObject* frame) {
+    inline PyObject* get_frame_code(PyFrameObject *frame) {
         PyCodeObject* code = PyFrame_GetCode(frame);
         PyObject* ret = PyCode_GetCode(code);
         Py_DECREF(code);
