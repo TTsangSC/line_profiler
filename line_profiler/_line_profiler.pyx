@@ -172,7 +172,7 @@ def label(code):
     module in Python 2.5.
 
     Note:
-        In Python >= 3.11 we use we return qualname for ``_name``.
+        In Python >= 3.11 we return qualname for ``_name``.
         In older versions of Python we just return name.
     """
     if isinstance(code, str):
@@ -275,7 +275,7 @@ cdef class _LineProfilerManager:
         Calls :c:func:`python_trace_callback()`.  If
         :py:func:`sys.gettrace` returns this instance, replaces the
         default C-level trace function :c:func:`trace_trampoline` (see
-        the C implementation of :py:mod:sys`) with
+        the C implementation of :py:mod:`sys`) with
         :c:func:`python_trace_callback` to reduce overhead.
 
         Returns;
@@ -496,7 +496,7 @@ cdef class LineProfiler:
     cdef public object threaddata
 
     # This is shared between instances and threads
-    _managers = {}  # type: dict[int, _LineProfilerManager]
+    _managers = {}  # type: ClassVar[dict[int, _LineProfilerManager]]
 
     def __init__(self, *functions,
                  wrap_trace=None, set_frame_local_trace=None):
