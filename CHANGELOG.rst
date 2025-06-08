@@ -15,6 +15,7 @@ Changes
 * ENH: In Python >=3.11, profiled objects are reported using their qualified name.
 * ENH: Highlight final summary using rich if enabled
 * ENH: Made it possible to use multiple profiler instances simultaneously
+* ENH: Fixed edge case where :py:meth:`LineProfiler.get_stats()` neglects data from duplicate code objects (#348)
 
 4.2.0
 ~~~~~
