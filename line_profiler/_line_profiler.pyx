@@ -257,9 +257,10 @@ cdef class LineProfiler:
     # These are shared between instances and threads
     # type: dict[int, set[LineProfiler]], int = thread id
     _all_active_instances = {}
-    # type: dict[bytes, tuple[int, weakref.WeakSet[LineProfiler]]]
-    # Wher bytes = bytecode, int = padding length
-    _all_instances_by_bcodes = {}
+    # type: dict[bytes, int], bytes = bytecode
+    _all_paddings = {}
+    # type: dict[int, weakref.WeakSet[LineProfiler]], int = func id
+    _all_instances_by_funcs = {}
 
     def __init__(self, *functions):
         self.functions = []
@@ -285,16 +286,17 @@ cdef class LineProfiler:
             )
         try:
             code = func.__code__
+            func_id = id(func)
         except AttributeError:
             try:
                 code = func.__func__.__code__
+                func_id = id(func.__func__)
             except AttributeError:
                 import warnings
                 warnings.warn("Could not extract a code object for the object %r" % (func,))
                 return
 
-        original_code_obj = code
-        original_bcode = code.co_code
+        co_code: bytes = code.co_code
         # Note: if we are to alter the code object, other profilers
         # which previously added this function would still expect the
         # old bytecode, and thus will not see anything when the function
@@ -302,55 +304,49 @@ cdef class LineProfiler:
         # hence:
         # - When doing bytecode padding, take into account all instances
         #   which refers to the same base bytecode to ensure
-        #   disambiguation
-        # - Update all existing instances referring to the old code
-        #   object
+        #   disambiguation (done by a class-level attribute)
+        # - Update all existing instances referring to the same function
+        #   to point to the new code object
         try:
-            npad, neighbors = self._all_instances_by_bcodes[original_bcode]
-            neighbors.add(self)
+            npad = self._all_paddings[co_code]
+            self._all_paddings[co_code] = npad + 1
         except KeyError:
             npad = 0
-            neighbors = WeakSet({self})
-            self._all_instances_by_bcodes[original_bcode] = (0, neighbors)
+            self._all_paddings[co_code] = 1
+        try:
+            neighbors = self._all_instances_by_funcs[func_id]
+            neighbors.add(self)
+        except KeyError:
+            neighbors = self._all_instances_by_funcs[func_id] = WeakSet({self})
+        # Maintain `.dupes_map` (legacy)
+        try:
+            self.dupes_map[co_code].append(code)
+        except KeyError:
+            self.dupes_map[co_code] = [code]
         if npad:
             # Code hash already exists, so there must be a duplicate
             # function (on some instance);
             # add no-op
-            co_code = original_bcode + NOP_BYTES * npad
+            co_code += NOP_BYTES * npad
             code = _code_replace(func, co_code=co_code)
             try:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
-        try:
-            self.dupes_map[original_bcode].append(code)
-        except KeyError:
-            self.dupes_map[original_bcode] = [code]
-        # If we padded the bytecode, identify other instances profiling
-        # the same CODE OBJECT, replacing the original code object with
-        # the new one and marking those instances for further updates
-        instances_to_update = {self}
-        if npad:
-            for instance in neighbors:
-                code_objs = instance.dupes_map[original_bcode]
-                for i, code_obj in enumerate(code_objs):
-                    if code_obj is original_code_obj:
-                        instances_to_update.add(instance)
-                        code_objs[i] = code
         # TODO: Since each line can be many bytecodes, this is kinda
         # inefficient
         # See if this can be sped up by not needing to iterate over
         # every byte
         code_hashes = []
-        for offset, _ in enumerate(code.co_code):
+        for offset, _ in enumerate(co_code):
             code_hashes.append(
                 compute_line_hash(
-                    hash(code.co_code),
+                    hash(co_code),
                     PyCode_Addr2Line(<PyCodeObject*>code, offset)))
         # Update `._c_code_map` and `.code_hash_map` with the new line
         # hashes on `self` and other instances profiling the same
         # function
-        for instance in instances_to_update:
+        for instance in neighbors:
             prof = <LineProfiler>instance
             try:
                 line_hashes = prof.code_hash_map[code]
