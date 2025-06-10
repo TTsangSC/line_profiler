@@ -321,6 +321,7 @@ cdef class LineProfiler:
         except KeyError:
             npad = 0
         self._all_paddings[base_co_code] = max(npad, npad_code) + 1
+        need_padding = npad > npad_code
         try:
             neighbors = self._all_instances_by_funcs[func_id]
             neighbors.add(self)
@@ -331,7 +332,7 @@ cdef class LineProfiler:
             self.dupes_map[base_co_code].append(code)
         except KeyError:
             self.dupes_map[base_co_code] = [code]
-        if npad > npad_code:
+        if need_padding:
             # Code hash already exists, so there must be a duplicate
             # function (on some instance);
             # (re-)pad with no-op
@@ -352,9 +353,9 @@ cdef class LineProfiler:
                     hash(co_code),
                     PyCode_Addr2Line(<PyCodeObject*>code, offset)))
         # Update `._c_code_map` and `.code_hash_map` with the new line
-        # hashes on `self` and other instances profiling the same
-        # function
-        for instance in neighbors:
+        # hashes on `self` (and other instances profiling the same
+        # function if we padded the bytecode)
+        for instance in (neighbors if need_padding else (self,)):
             prof = <LineProfiler>instance
             try:
                 line_hashes = prof.code_hash_map[code]
