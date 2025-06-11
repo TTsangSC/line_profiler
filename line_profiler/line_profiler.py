@@ -63,6 +63,12 @@ def _get_underlying_functions(func):
                         f'cannot get functions from {type(func)} objects')
     if is_function(func):
         return [func]
+    if type(func).__name__ == 'cython_function_or_method':
+        # PEP 669 meant that Cython line tracing is no longer possible
+        # since Python 3.12
+        # (see https://cython.readthedocs.io/en/latest/src/tutorial/\
+        # profiling_tutorial.html)
+        return [func] if sys.version_info[:2] < (3, 12) else []
     return [type(func).__call__]
 
 
