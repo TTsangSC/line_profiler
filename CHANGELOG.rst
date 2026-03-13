@@ -6,6 +6,8 @@ Changes
 * FIX: Make sure that the profiled code is run in the
   ``sys.modules['__main__']`` namespace to avoid issues w/e.g. pickling
   (#423)
+* FIX: ``ScopingPolicy`` members now type-check properly as instances thereof
+  (#427)
 
 
 5.0.2
