@@ -166,7 +166,7 @@ class LineProfilingCache:
             )
             diagnostics.log.debug(msg)
             instance = cls._from_path(cls._get_filename(cache_dir))
-            cls._loaded_instance = instance
+            instance._replace_loaded_instance(force=True)
         return instance
 
     def dump(self) -> None:
@@ -343,7 +343,8 @@ class LineProfilingCache:
             forked._setup_in_child_process(False, 'fork', self.profiler)
             return result
 
-        os.fork = wrapper
+        # Note: explicitly annotate the assignment to shut `ty` up
+        os.fork: Callable[[], int] = wrapper
         self.add_cleanup(setattr, os, 'fork', fork)
 
     def make_tempfile(self, **kwargs) -> Path:
@@ -363,9 +364,13 @@ class LineProfilingCache:
         finally:
             os.close(handle)
 
-    def _replace_loaded_instance(self) -> bool:
-        if self._consistent_with_loaded_instance:
-            type(self)._loaded_instance = self
+    def _replace_loaded_instance(self, force: bool = False) -> bool:
+        cls = type(self)
+        if force or self._consistent_with_loaded_instance:
+            # Note: `ty` REALLY hates assigning an instance to
+            # `ClassVar[Self]` (#3274); no choice but to ignore it for
+            # the time being...
+            cls._loaded_instance = self  # type: ignore
             return True
         return False
 
