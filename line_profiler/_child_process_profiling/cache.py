@@ -343,8 +343,19 @@ class LineProfilingCache:
             forked._setup_in_child_process(False, 'fork', self.profiler)
             return result
 
-        # Note: explicitly annotate the assignment to shut `ty` up
-        os.fork: Callable[[], int] = wrapper
+        # Note: type checkers have vastly different opinions on
+        # `os.fork = wrapper`:
+        # - `ty` wouldn't shut up about shadowing unless we explicitly
+        #   type-annotate the assignment (error type:
+        #   "invalid-assignment")
+        # - `mypy` is cool with the bare assignment, but complains about
+        #   declaring types in "assignment to non-self-attribute"
+        #   (error type: "misc")
+        # The only way to satisfy both seems to be either an
+        # unqualified "type: ignore" comment, or circumventing the
+        # attribute checks by `setattr()` or assigning to the module
+        # namespace dict.
+        os.fork = wrapper  # type: ignore
         self.add_cleanup(setattr, os, 'fork', fork)
 
     def make_tempfile(self, **kwargs) -> Path:
