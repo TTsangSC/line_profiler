@@ -237,6 +237,10 @@ from line_profiler import _diagnostics as diagnostics
 
 
 DIAGNOSITICS_VERBOSITY = 2
+CLEANUP_PRIORITIES = {  # Bigger number -> more delayed
+    'rm_cache_dir': 1024,
+    'gather_logs': 1,
+}
 
 
 def execfile(filename, globals=None, locals=None):
@@ -1221,29 +1225,35 @@ class _manage_profiler:
             self.cache = _prepare_child_profiling_cache(
                 self.options, self.prof, preimports_file, script_file,
             )
+            # Add a deferred callback for gathering debug logfiles
+            # (should run right before `.cache.cache_dir` is wiped)
+            if self.options.debug_log:
+                self.cache._add_cleanup(
+                    self._gather_debug_log,
+                    CLEANUP_PRIORITIES['gather_logs'],
+                    self.options.debug_log,
+                )
         return self.prof, script_file
 
     def __exit__(self, *_, **__):
         try:
             extra_stats = None
             if self.set_up_child_profiling:
-                extra_stats = self._finalize_cache()
+                try:
+                    if self.cache.debug:
+                        # Recover debug output from child processes
+                        self.cache._dump_debug_logs()
+                    extra_stats = self.cache.gather_stats()
+                finally:
+                    self.cache.cleanup()
             _post_profile(self.options, self.prof, extra_stats)
         finally:
             self._ctx.uninstall()
 
-    def _finalize_cache(self):
-        try:
-            if self.cache.debug:
-                # Recover debug output from child processes
-                self.cache._dump_debug_logs()
-            if self.options.debug_log:
-                with open(self.options.debug_log, mode='w') as fobj:
-                    for entry in self.cache._gather_debug_log_entries():
-                        print(entry.to_text(), file=fobj)
-            return self.cache.gather_stats()
-        finally:
-            self.cache.cleanup()
+    def _gather_debug_log(self, logfile):
+        with open(logfile, mode='w') as fobj:
+            for entry in self.cache._gather_debug_log_entries():
+                print(entry.to_text(), file=fobj)
 
     @property
     def set_up_child_profiling(self):
@@ -1366,7 +1376,11 @@ def _prepare_child_profiling_cache(options, prof, preimports_file, script_file):
     )
     clean_up = functools.partial(cache.add_cleanup, _remove, missing_ok=True)
     if not diagnostics.KEEP_TEMPDIRS:
-        clean_up(cache.cache_dir, recursive=True)
+        # Defer the scrubbing of the cache dir
+        cache._add_cleanup(
+            _remove, CLEANUP_PRIORITIES['rm_cache_dir'], cache.cache_dir,
+            recursive=True,
+        )
     clean_up(cache.filename)
 
     # This file is handed to us at the end of
