@@ -53,7 +53,7 @@ INHERITED_CACHE_ENV_VARNAME_PREFIX = (
     'LINE_PROFILER_PROFILE_CHILD_PROCESSES_CACHE_DIR'
 )
 CACHE_FILENAME = 'line_profiler_cache.pkl'
-_DEBUG_LOG_FILNAME_PATTERN = 'debug_log_{main_pid}_{current_pid}.log'
+_DEBUG_LOG_FILENAME_PATTERN = 'debug_log_{main_pid}_{current_pid}.log'
 
 
 class _ReprAttributes(TypedDict, total=False):
@@ -378,7 +378,7 @@ class LineProfilingCache:
         Gather the debug logfiles in child processes and write them to
         the logger; to be called in the main process.
         """
-        pattern = _DEBUG_LOG_FILNAME_PATTERN.format(
+        pattern = _DEBUG_LOG_FILENAME_PATTERN.format(
             main_pid=self.main_pid, current_pid='*',
         )
         for log in sorted(Path(self.cache_dir).glob(pattern)):
@@ -658,7 +658,7 @@ write_pth_hook`)
     def _debug_log(self) -> Path | None:
         if not self.debug:
             return None
-        fname = _DEBUG_LOG_FILNAME_PATTERN.format(
+        fname = _DEBUG_LOG_FILENAME_PATTERN.format(
             main_pid=self.main_pid, current_pid=os.getpid(),
         )
         return Path(self.cache_dir) / fname
