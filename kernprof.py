@@ -202,7 +202,7 @@ import contextlib
 import shutil
 import tempfile
 import time
-from argparse import ArgumentParser
+from argparse import ArgumentParser, SUPPRESS
 from operator import methodcaller
 from runpy import run_module
 from pathlib import Path
@@ -783,6 +783,8 @@ def _add_core_parser_arguments(parser):
         'Minimum value (and the value implied if the bare option '
         f'is given) is 1 s. (Default: {def_out_int})',
     )
+    # Hidden option for dumping the debug logs to a desinated location
+    add_argument(out_opts, '--debug-log', help=SUPPRESS)
 
 
 def _build_parsers(args=None):
@@ -1225,16 +1227,23 @@ class _manage_profiler:
         try:
             extra_stats = None
             if self.set_up_child_profiling:
-                if self.cache.debug:
-                    # Recover debug output from child processes
-                    self.cache._dump_debug_logs()
-                try:
-                    extra_stats = self.cache.gather_stats()
-                finally:
-                    self.cache.cleanup()
+                extra_stats = self._finalize_cache()
             _post_profile(self.options, self.prof, extra_stats)
         finally:
             self._ctx.uninstall()
+
+    def _finalize_cache(self):
+        try:
+            if self.cache.debug:
+                # Recover debug output from child processes
+                self.cache._dump_debug_logs()
+            if self.options.debug_log:
+                with open(self.options.debug_log, mode='w') as fobj:
+                    for entry in self.cache._gather_debug_log_entries():
+                        print(entry.to_text(), file=fobj)
+            return self.cache.gather_stats()
+        finally:
+            self.cache.cleanup()
 
     @property
     def set_up_child_profiling(self):
@@ -1353,7 +1362,7 @@ def _prepare_child_profiling_cache(options, prof, preimports_file, script_file):
         profile_imports=options.prof_imports,
         preimports_module=preimports_file,
         insert_builtin=options.builtin,
-        debug=options.debug,
+        debug=bool(options.debug or options.debug_log),
     )
     clean_up = functools.partial(cache.add_cleanup, _remove, missing_ok=True)
     if not diagnostics.KEEP_TEMPDIRS:
