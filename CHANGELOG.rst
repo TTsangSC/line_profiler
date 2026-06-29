@@ -15,10 +15,8 @@ Changes
 * FIX: Stop reverting ``sys.modules`` after calling ``kernprof.main()``
   to avoid edge-case issues with e.g. pickling (#437)
 * FIX: Fixed bug where ``kernprof -l`` misses ``--prof-mod`` targets if
-  multiple thereof are imported in the same (from-)import statement;
-  note however that the return type of
-  ``line_profiler.autoprofile.profmod_extractor.ProfmodExtractor.run()``
-  has changed (#434)
+  multiple thereof are imported in the same (from-)import statement
+  (#434)
 
 
 5.0.2
