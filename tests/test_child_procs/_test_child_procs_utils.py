@@ -1024,14 +1024,18 @@ def _cleanup_profiling_in_current_thread() -> None:
 
 @overload
 def add_timeout(
-    func: Callable[PS, T], *, timeout: float = DEFAULT_TIMEOUT,
+    func: Callable[PS, T], *,
+    timeout: float = DEFAULT_TIMEOUT,
+    name: str | None = None,
 ) -> Callable[PS, T]:
     ...
 
 
 @overload
 def add_timeout(
-    func: None = None, *, timeout: float = DEFAULT_TIMEOUT,
+    func: None = None, *,
+    timeout: float = DEFAULT_TIMEOUT,
+    name: str | None = None,
 ) -> Callable[[Callable[PS, T]], Callable[PS, T]]:
     ...
 
@@ -1039,19 +1043,36 @@ def add_timeout(
 def add_timeout(
     func: Callable[PS, T] | None = None, *,
     timeout: float = DEFAULT_TIMEOUT,
+    name: str | None = None,
 ) -> Callable[PS, T] | Callable[[Callable[PS, T]], Callable[PS, T]]:
     """
     Decorate the test function so that it is run in another thread and
-    can be timed out.
+    can be timed out; if a ``name`` is provided, it will be set to the
+    thread.
 
     Example:
         >>> from time import sleep
+        >>> from threading import enumerate as enum_threads
+        >>> from uuid import uuid4
 
-        >>> @add_timeout(timeout=.5)
+        >>> thread_name = f'my_func-{uuid4()}'
+        >>> sleep_loop_interval = .0625
+        >>> test_is_over = False
+
+        >>> @add_timeout(timeout=.5, name=thread_name)
         ... def my_func(
         ...     n: int, delay: float = 1, error: bool = False,
         ... ) -> list[int]:
-        ...     sleep(delay)
+        ...     # Sleep in pulses here so the doctest (+ cleanup)
+        ...     # doesn't take 10s if we have `delay=10`
+        ...     nloops, remainder = divmod(delay, sleep_loop_interval)
+        ...     intervals = [sleep_loop_interval] * int(nloops)
+        ...     if remainder:
+        ...         intervals.append(remainder)
+        ...     for interval in intervals:
+        ...         if test_is_over:
+        ...             break
+        ...         sleep(interval)
         ...     if error:
         ...         raise RuntimeError('my error message')
         ...     return list(range(n))
@@ -1075,11 +1096,23 @@ def add_timeout(
           ...
         test_child_procs._test_child_procs_utils.TestTimeout:
         my_func(4, delay=5): timed out after 0.5 s
+
+    Note:
+        When a call is timed out, the background (daemonized) thread
+        handling it may still be running; it is the caller's
+        responsibility to locate said thread and SOMEHOW terminate it.
+        The ``name`` parameter is to facilitate that.
+
+        >>> test_is_over = True  # Tell `my_func()` to stop sleeping...
+        >>> my_thread = next(
+        ...     t for t in enum_threads() if t.name == thread_name
+        ... )
+        >>> my_thread.join()  # ... or it may pollute the thread pool
     """
     if func is None:
         return cast(
             Callable[[Callable[PS, T]], Callable[PS, T]],
-            partial(add_timeout, timeout=timeout),
+            partial(add_timeout, timeout=timeout, name=name),
         )
 
     @wraps(func)
@@ -1128,7 +1161,9 @@ def add_timeout(
         msg = f'{call_repr}: timed out after {timeout:.2g} s'
         raise TestTimeout(msg)
 
-    new_thread = partial(threading.Thread, target=worker, daemon=True)
+    new_thread = partial(
+        threading.Thread, target=worker, name=name, daemon=True,
+    )
 
     return wrapper
 
