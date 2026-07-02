@@ -21,17 +21,14 @@ from typing import Literal, get_args
 from ..cache import LineProfilingCache
 from ._infrastructure import Registry
 from .mp_config import MPConfig
-from .poller import Poller
 
 
-__all__ = ('MPConfig', 'Poller', 'Registry', 'Timeout', 'apply')
+__all__ = ('MPConfig', 'Registry', 'apply')
 
 PublicPatch = Literal['pool', 'process', 'logging']
 
 _PATCHED_MARKER = '__line_profiler_patched_multiprocessing__'
 _PATCHES = Registry.from_entry_point()
-
-Timeout = Poller.Timeout
 
 
 def apply(

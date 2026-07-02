@@ -304,10 +304,10 @@ if __name__ == '__main__':
             'kernprof=kernprof:main',
         ],
         'line_profiler._multiproc_patches': [
-            '__process_termination'
+            '__process_setup'
             '=line_profiler._child_process_profiling'
             '.multiprocessing_patches._mandatory_patches'
-            ':PROCESS_TERMINATION_PATCH',
+            ':PROCESS_SETUP_PATCH',
             '__reboot_forkserver'
             '=line_profiler._child_process_profiling'
             '.multiprocessing_patches._mandatory_patches'

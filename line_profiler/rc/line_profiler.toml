@@ -242,27 +242,4 @@ process = true
 #   cache's debug logs
 logging = false
 
-# Polling controls, used for the `pool` patch
-
-[tool.line_profiler.child_processes.multiprocessing.polling]
-
-# - `multiprocessing.polling.cooldown` (float):
-#   Cooldown time (seconds) before successive polls on child processes
-#   (set to <= 0 to disable cooldowns)
-cooldown = 0.03125  # 1/32-nd of a second
-# - `multiprocessing.polling.timeout` (float):
-#   Time (seconds) before the main process disregards the alive-ness of
-#   child processes/existence of lock files, and unblocks calls to
-#   `.terminate()` a (most probably errored-out) child anyway (set to
-#   <= 0 to disable timeouts)
-timeout = 0.25
-# - `multiprocessing.polling.on_timeout`
-#   (Literal['error', 'warn', 'ignore']):
-#   What to do when the above timeout is exhausted, before actually
-#   `.terminate()`-ing the child process:
-#   - 'error': raise an error
-#   - `warn`: issue a warning
-#   - `ignore`: nothing
-on_timeout = 'warn'
-
 # XXX: --- End of implementation details ---
