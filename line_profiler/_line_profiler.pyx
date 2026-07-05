@@ -356,11 +356,23 @@ list[tuple[int, int, int]]]):
 
 cdef class _SysMonitoringState:
     """
-    Another helper object for managing the thread-local state.
+    Helper object for managing the :py:mod:`sys.monitoring` state.
 
     Note:
-        Documentations are for reference only, and all APIs are to be
-        considered private and subject to change.
+        - Documentations are for reference only, and all APIs are to be
+          considered private and subject to change.
+
+        - In contrast to the legacy trace system (which is set up
+          per-thread), :py:mod:`sys.monitoring` registration is
+          process-global; a single instance (per tool ID) is therefore
+          shared between the per-thread ``_LineProfilerManager``
+          objects (see :py:func:`_get_shared_mon_state`), and so is its
+          :py:attr:`~.active_instances` set.  This way, the global
+          callbacks/events are only torn down when the last profiler
+          anywhere is disabled, instead of whenever any one thread's
+          manager runs out of active profilers (which used to kill
+          profiling on the other threads and make their subsequent
+          ``disable()`` calls raise).
     """
     cdef int tool_id
     cdef object name  # type: str | None
@@ -371,6 +383,8 @@ cdef class _SysMonitoringState:
     cdef dict disabled
     cdef int events
     cdef Py_uintptr_t restart_version
+    # type: set[LineProfiler]; shared between the per-thread managers
+    cdef readonly set active_instances
 
     if _CAN_USE_SYS_MONITORING:
         line_tracing_event_set = (  # type: ClassVar[FrozenSet[int]]
@@ -395,6 +409,7 @@ cdef class _SysMonitoringState:
         self.disabled = {}
         self.events = 0  # NO_EVENTS
         self.restart_version = monitoring_restart_version()
+        self.active_instances = set()
 
     cpdef register(self, object handle_line,
                    object handle_return, object handle_yield,
@@ -437,12 +452,23 @@ cdef class _SysMonitoringState:
         mon = sys.monitoring
         cdef dict wrapped_callbacks = self.callbacks
 
-        # Restore prior state
-        mon.set_events(self.tool_id, self.events)
-        if self.name is None:
+        # No-op unless `.register()` has been called (makes repeated or
+        # spurious `.deregister()` calls harmless)
+        if not wrapped_callbacks:
+            return
+
+        # Restore prior state; be tolerant of external interference
+        # (e.g. other code having freed the tool ID from under us),
+        # which shouldn't prevent the teardown from completing
+        try:
+            mon.set_events(self.tool_id, self.events)
+        except ValueError:
+            pass
+        if self.name is None and mon.get_tool(self.tool_id) is not None:
             mon.free_tool_id(self.tool_id)
         self.name = None
         self.events = mon.events.NO_EVENTS
+        self.disabled.clear()
 
         # Reset tracebacks
         while wrapped_callbacks:
@@ -524,6 +550,23 @@ cdef class _SysMonitoringState:
                            self.events | self.line_tracing_events)
 
 
+# type: dict[int, _SysMonitoringState], int = tool id
+_shared_mon_states = {}
+
+
+cdef _SysMonitoringState _get_shared_mon_state(tool_id):
+    """
+    Get the process-global :py:class:`_SysMonitoringState` for the
+    ``tool_id``, creating it if necessary; see the class docstring for
+    why the state is shared.
+    """
+    try:
+        return _shared_mon_states[tool_id]
+    except KeyError:
+        return _shared_mon_states.setdefault(
+            tool_id, _SysMonitoringState(tool_id))
+
+
 cdef class _LineProfilerManager:
     """
     Helper object for managing the thread-local state.
@@ -588,9 +631,20 @@ sys.monitoring.html#monitoring-event-RERAISE
             :py:class:`~.LineProfiler`
         """
         self.legacy_callback = NULL
-        self.mon_state = _SysMonitoringState(tool_id)
+        if USE_LEGACY_TRACE:
+            # The legacy trace system is per-thread, so each (per-
+            # thread) manager tracks its own state
+            self.mon_state = _SysMonitoringState(tool_id)
+            self.active_instances = set()
+        else:
+            # `sys.monitoring` is process-global, so all managers share
+            # one monitoring state and one set of active profilers;
+            # the global callbacks are then only torn down when the
+            # last profiler anywhere is disabled, regardless of which
+            # thread registered or disables them
+            self.mon_state = _get_shared_mon_state(tool_id)
+            self.active_instances = self.mon_state.active_instances
 
-        self.active_instances = set()
         self.wrap_trace = wrap_trace
         self.set_frame_local_trace = set_frame_local_trace
         self.recursion_guard = 0
@@ -1357,6 +1411,13 @@ datamodel.html#user-defined-functions
         return py_last_time
 
     cpdef disable(self):
+        if not USE_LEGACY_TRACE:
+            # `sys.monitoring` events are process-global, so clear the
+            # in-progress line bookkeeping for all threads, not just
+            # the caller's
+            self._c_last_time.clear()
+        # Note: `operator[]` (re-)creates an empty entry for the
+        # calling thread, which `.c_last_time` expects to find
         self._c_last_time[PyThread_get_thread_ident()].clear()
         self._manager._handle_disable_event(self)
 
