@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import os
 import multiprocessing
+import warnings
 from collections.abc import Callable
 from functools import partial
 from multiprocessing.pool import Pool
@@ -32,10 +33,11 @@ except ImportError:
 else:
     _CAN_USE_RESOURCE_TRACKER = True
 
+from ... import _diagnostics as diagnostics
 from ..cache import LineProfilingCache
 from ..runpy_patches import create_runpy_wrapper
 from ._infrastructure import SingleModulePatch
-from ._queue import Queue, PutWrapper
+from ._queue import Queue, PutWrapper, PID_TAG
 
 
 __all__ = (
@@ -127,8 +129,8 @@ def wrap_handle_results(
     ],
     outqueue: Queue,
     # Since we patched `outqueue.put()` in the child process, the result
-    # tuple pushed to the parent has an extra item (the child PID)
-    get: Callable[[], tuple[int, tuple[Any, ...]] | None],
+    # pushed to the parent is (normally) a `(PID_TAG, pid, obj)` triplet
+    get: Callable[[], tuple[Any, ...] | None],
     *args: PS.args,
     **kwargs: PS.kwargs
 ) -> None:
@@ -225,22 +227,59 @@ def _get_worker_ntasks(worker: BaseProcess, cache: LineProfilingCache) -> int:
     return ntasks_finalized.setdefault(key, ntasks)
 
 
+_UNTAGGED_RESULT_WARNING = (
+    'received a pool-task result without the profiling worker-PID tag; '
+    'the worker process appears not to have been set up for profiling '
+    '(e.g. its interpreter never loaded the profiling startup hook), '
+    'so its profiling data will be missing from the output'
+)
+
+
 def _wrap_outqueue_quick_get(
     cache: LineProfilingCache,
-    vanilla_impl: Callable[PS, tuple[int, tuple[Any, ...]] | None],
+    vanilla_impl: Callable[PS, tuple[Any, ...] | None],
     *args: PS.args,
     **kwargs: PS.kwargs
 ) -> tuple[Any, ...] | None:
     """
     Take and process the PID of the child process completing the task.
+
+    Note:
+        A worker which was never patched (its interpreter didn't run
+        the profiling startup hook) pushes vanilla un-tagged results;
+        those are passed through untouched, with a once-per-session
+        warning, so that a mixed patched-parent/vanilla-worker setup
+        degrades to missing profile data instead of killing the pool's
+        result-handler thread (and thereby deadlocking every
+        ``AsyncResult.get()``).
     """
     result = vanilla_impl(*args, **kwargs)
     if result is None:
         return None
-    pid, orig_result = result
-    ntasks = _get_ntasks(cache)
-    ntasks[pid] = ntasks.get(pid, 0) + 1
-    return orig_result
+    if (
+        isinstance(result, tuple)
+        and len(result) == 3
+        and result[0] == PID_TAG
+    ):
+        _, pid, orig_result = result
+        ntasks = _get_ntasks(cache)
+        ntasks[pid] = ntasks.get(pid, 0) + 1
+        return orig_result
+    _warn_untagged_result_once(cache)
+    return result
+
+
+def _warn_untagged_result_once(cache: LineProfilingCache) -> None:
+    key = 'warned_untagged_pool_result'
+    # No lock: a race just means an extra warning, and this runs on the
+    # pool's single result-handler thread anyway
+    if cache._additional_data.get(key):
+        return
+    cache._additional_data[key] = True
+    # Log before warning in case the warning is promoted to an error
+    diagnostics.log.warning(_UNTAGGED_RESULT_WARNING)
+    cache._debug_output(_UNTAGGED_RESULT_WARNING)
+    warnings.warn(_UNTAGGED_RESULT_WARNING)
 
 
 def _get_ntasks(cache: LineProfilingCache) -> dict[int, int]:
