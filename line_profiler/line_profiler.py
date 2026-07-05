@@ -337,6 +337,114 @@ class LineStats(CLineStats):
         self.timings, self.unit = self._get_aggregated_timings([self, other])
         return self
 
+    def __sub__(self, other: _StatsLike) -> Self:
+        """
+        Subtract a "baseline" from this instance; the inverse of
+        :py:meth:`~.__add__`. Entries which reach zero hits and zero
+        time are dropped. The result is expressed in ``self``'s
+        :py:attr:`~.unit`.
+
+        Raises:
+            ValueError:
+                If ``other`` contains an entry absent from (or larger
+                than the corresponding entry in) ``self``;
+                a valid baseline must be a "prefix" of ``self``.
+
+        Example:
+            >>> baseline = LineStats(
+            ...     {('spam.py', 1, 'foo'): [(2, 10, 300)],
+            ...      ('spam.py', 10, 'bar'):
+            ...      [(11, 2, 1000), (12, 1, 500)]},
+            ...     1E-6)
+            >>> new = LineStats(
+            ...     {('spam.py', 1, 'foo'): [(2, 10, 300)],
+            ...      ('spam.py', 10, 'bar'):
+            ...      [(11, 12, 3000), (12, 6, 600)],
+            ...      ('eggs.py', 5, 'baz'): [(5, 2, 500)]},
+            ...     1E-6)
+            >>> new - baseline
+            LineStats({('spam.py', 10, 'bar'): [(11, 10, 2000), \
+(12, 5, 100)], ('eggs.py', 5, 'baz'): [(5, 2, 500)]}, 1E-06)
+            >>> assert (new - baseline) + baseline == new
+            >>> new - new
+            LineStats({}, 1E-06)
+            >>> baseline - new
+            Traceback (most recent call last):
+              ...
+            ValueError: ...not a prefix...
+        """
+        timings, unit = self._get_subtracted_timings(self, other)
+        return type(self)(timings, unit)
+
+    def __isub__(self, other: _StatsLike) -> Self:
+        """
+        In-place version of :py:meth:`~.__sub__`.
+
+        Example:
+            >>> baseline = LineStats(
+            ...     {('spam.py', 1, 'foo'): [(2, 10, 300)]}, 1E-6)
+            >>> stats = LineStats(
+            ...     {('spam.py', 1, 'foo'): [(2, 15, 450)]}, 1E-6)
+            >>> address = id(stats)
+            >>> stats -= baseline
+            >>> assert id(stats) == address
+            >>> stats
+            LineStats({('spam.py', 1, 'foo'): [(2, 5, 150)]}, 1E-06)
+        """
+        self.timings, self.unit = self._get_subtracted_timings(self, other)
+        return self
+
+    @staticmethod
+    def _get_subtracted_timings(minuend, subtrahend):
+        """
+        Compute ``minuend - subtrahend`` timings, expressed in
+        ``minuend.unit``; see :py:meth:`~.__sub__`.
+        """
+        def prefix_error(reason):
+            return ValueError(
+                'subtrahend is not a prefix of the minuend '
+                f'(cannot subtract): {reason}'
+            )
+
+        unit = minuend.unit
+        factor = subtrahend.unit / unit
+        timings = {
+            key: {lineno: (nhits, time) for lineno, nhits, time in entries}
+            for key, entries in minuend.timings.items()
+        }
+        for key, entries in subtrahend.timings.items():
+            try:
+                min_entries = timings[key]
+            except KeyError:
+                raise prefix_error(f'{key!r} not in the minuend') from None
+            for lineno, nhits, time in entries:
+                try:
+                    prev_nhits, prev_time = min_entries[lineno]
+                except KeyError:
+                    raise prefix_error(
+                        f'line {lineno} of {key!r} not in the minuend'
+                    ) from None
+                new_nhits = prev_nhits - nhits
+                new_time = int(round(prev_time - factor * time, 0))
+                if new_nhits < 0 or new_time < 0:
+                    raise prefix_error(
+                        f'line {lineno} of {key!r}: '
+                        f'({prev_nhits}, {prev_time}) - ({nhits}, {time})'
+                        + ('' if factor == 1 else f' * {factor}')
+                        + f' = ({new_nhits}, {new_time})'
+                    )
+                if new_nhits or new_time:
+                    min_entries[lineno] = new_nhits, new_time
+                else:
+                    del min_entries[lineno]
+        return {
+            key: [
+                (lineno, nhits, time)
+                for lineno, (nhits, time) in sorted(entries.items())
+            ]
+            for key, entries in timings.items() if entries
+        }, unit
+
     def print(
         self,
         stream: io.TextIOBase | None = None,
