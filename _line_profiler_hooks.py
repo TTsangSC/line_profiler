@@ -61,12 +61,20 @@ def load_pth_hook(ppid: int) -> None:
         cache = LineProfilingCache.load()
         cache._setup_in_child_process(True, 'pth')
     except Exception as e:  # nocover
+        # A child which has the profiling environment but cannot set
+        # up profiling is an abnormal condition the user asked to know
+        # about, so always warn (but still let the process run
+        # unprofiled)
+        msg = (
+            f'line_profiler child-process profiling setup failed in '
+            f'PID {os.getpid()} ({type(e).__name__}: {e}); '
+            f'this process runs unprofiled'
+        )
         if DEBUG:
-            msg = f'{type(e)}: {e}'
-            # Write log befor issuing warning, in case the warning is
-            # promoted to an exception
+            # Write log before issuing the warning, in case the
+            # warning is promoted to an exception
             log.warning(msg)
-            warnings.warn(msg)
+        warnings.warn(msg)
         load_pth_hook.called = True  # type: ignore
     else:
         cache.patch(load_pth_hook, 'called', True)
