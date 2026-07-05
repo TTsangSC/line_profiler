@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# llm_resource_tally post-commit — auto-record LLM usage for the commit just made.
+# Self-locating; best-effort (accounting must never block or fail a commit).
+here="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)" || exit 0
+python3 "$here/.." record --commit HEAD >/dev/null 2>&1 || true

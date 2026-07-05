@@ -62,12 +62,36 @@ def _import_sibling(submodule: str) -> ModuleType:
 _private_field = partial(dataclasses.field, init=False, repr=False)
 
 
+def _dump_stats(
+    prof: LineProfiler,
+    outfile: os.PathLike[str] | str,
+    baseline: LineStats | None = None,
+) -> None:
+    """
+    Write ``prof``'s stats to ``outfile``; if a ``baseline`` is given
+    (e.g. the stats state inherited across an :py:func:`os.fork`),
+    subtract it first so that only work done in *this* process is
+    written (the process the baseline was inherited from writes the
+    baseline's contents itself).
+    """
+    if baseline is None:
+        prof.dump_stats(outfile)
+        return
+    stats = prof.get_stats() - baseline
+    stats.to_file(outfile)
+
+
 class _DumpStatsHelper(Cleanup):
     def __init__(
-        self, prof: LineProfiler, outfile: os.PathLike[str] | str,
+        self,
+        prof: LineProfiler,
+        outfile: os.PathLike[str] | str,
+        baseline: LineStats | None = None,
     ) -> None:
         super().__init__()
-        callback = self._callback = partial(prof.dump_stats, outfile)
+        callback = self._callback = partial(
+            _dump_stats, prof, outfile, baseline,
+        )
         self.add_cleanup(callback)
 
     def __repr__(self) -> str:
@@ -425,6 +449,7 @@ class LineProfilingCache(Cleanup):
         wrap_os_fork: bool = False,
         context: str = '',
         prof: LineProfiler | None = None,
+        baseline: LineStats | None = None,
     ) -> bool:
         """
         Set up shop in a forked/spawned child process so that
@@ -441,6 +466,14 @@ class LineProfilingCache(Cleanup):
             prof (LineProfiler | None):
                 Optional profiler instance to associate with the cache;
                 if not provided, an instance is created
+            baseline (LineStats | None):
+                Stats which ``prof`` already held when this process
+                came into existence (only meaningful for forked
+                processes, which inherit the parent's profiler state);
+                they are subtracted from every stats dump so that the
+                pre-existing data isn't double-counted when the parent
+                gathers and merges the *separately-dumped* child and
+                parent stats
 
         Returns:
             has_set_up (bool):
@@ -493,7 +526,9 @@ class LineProfilingCache(Cleanup):
             suffix='.lprof',
             delete=False,
         )
-        self._stats_dumper = dumper = _DumpStatsHelper(prof, prof_outfile)
+        self._stats_dumper = dumper = _DumpStatsHelper(
+            prof, prof_outfile, baseline,
+        )
         self.patch(
             # If we call `dumper.cleanup()` instead of `dumper` (e.g.
             # in some `multiprocessing` patches), the subsequent
@@ -550,6 +585,15 @@ class LineProfilingCache(Cleanup):
                 return result
             # If we're here, we are in the fork
             pid = os.getpid()
+            # Snapshot the profiler state inherited from the parent
+            # BEFORE any further code runs in the fork; it is used as a
+            # subtractive baseline for this process's stats dumps so
+            # that pre-fork data (which the parent dumps itself) isn't
+            # double-counted at gathering time
+            if self.profiler is None:
+                baseline = None
+            else:
+                baseline = self.profiler.get_stats()
             forked = self.copy()  # Ditch inherited cleanups
             forked._debug_output(f'Forked: {ppid} -> {pid}')
             if forked._replace_loaded_instance():
@@ -565,7 +609,9 @@ class LineProfilingCache(Cleanup):
             # Note: we can reuse the profiler instance in the fork, but
             # it needs to go through setup so that the separate
             # profiling results are dumped into another output file
-            forked._setup_in_child_process(False, 'fork', self.profiler)
+            forked._setup_in_child_process(
+                False, 'fork', self.profiler, baseline,
+            )
             return result
 
         self.patch(os, 'fork', wrapper, name='os')
