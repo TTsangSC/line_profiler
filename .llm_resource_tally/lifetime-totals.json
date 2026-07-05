@@ -1,0 +1,37 @@
+{
+  "generated_at": "2026-07-05T00:07:11.912085+00:00",
+  "schema": "llm-resource-tally/v3",
+  "ledger_rows": 3,
+  "commits_accounted": 2,
+  "turns": 70,
+  "tokens": {
+    "input": 28765,
+    "cache_write": 249167,
+    "cache_read": 8973603,
+    "output": 85253,
+    "billable_input": 9251535
+  },
+  "output_tokens_by_model": {
+    "claude-fable-5": 85253
+  },
+  "output_tokens_by_activity": {
+    "unlabeled": 81461,
+    "review": 3792
+  },
+  "output_tokens_by_agent": {
+    "claude-code": 85253
+  },
+  "server_tool_calls": {
+    "web_search": 0,
+    "web_fetch": 0
+  },
+  "time": {
+    "wall_clock_s": 1491.1
+  },
+  "compaction_signals": {
+    "events": 0,
+    "peak_context_tokens": 0,
+    "summary_chars": 0
+  },
+  "modeled_post_hoc": "inference_seconds, energy_kwh, carbon_gco2e — derived from the measurements above by a separate pass; not stored here."
+}
