@@ -14,14 +14,14 @@ maintainer's merge plan in the Agent log).
 
 | ID | Task | Difficulty | Owner | Status |
 |----|------|-----------|-------|--------|
-| FR-1 | sysmon backend: process-global registration refcount | **[hard]** | fable | in-progress 2026-07-05 |
+| FR-1 | sysmon backend: process-global registration refcount | **[hard]** | fable | done (see log) |
 | FR-2 | `GlobalProfiler.show()`: replace `ppid == 1` heuristic | small | — | todo |
 | FR-3 | Generator `@profile` preserves return value | trivial | — | todo |
 | FR-4 | AST: skip `*` aliases in `_visit_import` | trivial | — | todo (folds into AST-ROBUST) |
 | FR-5 | AST: multi-name import statements profile all matched names | small | — | todo (folds into AST-ROBUST) |
 | FR-6 | `LineStats` mixed-unit merge converts to smallest unit | small | — | todo |
 | FR-7 | `_line_profiler.pyi` drift | — | — | superseded by TYPE program |
-| FR-8 | `c_trace_callbacks.c` refcount fixes | **[hard]** | fable | in-progress 2026-07-05 |
+| FR-8 | `c_trace_callbacks.c` refcount fixes | **[hard]** | fable | done (d1616c5) |
 | FR-9 | `_StrEnumBase.__hash__` on 3.10 | trivial | — | todo |
 | FR-10 | Guard monitoring callbacks during interpreter finalization | small | — | todo |
 | FR-11 | Cosmetic/dead-code bundle (see review F11: docstring env var, dead guards, `if basename`→`if parent`, util_static twins, pyx try/else/finally, inspect monkeypatch lock) | small | — | todo |
@@ -147,6 +147,40 @@ Plan:
   current branch → PR into `TTsangSC:profile-child-processes` → main;
   repo-level fixes (FR-*) staged as separate commits at the branch tip so
   they can be split into a follow-up PR onto main.
+- **2026-07-05 (fable):** FR-8 done (`d1616c5`). Confirmed the leaks
+  empirically before fixing (wrappers survive deletion of all Python
+  refs); fixed both leak sites, the NULL-to-SetAttr misuse, the
+  unchecked `PyUnicode_FromString`, and the `Py_None` overwrite; errors
+  now go through `PyErr_WriteUnraisable` (the Cython call site is
+  `void` with no exception check, so a set-but-unchecked exception
+  would smear into unrelated code). Regression test:
+  `tests/test_trace_callback_leaks.py` (weakref-death of captured
+  `frame.f_trace` wrappers; red against the old .so, green after).
+  Gotcha for future agents: the wrappers are Cython closures that
+  masquerade as the wrapped function (`@wraps` copies `__qualname__`),
+  so neither `types.FunctionType` checks nor qualname scans find them.
+- **2026-07-05 (fable):** FR-1 done. Deviation from the literal spec
+  (which suggested a bare refcount): a count alone is insufficient
+  because attribution consults the handling manager's
+  `active_instances` — a profiler enabled on another thread would be
+  invisible to the registered manager and its data silently dropped.
+  Implemented instead: one shared `_SysMonitoringState` per tool id
+  (`_get_shared_mon_state()`), with every manager's
+  `active_instances` aliased to the shared state's set when the sysmon
+  core is in use (legacy stays strictly per-thread). The existing
+  enable/disable logic then becomes globally correct: registration on
+  first-profiler-anywhere, teardown on last-profiler-anywhere,
+  regardless of thread. `deregister()` is now idempotent (no-op unless
+  registered) and tolerant of an externally-freed tool;
+  `LineProfiler.disable()` clears `_c_last_time` for all threads under
+  sysmon. Semantics note: raw `enable()`/`disable()` (not
+  `_by_count`) are now idempotent process-globally under sysmon —
+  consistent with their idempotent-per-thread legacy behavior;
+  `enable_by_count()` remains the sanctioned nesting mechanism.
+  Regression test: `tests/test_cross_thread_profiling.py` (two
+  profilers, two threads, first enabler bows out mid-flight; red
+  before — `ValueError: tool 2 is not in use` + lost hits — green
+  after, both cores).
 
 ## Open questions
 
