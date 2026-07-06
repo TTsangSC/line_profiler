@@ -387,6 +387,8 @@ class LineStats(CLineStats):
         *files: PathLike[str] | str,
         on_empty: Literal['ignore', 'warn', 'error'] = 'warn',
         on_defective: Literal['ignore', 'warn', 'error'] = 'error',
+        _note_on_empty: str | None = None,
+        _note_on_defective: str | None = None,
     ) -> Self:
         """
         Utility function to load an instance from the given filenames.
@@ -424,18 +426,33 @@ class LineStats(CLineStats):
                 except Exception as e:
                     if on_defective == 'error':
                         raise
-                    failures[str(file)] = f'{type(e).__name__}: {e}'
+                    failure = type(e).__name__
+                    if str(e):
+                        failure = f'{failure}: {e}'
+                    failures[str(file)] = failure
 
         problems: Collection[Any]
-        for problems, description, behavior in [
-            (list(empty_files), 'is/are empty and thus skipped:', on_empty),
-            (failures, 'failed to load and is/are skipped', on_defective),
+        for problems, description, behavior, note in [
+            (
+                list(empty_files),
+                'is/are empty and thus skipped',
+                on_empty,
+                _note_on_empty,
+            ),
+            (
+                failures,
+                'cannot be loaded and thus is/are skipped',
+                on_defective,
+                _note_on_defective,
+            ),
         ]:
             if not problems:
                 continue
             msg = '{} file(s) out of {} {}: {!r}'.format(
                 len(problems), len(all_files), description, problems,
             )
+            if note:
+                msg = f'{msg}; {note}'
             if behavior == 'warn':
                 # Log before warning because warnings may be promoted to
                 # errors

@@ -226,8 +226,15 @@ class LineProfilingCache(Cleanup):
         )
         if not fnames:
             return LineStats.get_empty_instance()
+        caveat = (
+            'note that empty/malformed profiling files may be produced '
+            'when child processes exits uncleanly (e.g. `.terminate()`-ed '
+            'or `.kill()`-ed by the parent)'
+        )
         return LineStats.from_files(
-            *fnames, on_empty=on_empty, on_defective=on_defective,
+            *fnames,
+            on_empty=on_empty, on_defective=on_defective,
+            _note_on_empty=caveat, _note_on_defective=caveat,
         )
 
     def _dump_debug_logs(self) -> None:
