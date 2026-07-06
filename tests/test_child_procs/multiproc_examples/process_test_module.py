@@ -4,6 +4,7 @@ import atexit
 import os
 import pickle
 import shutil
+import sys
 from argparse import ArgumentParser
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
@@ -73,8 +74,6 @@ class Timeout(RuntimeError):
 class Worker(Generic[T]):
     """
     Example:
-        >>> # xdoctest: +SKIP
-
         >>> import os
         >>> from time import sleep
 
@@ -96,7 +95,9 @@ class Worker(Generic[T]):
     tmpdir: Path
     result_callback: Callable[[], T]
     _result: T = field(init=False)
+    _should_interpolate: bool = field(default=False, init=False)
     _counter: ClassVar[count] = count()
+    _module_path: ClassVar[str] = str(Path(__file__).parent)
 
     def get_result(self, timeout: float | None = None) -> T:
         try:
@@ -127,10 +128,24 @@ class Worker(Generic[T]):
         return '<{} @ {:#x} ({})>'.format(type(self).__name__, id(self), attrs)
 
     def __enter__(self) -> Self:
+        # Ensure that this module is import-able; see
+        # Erotemic/xdoctest#207
+        path = self._module_path
+        self._should_interpolate = interpolate = not any(
+            os.path.samefile(path, p) for p in sys.path if os.path.exists(p)
+        )
+        if interpolate:
+            sys.path.insert(0, path)
         self.process.start()
         return self
 
     def __exit__(self, *_, **__) -> None:
+        if self._should_interpolate:
+            self._should_interpolate = False
+            try:
+                sys.path.remove(self._module_path)
+            except ValueError:
+                pass
         try:
             self._end_process('terminate')
         finally:
