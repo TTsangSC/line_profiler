@@ -10,7 +10,7 @@ from functools import partial
 from inspect import getattr_static
 from operator import setitem
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast, overload
 from typing_extensions import Concatenate, ParamSpec, Self
 
 from .line_profiler_utils import CallbackRepr, make_tempfile
@@ -24,10 +24,24 @@ K = TypeVar('K')
 V = TypeVar('V')
 _Stacks = dict[float, list[Callable[[], Any]]]
 _StackContexts = list[_Stacks]
+LogLevel = Literal['debug', 'info', 'warning', 'error', 'critical']
 
 
 _CALLBACK_REPR_HELPER = CallbackRepr(maxother=cast(int, float('inf')))
 _CALLBACK_REPR = _CALLBACK_REPR_HELPER.repr
+
+
+class _LoggingCallback(Protocol):
+    @overload
+    def __call__(self, msg: str, /) -> Any:
+        ...
+
+    @overload
+    def __call__(self, msg: str, /, level: LogLevel) -> Any:
+        ...
+
+    def __call__(self, *_, **__):
+        ...
 
 
 class Cleanup:
@@ -124,7 +138,7 @@ class Cleanup:
 
     @staticmethod
     def _cleanup(
-        log: Callable[[str], Any], stacks: _Stacks, reason: str | None,
+        log: _LoggingCallback, stacks: _Stacks, reason: str | None,
     ) -> None:
         ncallbacks_total = sum(len(stack) for stack in stacks.values())
         note = f'{ncallbacks_total} callback(s)'
@@ -146,14 +160,15 @@ class Cleanup:
                 try:
                     callback()
                 except Exception as e:
-                    state = 'failed'
+                    success, state = False, 'failed'
                     msg = f'{callback_repr}: {type(e).__name__}: {e}'
                 else:
-                    state, msg = 'succeeded', f'{callback_repr}'
-                log(
+                    success, state, msg = True, 'succeeded', f'{callback_repr}'
+                msg = (
                     f'- Cleanup {state} '
-                    f'({ncallbacks_run}/{ncallbacks_total}): {msg}',
+                    f'({ncallbacks_run}/{ncallbacks_total}): {msg}'
                 )
+                log(msg, 'debug' if success else 'warning')
         log(f'... cleanup completed ({note})')
 
     def add_cleanup(
@@ -399,15 +414,16 @@ class Cleanup:
                 name = f'{obj.__module__}.{name}'
         return str(name)
 
-    def _debug_output(self, msg: str, /) -> None:
+    def _debug_output(self, msg: str, /, level: LogLevel = 'debug') -> None:
         """
         Write debugging output.
 
         Note:
             This default implementation just writes to the logger at the
-            ``DEBUG`` level.
+            specified level.
         """
-        diagnostics.log.debug(msg)
+        log_func = getattr(diagnostics.log, level)
+        log_func(msg)
 
     @property
     def _current_context(self) -> _Stacks:

@@ -26,7 +26,7 @@ from typing_extensions import Concatenate, ParamSpec, Self
 
 from _line_profiler_hooks import INHERITED_PID_ENV_VARNAME, load_pth_hook
 from .. import _diagnostics as diagnostics
-from ..cleanup import Cleanup, _CALLBACK_REPR_HELPER
+from ..cleanup import Cleanup, LogLevel, _CALLBACK_REPR_HELPER
 from ..curated_profiling import CuratedProfilerContext
 from ..line_profiler import LineProfiler, LineStats
 from ..toml_config import ConfigSource
@@ -371,13 +371,14 @@ class LineProfilingCache(Cleanup):
 
         return fpath
 
-    def _debug_output(self, msg: str) -> None:
+    def _debug_output(self, msg: str, /, level: LogLevel = 'debug') -> None:
         """
         Beside writing to the logger, also write to the
         :py:attr:`~._debug_log`.
         """
+        entry = CacheLoggingEntry.new(self.main_pid, id(self), msg, level)
         try:
-            self._make_debug_entry(msg).write(self._debug_log)
+            entry.write(self._debug_log)
         except OSError:  # Cache dir may have been rm-ed during cleanup
             pass
 
@@ -446,9 +447,10 @@ class LineProfilingCache(Cleanup):
                 calling this function, true otherwise
         """
         def wrap_ctx_debug(
-            ctx: CuratedProfilerContext, msg: str,
+            ctx: CuratedProfilerContext, msg: str, /,
+            level: LogLevel = 'debug',
         ) -> None:
-            self._debug_output(f'  Context {id(ctx):#x}: {msg}')
+            self._debug_output(f'  Context {id(ctx):#x}: {msg}', level)
 
         if not context:
             context = '...'
@@ -819,10 +821,6 @@ class LineProfilingCache(Cleanup):
             main_pid=self.main_pid, current_pid=os.getpid(),
         )
         return Path(self.cache_dir) / fname
-
-    @cached_property
-    def _make_debug_entry(self) -> Callable[[str], CacheLoggingEntry]:
-        return partial(CacheLoggingEntry.new, self.main_pid, id(self))
 
     @cached_property
     def _consistent_with_loaded_instance(self) -> bool:

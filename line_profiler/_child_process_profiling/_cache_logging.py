@@ -7,6 +7,7 @@ import os
 import re
 from collections.abc import Generator
 from datetime import datetime
+from enum import auto
 from itertools import pairwise
 from pathlib import Path
 from string import Formatter as StringParser
@@ -15,14 +16,13 @@ from typing import TYPE_CHECKING, NamedTuple, TextIO, overload
 from typing_extensions import Self
 
 from .. import _diagnostics as diagnostics
-from ..line_profiler_utils import block_indent
+from ..line_profiler_utils import block_indent, StringEnum
 
 
 __all__ = ('CacheLoggingEntry',)
 
-
 FILENAME_PATTERN = 'debug_log_{main_pid}_{current_pid}.log'
-TIMESTAMP_PATTERN = '[cache-debug-log {timestamp} DEBUG]'
+TIMESTAMP_PATTERN = '[cache-debug-log {timestamp} {level}]'
 HEADER_PATTERN = 'PID {current_pid} ({main_pid}): Cache {obj_id:#x}'
 
 TIMESTAMP_FORMAT = '%Y-%m-%d %H:%M:%S'
@@ -32,6 +32,14 @@ TIMESTAMP_SPACING = ' '
 
 HEADER_SEP = ': '
 HEADER_MAIN_INDICATOR = 'main process'
+
+
+class LogLevel(StringEnum):
+    DEBUG = auto()
+    INFO = auto()
+    WARNING = auto()
+    ERROR = auto()
+    CRITICAL = auto()
 
 
 def get_logger_header(current_pid: int, main_pid: int, obj_id: int) -> str:
@@ -88,7 +96,11 @@ def parse_timestamp(ts: str) -> datetime:
     return datetime.strptime(ts, parse_format)
 
 
-def add_timestamp(msg: str, timestamp: datetime | None = None) -> str:
+def add_timestamp(
+    msg: str,
+    timestamp: datetime | None = None,
+    level: str | LogLevel = LogLevel.DEBUG,
+) -> str:
     """
     Returns:
         msg_with_timestamp (str):
@@ -99,6 +111,7 @@ def add_timestamp(msg: str, timestamp: datetime | None = None) -> str:
         timestamp = datetime.now()
     ts_formatted = TIMESTAMP_PATTERN.format(
         timestamp=format_timestamp(timestamp),
+        level=str(level).upper(),
     )
     return block_indent(msg, ts_formatted + TIMESTAMP_SPACING)
 
@@ -205,6 +218,7 @@ class CacheLoggingEntry(NamedTuple):
         >>>
         >>> entry = CacheLoggingEntry(
         ...     datetime(1900, 1, 1, 0, 0, 0, 0),
+        ...     LogLevel.DEBUG,
         ...     12345,
         ...     12345,
         ...     12345678,
@@ -217,13 +231,14 @@ class CacheLoggingEntry(NamedTuple):
 multiple lines
         >>> another_entry = CacheLoggingEntry(
         ...     datetime(2000, 12, 31, 12, 34, 56, 789000),
+        ...     LogLevel.INFO,
         ...     12345,
         ...     54321,
         ...     87654321,
         ...     'FOO BAR BAZ',
         ... )
         >>> print(another_entry.to_text())
-        [cache-debug-log 2000-12-31 12:34:56,789 DEBUG] PID 54321 \
+        [cache-debug-log 2000-12-31 12:34:56,789 INFO] PID 54321 \
 (12345): Cache 0x5397fb1: FOO BAR BAZ
         >>> log_text = '\\n'.join([
         ...     e.to_text() for e in [entry, another_entry]
@@ -233,13 +248,16 @@ multiple lines
         ... ]
     """
     timestamp: datetime
+    level: LogLevel
     main_pid: int
     current_pid: int
     cache_id: int
     msg: str
 
     def to_text(self) -> str:
-        return add_timestamp(self._get_header() + self.msg, self.timestamp)
+        return add_timestamp(
+            self._get_header() + self.msg, self.timestamp, self.level,
+        )
 
     def _get_header(self) -> str:
         return get_logger_header(
@@ -247,16 +265,29 @@ multiple lines
         ) + HEADER_SEP
 
     def write(self, tee: os.PathLike[str] | str | None = None) -> None:
+        """
+        Write the log message using
+        :py:mod:`line_profiler._diagnostics.log`. If ``tee`` is a path,
+        also tee thereto with an appropriate timestamp.
+        """
         log_msg = self._get_header() + self.msg
-        diagnostics.log.debug(log_msg)
+        log_func = getattr(diagnostics.log, self.level.lower())
+        log_func(log_msg)
         if tee is None:
             return
         with Path(tee).open(mode='a') as fobj:
-            print(add_timestamp(log_msg, self.timestamp), file=fobj)
+            full_msg = add_timestamp(log_msg, self.timestamp, self.level)
+            print(full_msg, file=fobj)
 
     @classmethod
-    def new(cls, main_pid: int, cache_id: int, msg: str) -> Self:
-        return cls(datetime.now(), main_pid, os.getpid(), cache_id, msg)
+    def new(
+        cls, main_pid: int, cache_id: int, msg: str,
+        level: str | LogLevel = LogLevel.DEBUG,
+    ) -> Self:
+        return cls(
+            datetime.now(), LogLevel(level), main_pid,
+            os.getpid(), cache_id, msg,
+        )
 
     @classmethod
     def from_file(cls, file: os.PathLike[str] | str | TextIO) -> list[Self]:
@@ -286,7 +317,7 @@ multiple lines
                     return
 
         def gen_message_blocks(text: str) -> Generator[
-            tuple[datetime, re.Match, str], None, None
+            tuple[datetime, LogLevel, re.Match, str], None, None
         ]:
             timestamps = list(gen_timestamps(text))
             if not timestamps:
@@ -295,18 +326,22 @@ multiple lines
             # Handle all the entries up till the 2nd-to-last one
             for this_match, next_match in pairwise(timestamps):
                 ts = parse_timestamp(this_match.group('timestamp'))
+                level = LogLevel(this_match.group('level'))
                 text_block = text[this_match.start():next_match.start()]
-                yield (ts, this_match, text_block.rstrip('\n'))
+                yield (ts, level, this_match, text_block.rstrip('\n'))
             # Handle the last entry
             last_match = timestamps[-1]
             yield (
                 parse_timestamp(last_match.group('timestamp')),
+                LogLevel(last_match.group('level')),
                 last_match,
                 text[last_match.start():].rstrip('\n'),
             )
 
         def get_entries(text: str) -> Generator[Self, None, None]:
-            for timestamp, ts_match, text_block in gen_message_blocks(text):
+            for (
+                timestamp, level, ts_match, text_block,
+            ) in gen_message_blocks(text):
                 # Strip the block indent
                 ts_text = ts_match.group(0)
                 assert text_block.startswith(ts_text), (
@@ -326,10 +361,14 @@ multiple lines
                 cache_id = parse_id(header_match.group('obj_id'))
                 # The rest of the block is the message proper
                 msg = text_block[header_match.end():]
-                yield cls(timestamp, main_pid, current_pid, cache_id, msg)
+                yield cls(
+                    timestamp, level, main_pid, current_pid, cache_id, msg,
+                )
 
         timestamp_pattern = fmt_to_regex(
-            f'{TIMESTAMP_PATTERN}{TIMESTAMP_SPACING}', timestamp='.+?',
+            f'{TIMESTAMP_PATTERN}{TIMESTAMP_SPACING}',
+            timestamp='.+?',
+            level='({})'.format('|'.join(LogLevel.__members__)),
         )
         timestamp_regex = re.compile('^' + timestamp_pattern, re.MULTILINE)
         header_regex = re.compile(fmt_to_regex(
