@@ -38,8 +38,6 @@ __all__ = ('LineProfilingCache',)
 
 T = TypeVar('T')
 PS = ParamSpec('PS')
-# Note: `typing.AnyStr` deprecated since 3.13
-AnyStr = TypeVar('AnyStr', str, bytes)
 
 _THIS_SUBPACKAGE, *_ = (lambda: None).__module__.rpartition('.')
 INHERITED_CACHE_ENV_VARNAME_PREFIX = (
@@ -146,8 +144,8 @@ class LineProfilingCache(Cleanup):
             If a previously :py:meth:`.~.load`-ed instance exists, it is
             returned instead of a new instance.
         """
-        # `ty` needs some help here, evenif we've marked the class to be
-        # `@final`
+        # `ty` needs some help here, even if we've marked the class to
+        # be `@final`
         instance = cast(Self | None, cls._loaded_instance)
         if instance is None:
             pid = os.environ[INHERITED_PID_ENV_VARNAME]
@@ -401,7 +399,7 @@ class LineProfilingCache(Cleanup):
               (see :py:meth:`~.inject_env_vars()`)
 
             - A ``.pth`` file written so that child processes
-              automaticaly runs setup code (see
+              automatically runs setup code (see
               :py:meth:`.write_pth_hook`)
 
             - :py:func:`os.fork` wrapped so that profiling set up in

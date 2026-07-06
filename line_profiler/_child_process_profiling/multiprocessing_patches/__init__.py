@@ -56,19 +56,14 @@ def apply(
 
     Patches:
         ``'pool'``:
-            On Windows
-                Patch :py:class:`multiprocessing.pool.Pool`'s
-                ``._get_tasks()`` and ``._guarded_task_generation()``
-                methods so that parallel tasks write profiling output.
-            Else
-                Patch :py:func:`multiprocessing.pool.worker` so that
-                profiling output is written as each child process runs
-                out of task.
+            Patch :py:func:`multiprocessing.pool.worker` so that
+            profiling output is written as each pool-worker child
+            process completes a task.
         ``'process'``:
-            Patch :py:class:`multiprocessing.process.BaseProcess`'s
-            ``._bootstrap()`` method (and ``.terminate()`` on Windows)
-            so that child processes write profiling output on exit and
-            are given enough time for that.
+            Patch
+            :py:meth:`multiprocessing.process.BaseProcess._bootstrap`
+            so that non-pool-worker child processes write profiling
+            output on exit.
         ``'logging'``:
             Patch :py:mod:`multiprocessing.util`'s logging methods (e.g.
             ``debug()`` and ``info()``) so that their messages are teed
@@ -87,12 +82,12 @@ def apply(
 
     Note:
         Rebooting the fork server is necessary because its process
-        staticly inherits the environment when it is first spun up
+        statically inherits the environment when it is first spun up
         (see :py:func:`multiprocessing.forkserver.ensure_running`).
         Thus, without the reboots:
 
         - If in the same Python process we ever start up two separate
-          profliing sessions managed by different caches, the child
+          profiling sessions managed by different caches, the child
           processes forked from the server will fail to inherit the
           updated environment variables injected by the newer cache
           instance, leading to the setup code in this subpackage not

@@ -266,7 +266,7 @@ class CallbackRepr(Repr):
 
     def format_call(self, /, *args, **kwargs) -> str:
         """
-        Convenience method for Formating a call a la
+        Convenience method for Formatting a call a la
         :py:meth:`inspect.BoundArguments.__str__`.
 
         Example:
@@ -344,9 +344,16 @@ def make_tempfile(**kwargs) -> Path:
     Convenience wrapper around :py:func:`tempfile.mkstemp`, discarding
     and closing the integer handle (which if left unattended causes
     problems on some platforms).
+
+    Note:
+        If for whatever reason the handle cannot be closed, the function
+        errors out and the tempfile is deleted.
     """
     handle, fname = mkstemp(**kwargs)
+    path = Path(fname)
     try:
-        return Path(fname)
-    finally:
         os.close(handle)
+        return path
+    except Exception:
+        path.unlink()
+        raise

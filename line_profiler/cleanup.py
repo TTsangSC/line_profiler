@@ -177,7 +177,7 @@ class Cleanup:
                 Callback to be called at cleanup
             priority (float):
                 Numeric priority value; callbacks with a HIGHER value
-                are invoked BEFORE those with bigger values
+                are invoked BEFORE those with lower values
             *args, **kwargs:
                 Arguments ``callback`` should be called with
 
@@ -404,7 +404,8 @@ class Cleanup:
         Write debugging output.
 
         Note:
-            This default implementation just writes to the logger.
+            This default implementation just writes to the logger at the
+            ``DEBUG`` level.
         """
         diagnostics.log.debug(msg)
 

@@ -502,13 +502,7 @@ def _test_apply_mp_patches_inner(
     config = tmp_path_factory.mktemp('myconfig') / 'mytoml.toml'
     intercept_logs = 'logging' in mp_patches
     assert {'pool', 'process'} & set(mp_patches)  # Needed for profiling
-    cfg_chunks: list[str] = [
-        get_mp_patches_toml_text(mp_patches),
-        # This is easier to debug than `ResultMismatch`
-        '[tool.line_profiler.child_processes.multiprocessing.polling]\n'
-        'on_timeout = "error"',
-    ]
-    config.write_text('\n\n'.join(cfg_chunks))
+    config.write_text(get_mp_patches_toml_text(mp_patches))
 
     # Note: no need to test the case for `my_local_sum()` separately,
     # with `preimports_module=True`, both are just imported and added
@@ -983,7 +977,7 @@ def test_profiling_multiproc_script_success(
         This test function is heavily parametrized. Here is why that is
         necessary:
 
-        - ``run_func`` tests the different :cmd:`kernprof` modes (see
+        - ``run_func`` tests the different ``kernprof`` modes (see
           :py:func:`~.test_running_multiproc_script`).
 
         - ``test_module`` chooses what kind of parallelism the test

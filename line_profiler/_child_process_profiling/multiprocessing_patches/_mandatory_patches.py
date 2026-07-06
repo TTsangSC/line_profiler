@@ -172,7 +172,7 @@ def wrap_terminate_pool(
     try:
         vanilla_impl(cls, taskqueue, inqueue, outqueue, pool, *args, **kwargs)
     finally:
-        # Guard against dummy ppol; see similar code in
+        # Guard against dummy pool; see similar code in
         # `multiprocessing.pool`
         if pool and hasattr(pool[0], 'terminate'):
             for worker in pool:
@@ -280,7 +280,7 @@ class RebootForkserverPatch:
 
     Note:
         This uses
-        :py:method:`multiprocessing.forkserver.ForkServer._stop()` which
+        :py:meth:`multiprocessing.forkserver.ForkServer._stop()` which
         is private API, but it's the same hack used in Python's own test
         suite -- see the comment to said method.
     """

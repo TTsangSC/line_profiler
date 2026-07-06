@@ -109,7 +109,7 @@ class ClassifiedPreimportTargets:
     ) -> Self:
         """
         Create an instance based on a collection of targets
-        (like what is supplied to :cmd:`kernprof --prof-mod=...`).
+        (like what is supplied to ``kernprof --prof-mod=...``).
 
         Args:
             targets (Collection[str])

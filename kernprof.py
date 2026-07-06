@@ -789,7 +789,7 @@ def _add_core_parser_arguments(parser):
         'Minimum value (and the value implied if the bare option '
         f'is given) is 1 s. (Default: {def_out_int})',
     )
-    # Hidden option for dumping the debug logs to a desinated location
+    # Hidden option for dumping the debug logs to a designated location
     add_argument(out_opts, '--debug-log', help=SUPPRESS)
 
 

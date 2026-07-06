@@ -2,16 +2,16 @@
 Additional hooks installed by :py:mod:`line_profiler`.
 
 Notes:
-    - This file and its content should be considered an implmentation
+    - This file and its content should be considered an implementation
       detail of :py:mod:`line_profiler`; currently we just use this to
       set up shop in a child Python process, and extend profiling to
       therein.
 
     - This current implementation writes temporary .pth files to the
       site-packages directory, which are executed for all Python
-      processes referring to the same :path:`lib/`. However, only
-      processes originating from a parent which set the requisite
-      environment variables will execute to the profiling code.
+      processes referring to the same ``lib/``. However, only processes
+      originating from a parent which set the requisite environment
+      variables will execute to the profiling code.
 
     - Said .pth file always import this module; hence, this file is kept
       intentionally lean and separate from the main
@@ -43,6 +43,12 @@ def load_pth_hook(ppid: int) -> None:
         return
     if env_ppid != ppid:
         return
+    # Note: .pth files may be double-loaded in a virtual environment
+    # (see https://stackoverflow.com/questions/58807569), so work around
+    # that;
+    # also see similar check in `coverage.control.process_startup()`
+    if getattr(load_pth_hook, 'called', False):
+        return
 
     # If we're here, we're most probably in a descendent process of a
     # profiled Python process, so we can be more liberal with the
@@ -51,19 +57,13 @@ def load_pth_hook(ppid: int) -> None:
     from line_profiler._diagnostics import DEBUG, log
     from line_profiler._child_process_profiling.cache import LineProfilingCache
 
-    # Note: .pth files may be double-loaded in a virtual environment
-    # (see https://stackoverflow.com/questions/58807569), so work around
-    # that;
-    # also see similar check in `coverage.control.process_startup()`
-    if getattr(load_pth_hook, 'called', False):
-        return
     try:
         cache = LineProfilingCache.load()
         cache._setup_in_child_process(True, 'pth')
     except Exception as e:  # nocover
         if DEBUG:
             msg = f'{type(e)}: {e}'
-            # Write log befor issuing warning, in case the warning is
+            # Write log before issuing warning, in case the warning is
             # promoted to an exception
             log.warning(msg)
             warnings.warn(msg)

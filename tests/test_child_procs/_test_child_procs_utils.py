@@ -1718,7 +1718,7 @@ PATCH_SUMMARIES: dict[
 }
 # Get patches that are dynamically resolved: while these patches are
 # always applied, some of the patch targets are
-# platform-/Pyhon-version-specific and may not always exist
+# platform-/Python-version-specific and may not always exist
 _dynamically_resolved_patch_summaries: Iterable[_PatchSummary] = (
     patch.summary for name, patch in _MP_PATCHES.items()
     # Basic `multiprocessing` patches are always applied
@@ -1907,7 +1907,7 @@ def _run_kernprof_main_in_process(
     **_kwargs
 ) -> subprocess.CompletedProcess:
     """
-    Emulate running :cmd:`kernprof` in a subprocess with in-process
+    Emulate running ``kernprof`` in a subprocess with in-process
     machineries as best as we can, so that we can retrieve more
     debugging output when things do go south.
     """
@@ -1946,7 +1946,7 @@ def _run_kernprof_main_in_process(
         main = kernprof_main
     with ExitStack() as stack:
         if check_warnings:
-            # See similar indictions against warnings in
+            # See similar indictments against warnings in
             # `test_child_procs.py::_test_apply_mp_patches()`
             cw = stack.enter_context(CheckWarnings())
             cw.forbid_warnings('.*resource_tracker', module='multiprocessing')
@@ -2054,7 +2054,7 @@ def _run_test_module(
     Returns:
         process_running_the_test_module (subprocess.CompletedProcess):
             Process object
-        profliing_stats (LineStats | None):
+        profiling_stats (LineStats | None):
             Line-profiling stats (where available)
     """
     if isinstance(runner, str):
@@ -2068,7 +2068,7 @@ def _run_test_module(
     if profile and not profiled_code_is_tempfile:
         runner_cli_args.extend(['--prof-mod', str(test_module.path)])
     if nhits is not None:
-        # We need `kernprof` to write the profliing results immediately
+        # We need `kernprof` to write the profiling results immediately
         # to preserve data from tempfiles (see note below)
         runner_cli_args.append('--view')
 
@@ -2166,7 +2166,7 @@ def check_tagged_line_nhits(output: str, tag: str, nhits: int) -> None:
     Check the output of :py:meth:`LineStats.print` for the number of
     hits on the line tagged with the comment ``# GREP_MARKER[<...>]``.
     """
-    # The line should be preixed with 5 numbers:
+    # The line should be prefixed with 5 numbers:
     # lineno, nhits, time, time-per-hit, % time
     actual_nhits = 0
     for line in output.splitlines():
