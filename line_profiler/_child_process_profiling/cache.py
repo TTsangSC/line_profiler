@@ -7,30 +7,34 @@ from __future__ import annotations
 import atexit
 import dataclasses
 import os
+import site
+import sys
 import sysconfig
+import warnings
 try:
     import _pickle as pickle
 except ImportError:
     import pickle  # type: ignore[assignment,no-redef]
 from collections.abc import (
-    Collection, Callable, Iterable, Mapping, MutableMapping,
+    Collection, Callable, Generator, Iterable, Mapping, MutableMapping,
 )
 from functools import partial, cached_property, wraps
 from importlib import import_module
 from pathlib import Path
 from pickle import HIGHEST_PROTOCOL
 from textwrap import indent
-from types import ModuleType
+from types import ModuleType, TracebackType
 from typing import Any, ClassVar, Literal, TypeVar, cast, final, overload
 from typing_extensions import Concatenate, ParamSpec, Self
 
-from _line_profiler_hooks import INHERITED_PID_ENV_VARNAME, load_pth_hook
+import _line_profiler_hooks as _lp_hooks
 from .. import _diagnostics as diagnostics
 from ..cleanup import Cleanup, LogLevel, _CALLBACK_REPR_HELPER
 from ..curated_profiling import CuratedProfilerContext
 from ..line_profiler import LineProfiler, LineStats
 from ..toml_config import ConfigSource
 from ._cache_logging import CacheLoggingEntry
+from ._retrieve_pids import CAN_RETRIEVE_PIDS, processes_are_alive
 
 
 __all__ = ('LineProfilingCache',)
@@ -148,7 +152,7 @@ class LineProfilingCache(Cleanup):
         # be `@final`
         instance = cast(Self | None, cls._loaded_instance)
         if instance is None:
-            pid = os.environ[INHERITED_PID_ENV_VARNAME]
+            pid = os.environ[_lp_hooks.INHERITED_PID_ENV_VARNAME]
             cache_varname = f'{INHERITED_CACHE_ENV_VARNAME_PREFIX}_{pid}'
             cache_dir = os.environ[cache_varname]
             msg = (
@@ -324,6 +328,7 @@ class LineProfilingCache(Cleanup):
         dir: os.PathLike[str] | str | None = None,
         # Get rid of the .pth file ASAP so as to be the least disruptive
         priority: float = 1,
+        clean_stale: bool = True,
         **kwargs
     ) -> Path:
         """
@@ -333,16 +338,33 @@ class LineProfilingCache(Cleanup):
         Args:
             prefix, suffix (str | None):
                 Optional filename-stem affixes of the .pth file; default
-                is to use default values loaded from :py:attr:`.config`
+                is to use default values loaded from :py:attr:`.config`.
             dir (os.PathLike[str] | str | None):
                 Optional directory to create the .pth file in; default
-                is to use ``sysconfig.get_path('purelib')``
+                is to look up a list of directories where .pth files can
+                usually be installed to, depending on the environment
+                and interpreter state.
+            clean_stale (bool):
+                Whether to look at the directory where the .pth file
+                has been written to and prune stale .pth files.
             priority, **kwargs:
                 Passed to :py:meth:`.make_tempfile`.
 
         Returns:
             fpath (Path):
                 Path to the written .pth file
+
+        Notes:
+            - Due to normalizations and attachment of extra data, users
+              should NOT count on the affixes bracketing the filename
+              stem of the created file.
+
+            - During normal execution, the .pth file should be cleaned
+              up, as with all other tempfiles created with
+              :py:meth:`.make_tempfile` created without
+              ``delete=False``. However, if the Python control flow is
+              broken (e.g. process killed), cleanup can fail to occur.
+              Hence the option to ``clean_stale``.
         """
         def get_pth_config() -> Mapping[str, Any]:
             # Note: the only keys in it should be `prefix` and `suffix`
@@ -362,21 +384,255 @@ class LineProfilingCache(Cleanup):
             prefix = str(get_pth_config()['prefix'])
         if suffix is None:
             suffix = str(get_pth_config()['suffix'])
-        if dir is None:
-            dir = sysconfig.get_path('purelib')
+        prefix, suffix_template = self._normalize_pth_affixes(prefix, suffix)
+        suffix = suffix_template.format(self.main_pid)
 
-        template = 'import {0.__module__}; {0.__module__}.{0.__name__}({1})'
-        fpath = self.make_tempfile(
-            prefix=prefix, suffix=suffix + '.pth', dir=dir, priority=priority,
-            **kwargs,
+        if dir is None:
+            dirs: list[Path]
+            dirs = list(self._enumerate_pth_installation_locations())
+        else:
+            dirs = [Path(dir)]
+
+        failures: dict[Path, str] = {}
+        tempfile_msg_template = 'Created tempfile {0.name!r} at {0.parent}'
+        for dir in dirs:
+            try:
+                fpath = self.make_tempfile(
+                    prefix=prefix, suffix=suffix,
+                    dir=dir, priority=priority,
+                    _format_debug_msg=tempfile_msg_template.format,
+                    **kwargs
+                )
+            except OSError as e:
+                failures[dir] = self._format_exception(e)
+            else:
+                break
+        else:
+            raise RuntimeError(
+                'cannot create .pth file in any of the following directories '
+                f'({{path: error}}): {failures!r}'
+            )
+
+        content = self._get_graceful_oneline_call(
+            _lp_hooks.__name__,
+            _lp_hooks.load_pth_hook.__name__,
+            self.main_pid,
         )
         try:
-            fpath.write_text(template.format(load_pth_hook, self.main_pid))
+            fpath.write_text(content)
         except Exception:
             fpath.unlink(missing_ok=True)
             raise
 
+        if clean_stale:
+            self._cleanup_stale_pth_files(
+                prefix, suffix_template, fpath.parent,
+            )
         return fpath
+
+    def _cleanup_stale_pth_files(
+        self, prefix: str, suffix_template: str, dir: Path,
+    ) -> None:
+        def log(msg: str, level: LogLevel = 'debug') -> None:
+            msg = f'._cleanup_stale_pth_files(): {msg}'
+            self._debug_output(msg, level)
+
+        def warn(msg: str) -> None:
+            log(msg, 'warning')
+            # 3: code calling `._cleanup_stale_pth_files()`
+            warnings.warn(msg, stacklevel=3)
+
+        if not CAN_RETRIEVE_PIDS:  # nocover
+            warn(
+                'lookup for stale .pth files not currently possible '
+                f'on this platform (`{sys.platform}`); cleanup aborted',
+            )
+            return
+
+        try:
+            pth_files = self._find_pth_files(prefix, suffix_template, dir)
+            is_alive = processes_are_alive(pth_files)
+        except Exception as e:  # nocover
+            try:
+                frame = cast(TracebackType, e.__traceback__).tb_frame
+                context = f'{frame.f_code.co_filename}:{frame.f_lineno}'
+            except Exception:  # E.g. no traceback
+                context = ''
+            xc = self._format_exception(e)
+            if context:
+                xc = f'{xc} ({context})'
+            warn(
+                f'lookup for stale .pth files failed ({xc}); '
+                'cleanup aborted',
+            )
+            return
+
+        nfiles = sum(len(p) for p in pth_files.values())
+        nstale = 0
+        npruned = 0
+        log(f'found {nfiles} matching .pth file(s)')
+        for ppid, pths in pth_files.items():
+            if is_alive[ppid]:
+                log(
+                    f'skipping over {len(pths)} .pth file(s) '
+                    f'associated with main PID {ppid} (do not seem stale)'
+                )
+                continue
+            for pth in pths:
+                nstale += 1
+                try:
+                    pth.unlink()
+                except Exception as e:
+                    success = False
+                    status = f'failed ({self._format_exception(e)})'
+                else:
+                    success, status = True, 'succeeded'
+                    npruned += 1
+                report: Callable[[str], Any] = log if success else warn
+                report(f'cleanup for stale .pth file {pth.name!r} {status}')
+        log(f'summary: {nfiles} found, {nstale} stale, {npruned} pruned')
+
+    @staticmethod
+    def _find_pth_files(
+        prefix: str, suffix_template: str, dir: Path,
+    ) -> dict[int, set[Path]]:
+        result: dict[int, set[Path]] = {}
+        assert suffix_template.endswith('ppid-{}.pth')
+        glob_pattern = f'{prefix}?*{suffix_template.format("?*")}'
+        for pth in dir.glob(glob_pattern):
+            *_, suffix = pth.name.rpartition('ppid-')
+            assert suffix.endswith('.pth')
+            ppid = int(suffix[:-len('.pth')])
+            result.setdefault(ppid, set()).add(pth)
+        return result
+
+    @staticmethod
+    def _normalize_pth_affixes(prefix: str, suffix: str) -> tuple[str, str]:
+        prefix = prefix.rstrip('-') + '-'
+        # Escape braces because we'll use the suffix as a formatting
+        # template
+        suffix = suffix.strip('-').replace('{', '{{').replace('}', '}}')
+        suffix_chunks: list[str] = ['ppid', '{}']
+        if suffix:
+            suffix_chunks.insert(0, suffix)
+        suffix_template = ''.join('-' + chunk for chunk in suffix_chunks)
+        suffix_template += '.pth'
+        return prefix, suffix_template
+
+    @staticmethod
+    def _get_graceful_oneline_call(
+        module: str, func: str, /, *args, **kwargs,
+    ) -> str:
+        r"""
+        Get the content of a one-line .pth file which imports a
+        function and calls it with the supplied arguments, and fails
+        gracefully (e.g. due to failed imports) as far as possible.
+
+        Example:
+            >>> get_pth = LineProfilingCache._get_graceful_oneline_call
+            >>> run = lambda stmts: exec(stmts, {})  # Isolate side-fxs
+
+            >>> good_stmts = get_pth(
+            ...     'builtins', 'print', [1, 2], 'b', None, sep='\n',
+            ... )
+            >>> run(good_stmts)
+            [1, 2]
+            b
+            None
+
+            Check that non-frozen modules are correctly handled:
+
+            >>> pprint_stmts = get_pth(
+            ...     'pprint', 'pprint', [1, 2, 3], width=5,
+            ... )
+            >>> run(pprint_stmts)
+            [1,
+             2,
+             3]
+
+            Note that it satisfies the requirements for .pth files:
+
+            >>> assert good_stmts.startswith('import')
+            >>> assert len(good_stmts.splitlines()) == 1
+
+            If the import/module-spec lookup fails or the if the
+            attribute lookup on the module fails, the code is a no-op:
+
+            >>> from contextlib import ExitStack, redirect_stdout
+            >>> from io import StringIO
+
+            >>> with ExitStack() as stack:
+            ...     fobj = stack.enter_context(StringIO())
+            ...     stack.enter_context(redirect_stdout(fobj))
+            ...     bad_module_stmts = get_pth(
+            ...         'buuiltins', 'print', 'foo',
+            ...     )
+            ...     run(bad_module_stmts)  # Import fails -> no-op
+            ...     bad_func_stmts = get_pth(
+            ...         'builtins', 'priint', 'foo',
+            ...     )
+            ...     run(bad_module_stmts)  # Attr lookup fails -> no-op
+            ...     assert not (stdout := fobj.getvalue()), stdout
+
+            (Note: when running with :py:mod:`xdoctest`, leaving the
+            expected output empty does not by default check AGAINST
+            output; hence the context contraption.)
+        """
+        assert module and not module.isspace()
+        assert all(chunk.isidentifier() for chunk in module.split())
+        assert func.isidentifier()
+
+        call_args = [repr(a) for a in args]
+        call_args.extend(f'{k}={v!r}' for k, v in kwargs.items())
+        call_args = ['mod', repr(func)] + call_args
+
+        statements = [
+            'import importlib.util as iu',
+            'dummy = lambda *_, **__: None',
+            'call = lambda obj, attr, /, *a, **k: '
+            '(func if callable(func := getattr(obj, attr, None)) else dummy)'
+            '(*a, **k)',
+            # Import the module
+            f'spec = iu.find_spec({module!r})',
+            'mod = iu.module_from_spec(spec) if spec else None',
+            "call(spec.loader, 'exec_module', mod) if mod else None",
+            # Retrieve and call the function
+            f'call({", ".join(call_args)}) if mod else None',
+        ]
+        return '; '.join(statements)
+
+    @staticmethod
+    def _enumerate_pth_installation_locations() -> Generator[Path, None, None]:
+        """
+        Enumerate locations where the .pth file can potentially be
+        installed to; the lookup order is:
+
+        - Directory where :py:mod:`_line_profiler_hooks` is installed to
+          (if among the output of :py:func:`site.getsitepackages`)
+
+        - ``sysconfig.get_path('purelib')``
+
+        - The output of :py:func:`site.getusersitepackages`
+        """
+        def filter_dirs(
+            maybe_dirs: Iterable[os.PathLike[str] | str],
+        ) -> Generator[Path, None, None]:
+            for path in maybe_dirs:
+                if os.path.isdir(path):
+                    yield Path(path)
+
+        try:
+            path = Path(_lp_hooks.__file__).parent
+        except Exception:
+            pass
+        else:
+            if any(
+                path.samefile(p) for p in filter_dirs(site.getsitepackages())
+            ):
+                yield path
+        yield Path(sysconfig.get_path('purelib'))
+        if site.ENABLE_USER_SITE:
+            yield Path(site.getusersitepackages())
 
     def _debug_output(self, msg: str, /, level: LogLevel = 'debug') -> None:
         """
@@ -422,7 +678,17 @@ class LineProfilingCache(Cleanup):
         """
         self.dump()
         self.inject_env_vars()
-        self.write_pth_hook()
+        try:
+            self.write_pth_hook()
+        except Exception as e:
+            xc = self._format_exception(e)
+            msg = (
+                'cannot write a .pth file for setting up profiling '
+                f'in child processes ({xc}); profiling data cannot be '
+                'collected for non-`fork()`ed children'
+            )
+            self._debug_output(msg, 'warning')
+            warnings.warn(msg, stacklevel=2)
         self._setup_common(wrap_os_fork, {'reboot_forkserver': True})
         self._replace_loaded_instance()
 
@@ -812,7 +1078,7 @@ class LineProfilingCache(Cleanup):
         """
         cache_varname = f'{INHERITED_CACHE_ENV_VARNAME_PREFIX}_{self.main_pid}'
         return {
-            INHERITED_PID_ENV_VARNAME: str(self.main_pid),
+            _lp_hooks.INHERITED_PID_ENV_VARNAME: str(self.main_pid),
             cache_varname: str(self.cache_dir),
         }
 

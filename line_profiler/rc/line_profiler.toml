@@ -217,8 +217,14 @@ percent = 8
 
 # - `pth_files.prefix`, `.suffix` (str):
 #   Affixes to use for the stem of the name of the .pth file created
-#   Note: may be useful to tweak this in case of issues with .pth file
-#   precedence.
+#   Notes:
+#   - May be useful to tweak this in case of issues with .pth file
+#     precedence.
+#   - The PID of the main process is always suffixed on top of this
+#     suffix; this is so that .pth files can be identified by their
+#     "owning" processes and stale files can be cleaned up. In general
+#     end users should NOT count on the affixes appearing as-is in the
+#     final filename.
 prefix = '_line_profiler-profiling-hook-'
 suffix = ''
 
