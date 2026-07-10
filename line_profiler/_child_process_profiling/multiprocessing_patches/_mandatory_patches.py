@@ -3,10 +3,8 @@ from __future__ import annotations
 import atexit
 import os
 import multiprocessing
-import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from functools import partial
-from multiprocessing.pool import Pool
 from multiprocessing.process import BaseProcess
 from types import MappingProxyType as mappingproxy, MethodType
 from typing import Any, ClassVar, TypeVar, cast
@@ -36,13 +34,15 @@ else:
 from ..cache import LineProfilingCache
 from ..runpy_patches import create_runpy_wrapper
 from ._infrastructure import SingleModulePatch
-from ._queue import Queue, get_mp_pool_patch
+from ._pool_patch_helpers import (
+    get_per_task_callback_patch, get_worker_finalization_patch,
+)
 
 
 __all__ = (
     'POOL_WORKER_PID_PATCH', 'PROCESS_SETUP_PATCH',
     'RebootForkserverPatch', 'ResourceTrackerPatch', 'RunpyPatch',
-    'wrap_bootstrap', 'wrap_terminate_pool', 'wrap_join_exited_workers',
+    'wrap_bootstrap',
 )
 
 T = TypeVar('T')
@@ -116,77 +116,7 @@ PROCESS_SETUP_PATCH.add_method('BaseProcess', '_bootstrap', wrap_bootstrap)
 # ---------------------- PID bookkeeping patches -----------------------
 
 
-@LineProfilingCache._method_wrapper
-def wrap_terminate_pool(
-    cache: LineProfilingCache,
-    vanilla_impl: Callable[
-        Concatenate[type[Pool], Queue, Queue, Queue, list[P], PS], None
-    ],
-    cls: type[Pool],
-    taskqueue: Queue,
-    inqueue: Queue,
-    outqueue: Queue,
-    pool: list[P],
-    *args: PS.args,
-    **kwargs: PS.kwargs
-) -> None:
-    """
-    Wrap around :py:meth:`.Pool._terminate_pool` so that we recover task
-    info from the worker processes. If a worker was idle and hasn't
-    processed any task, it is reported to the cache.
-
-    Note:
-        :py:meth:`.Pool._terminate_pool` is a class method.
-    """
-    try:
-        vanilla_impl(cls, taskqueue, inqueue, outqueue, pool, *args, **kwargs)
-    finally:
-        if _is_nonempty_normal_pool(pool):
-            failures: list[P] = []
-            for worker in pool:
-                if worker.is_alive():  # nocover
-                    failures.append(worker)
-                    continue
-                _get_worker_ntasks(worker, cache)
-            if failures:  # nocover
-                msg = (
-                    f'{len(failures)} worker(s) still alive after '
-                    f'`Pool.terminate()`: {failures!r}'
-                )
-                cache._debug_output(msg, 'warning')
-                warnings.warn(msg)
-
-
-@LineProfilingCache._method_wrapper
-def wrap_join_exited_workers(
-    cache: LineProfilingCache,
-    vanilla_impl: Callable[[list[P]], bool],
-    pool: list[P],
-) -> bool:
-    """
-    Wrap around :py:meth:`.Pool._join_exited_workers` so that we recover
-    task info from worker processes which have already exited within the
-    pool's lifetime. If a worker was idle and hasn't processed any task,
-    it is reported to the cache.
-
-    Note:
-        :py:meth:`.Pool._join_exited_workers` is a static method.
-    """
-    if _is_nonempty_normal_pool(pool):
-        for worker in pool:
-            if worker.exitcode is not None:
-                _get_worker_ntasks(worker, cache)
-    return vanilla_impl(pool)
-
-
-def _is_nonempty_normal_pool(pool: Sequence[BaseProcess]) -> bool:
-    """
-    Guard against dummy pool; see similar code in `multiprocessing.pool`
-    """
-    return bool(pool and hasattr(pool[0], 'terminate'))
-
-
-def _get_worker_ntasks(worker: BaseProcess, cache: LineProfilingCache) -> int:
+def _get_worker_ntasks(cache: LineProfilingCache, worker: BaseProcess) -> int:
     """
     Check if the process has run any tasks; if not, report to the cache.
 
@@ -203,6 +133,8 @@ def _get_worker_ntasks(worker: BaseProcess, cache: LineProfilingCache) -> int:
     except KeyError:
         pass
     ntasks = _get_ntasks(cache).pop(pid, 0)
+    msg = 'Worker {0.name!r} (PID: {0.pid}) ran {1} task(s)'
+    cache._debug_output(msg.format(worker, ntasks))
     if not ntasks:
         cache._warn_possible_lack_of_stats(pid)
     return ntasks_finalized.setdefault(key, ntasks)
@@ -230,15 +162,14 @@ def _get_ntasks_finalized(
     )
 
 
-POOL_WORKER_PID_PATCH = get_mp_pool_patch(
-    os.getpid, _increment_ntasks, '__line_profiler_pool_worker_pid__',
+def _get_pid(_) -> int:
+    return os.getpid()
+
+
+POOL_WORKER_PID_PATCH = get_per_task_callback_patch(
+    _get_pid, _increment_ntasks, '__line_profiler_pool_worker_pid__',
 )
-POOL_WORKER_PID_PATCH.add_method(
-    'Pool', '_terminate_pool', wrap_terminate_pool, 'class',
-)
-POOL_WORKER_PID_PATCH.add_method(
-    'Pool', '_join_exited_workers', wrap_join_exited_workers, 'static',
-)
+get_worker_finalization_patch(_get_worker_ntasks, POOL_WORKER_PID_PATCH)
 
 # --------------------------- Misc. patches ----------------------------
 

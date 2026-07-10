@@ -233,8 +233,9 @@ suffix = ''
 [tool.line_profiler.child_processes.multiprocessing.patches]
 
 # - `multiprocessing.patches.pool` (bool):
-#   Whether to patch `multiprocessing.pool.worker()` so that each child
-#   process write profiling output as each task is completed
+#   Whether to patch `multiprocessing.pool.worker()` and `Pool` so that
+#   child processes report profiling stats to the parent as each task is
+#   completed
 pool = true
 # - `multiprocessing.patches.process` (bool):
 #   Whether to patch `multiprocessing.process.BaseProcess`, so that each

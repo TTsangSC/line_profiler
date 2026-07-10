@@ -56,9 +56,11 @@ def apply(
 
     Patches:
         ``'pool'``:
-            Patch :py:func:`multiprocessing.pool.worker` so that
-            profiling output is written as each pool-worker child
-            process completes a task.
+            Patch :py:class:`multiprocessing.pool.Pool` and
+            :py:func:`multiprocessing.pool.worker` so that profiling
+            output is recorded as each pool-worker child process
+            completes a task, and written to disk as the pool is
+            terminated.
         ``'process'``:
             Patch
             :py:meth:`multiprocessing.process.BaseProcess._bootstrap`

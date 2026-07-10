@@ -64,26 +64,7 @@ def _import_sibling(submodule: str) -> ModuleType:
 _private_field = partial(dataclasses.field, init=False, repr=False)
 
 
-def _dump_stats(
-    prof: LineProfiler,
-    outfile: os.PathLike[str] | str,
-    baseline: LineStats | None = None,
-) -> None:
-    """
-    Write ``prof``'s stats to ``outfile``; if a ``baseline`` is given
-    (e.g. the stats state inherited across an :py:func:`os.fork`),
-    subtract it first so that only work done in *this* process is
-    written (the process the baseline was inherited from writes the
-    baseline's contents itself).
-    """
-    if baseline is None:
-        prof.dump_stats(outfile)
-        return
-    stats = prof.get_stats() - baseline
-    stats.to_file(outfile)
-
-
-class _DumpStatsHelper(Cleanup):
+class _StatsHelper(Cleanup):
     def __init__(
         self,
         prof: LineProfiler,
@@ -91,22 +72,37 @@ class _DumpStatsHelper(Cleanup):
         baseline: LineStats | None = None,
     ) -> None:
         super().__init__()
-        callback = self._callback = partial(
-            _dump_stats, prof, outfile, baseline,
-        )
-        self.add_cleanup(callback)
+        self._prof = prof
+        self.outfile = outfile
+        self._baseline = baseline
+        self.add_cleanup(self.dump)
 
     def __repr__(self) -> str:
         name = type(self).__name__
-        get_repr = _CALLBACK_REPR_HELPER.repr
-        return f'<{name} @ {hex(id(self))}: {get_repr(self._callback)}>'
+        func = partial(self._prof.dump_stats, self.outfile)
+        repr_callback = _CALLBACK_REPR_HELPER.repr(func)
+        return f'<{name} @ {hex(id(self))}: {repr_callback}>'
 
-    def __call__(self) -> None:
-        self._callback()
+    def get(self) -> LineStats:
+        """
+        If a ``baseline`` is given (e.g. the stats state inherited
+        across an :py:func:`os.fork`), subtract it first so that only
+        work done in *this* process is written; the process the baseline
+        was inherited from writes the baseline's contents itself.
+        """
+        stats = self._prof.get_stats()
+        if self._baseline is not None:
+            stats -= self._baseline
+        return stats
+
+    def dump(self) -> None:
+        self.get().to_file(self.outfile)
+
+    __call__ = dump
 
     def cleanup(self, *args, force: bool = False, **kwargs) -> None:
         if force and not any(self._current_context.values()):
-            self.add_cleanup(self._callback)
+            self.add_cleanup(self.dump)
         super().cleanup(*args, **kwargs)
 
 
@@ -132,7 +128,7 @@ class LineProfilingCache(Cleanup):
     debug: bool = diagnostics.DEBUG
 
     profiler: LineProfiler | None = _private_field(default=None)
-    _stats_dumper: _DumpStatsHelper | None = _private_field(default=None)
+    _stats_helper: _StatsHelper | None = _private_field(default=None)
     # These are unstructured fields; other components can decide on what
     # to put in them. They are also pickled by `.dump()`, and are thus
     # retrievable in `.load()`-ed instances.
@@ -799,18 +795,15 @@ class LineProfilingCache(Cleanup):
             suffix='.lprof',
             delete=False,
         )
-        self._stats_dumper = dumper = _DumpStatsHelper(
-            prof, prof_outfile, baseline,
-        )
+        self._stats_helper = sh = _StatsHelper(prof, prof_outfile, baseline)
         self.patch(
-            # If we call `dumper.cleanup()` instead of `dumper` (e.g.
-            # in some `multiprocessing` patches), the subsequent
-            # debug-log messages are attributed to and handled by this
-            # cache instance
-            dumper, '_debug_output', self._debug_output,
-            cleanup=False, name='<this cache object>._stats_dumper',
+            # If we call `sh.cleanup()` instead of `sh` (e.g. in some
+            # `multiprocessing` patches), the subsequent debug-log msgs
+            # are attributed to and handled by this cache instance
+            sh, '_debug_output', self._debug_output,
+            cleanup=False, name='<this cache object>._stats_helper',
         )
-        self.add_cleanup_with_priority(self._stats_dumper, 1)
+        self.add_cleanup_with_priority(sh, 1)
 
         # Various setups
         self._setup_common(wrap_os_fork, {'reboot_forkserver': False})

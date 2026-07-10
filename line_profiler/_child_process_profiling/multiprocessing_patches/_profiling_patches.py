@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from functools import partial
 from multiprocessing.process import BaseProcess
-from typing import TypeVar
+from pathlib import Path
+from typing import TypeVar, cast
 from typing_extensions import Concatenate, ParamSpec
 
+from ...line_profiler import LineStats
 from ..cache import LineProfilingCache
 from ._infrastructure import SingleModulePatch
-from ._queue import Queue, PutWrapper
+from ._pool_patch_helpers import (
+    get_per_task_callback_patch, get_worker_finalization_patch,
+)
 
 
 __all__ = (
     'POOL_PATCH', 'PROCESS_PATCH',
-    'wrap_bootstrap', 'wrap_process', 'wrap_worker',
+    'wrap_bootstrap', 'wrap_process',
 )
 
 T = TypeVar('T')
@@ -33,17 +36,17 @@ def dump_stats_quick(
         We don't really care about cleanup in the child process, so just
         dump the stats and bail to reduce the chance of end-of-process
         shenanigans causing a deadlock...
-        but do use ``._stats_dumper.cleanup()`` instead of
+        but do use ``._stats_helper.cleanup()`` instead of
         ``.__call__()`` so that we get debugging output (if ``debug`` is
         true)
     """
-    stats_dumper = cache._stats_dumper
-    if stats_dumper is None:
+    stats_helper = cache._stats_helper
+    if stats_helper is None:
         return
     if cache.debug:
-        stats_dumper.cleanup(force=True, reason=reason)
+        stats_helper.cleanup(force=True, reason=reason)
     else:
-        stats_dumper()
+        stats_helper()
 
 
 def _mark_worker(worker: P) -> P:
@@ -58,20 +61,31 @@ def _is_marked_worker(proc: BaseProcess) -> bool:
 # ---------------- `multiprocessing.pool.Pool` patches -----------------
 
 
-@LineProfilingCache._method_wrapper  # nocover
-def wrap_worker(
-    cache: LineProfilingCache,
-    vanilla_impl: Callable[Concatenate[Queue, Queue, PS], None],
-    inqueue: Queue,
-    outqueue: Queue,
-    *args: PS.args,
-    **kwargs: PS.kwargs
-) -> None:
+@LineProfilingCache._method_wrapper
+def wrap_process(
+    _, vanilla_impl: Callable[PS, P], *args: PS.args, **kwargs: PS.kwargs
+) -> P:
     """
-    Wrap around :py:func:`multiprocessing.pool.worker` so that child
-    processes can write profiling output before pushing the result of
-    each task back to the parent.
+    Wrap around :py:meth:`.Pool.Process` so that the worker processes
+    created by the pool are marked and can be distinguished from
+    processes otherwise managed.
 
+    Notes:
+
+        - :py:meth:`.Pool.Process` is a static method.
+
+        - Technically one can inspect the :py:attr:`.BaseProcess.name`
+          of the process to see that it is a ``PoolWorker``, but since
+          said attribute is writable it may be more robust to set up a
+          separate marker.
+    """
+    return _mark_worker(vanilla_impl(*args, **kwargs))
+
+
+def _report_stats_and_dest(
+    cache: LineProfilingCache,
+) -> tuple[LineStats, Path] | None:  # nocover
+    """
     Notes:
 
         - This is only called in child processes and thus we can't
@@ -95,39 +109,86 @@ def wrap_worker(
 
           So this is about as good as we can do.
 
+        - Instead of dumping the stats to disk every task, it should be
+          less overhead for us to just send them back to the parent via
+          the preexisting connection.
+
+        - Unless the code paths varied significantly between tasks, the
+          physical size of the stats should not have changed too much –
+          running the same code more only increment the timing entries,
+          but do not generate more thereof. Thus, calculating the
+          delta-stats between tasks and only sending those would have
+          been a waste of time here; on top of that, the parent would
+          also have to perform additional processing to accumulate the
+          deltas. So we just send the entire stats object.
+
     .. _1: https://github.com/python/cpython/issues/73945
     .. _2: https://github.com/python/cpython/issues/82408
     .. _3: https://github.com/coveragepy/coveragepy/issues/1310
     """
-    dump = partial(dump_stats_quick, cache, reason='processed task')
-    outqueue = PutWrapper(outqueue, dump)
-    return vanilla_impl(inqueue, outqueue, *args, **kwargs)
+    stats_helper = cache._stats_helper
+    if stats_helper is None:
+        return None
+    return stats_helper.get(), Path(stats_helper.outfile)
 
 
-@LineProfilingCache._method_wrapper
-def wrap_process(
-    _, vanilla_impl: Callable[PS, P], *args: PS.args, **kwargs: PS.kwargs
-) -> P:
+def _record_stats(
+    cache: LineProfilingCache,
+    stats_and_dest: tuple[LineStats, Path] | None,
+) -> None:
     """
-    Wrap around :py:meth:`multiprocessing.pool.Pool.Process` so that the
-    worker processes created by the pool are marked and can be
-    distinguished from processes otherwise managed.
+    Record the stats gathered from workers so that they can be dealt
+    with when the process pool is terminated.
 
-    Notes:
-
-        - :py:meth:`multiprocessing.pool.Pool.Process` is a static
-          method.
-
-        - Technically one can inspect the :py:attr:`.BaseProcess.name`
-          of the process to see that it is a ``PoolWorker``, but since
-          said attribute is writable it may be more robust to set up a
-          separate marker.
+    See also:
+        :py:func:`_report_stats_and_dest`
     """
-    return _mark_worker(vanilla_impl(*args, **kwargs))
+    if stats_and_dest is None:
+        return  # No-op
+    stats, dest = stats_and_dest
+    _get_worker_stats(cache)[dest] = stats
 
 
-POOL_PATCH = SingleModulePatch('pool')
-POOL_PATCH.add_method('', 'worker', wrap_worker)
+def _write_recorded_stats(
+    cache: LineProfilingCache, worker: BaseProcess,
+) -> None:
+    """
+    Write the gathered stats associated with ``worker``.
+    """
+    pid = getattr(worker, 'pid', None)
+    if pid is None:
+        return
+    worker_stats = _get_worker_stats(cache)
+    xc: Exception | None = None
+    msg = '{0} (centralized `.dump_stats()`): {1.name!r} (PID: {1.pid}) -> {2}'
+    for outfile in cache._get_profiling_outfiles(pid):
+        stats = worker_stats.pop(outfile, None)
+        if stats is None:
+            continue
+        try:
+            stats.to_file(outfile)
+        except Exception as e:
+            xc = e
+            state, outcome = 'Failed', cache._format_exception(e)
+        else:
+            state, outcome = 'Succeeded', repr(outfile.name)
+        cache._debug_output(msg.format(state, worker, outcome))
+    if xc is not None:
+        raise xc
+
+
+def _get_worker_stats(cache: LineProfilingCache) -> dict[Path, LineStats]:
+    key = 'mp_pool_worker_stats'
+    return cache._additional_data.setdefault(
+        key, cast(dict[Path, LineStats], {}),
+    )
+
+
+POOL_PATCH = get_per_task_callback_patch(
+    _report_stats_and_dest, _record_stats,
+    '__line_profiler_pool_worker_stats__',
+)
+get_worker_finalization_patch(_write_recorded_stats, POOL_PATCH)
 POOL_PATCH.add_method('Pool', 'Process', wrap_process, 'static')
 
 # ----------- `multiprocessing.process.BaseProcess` patches ------------

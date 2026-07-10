@@ -4,19 +4,17 @@ import warnings
 from collections.abc import Callable
 from functools import partial
 from typing import Any, Generic, Protocol, TypeVar, cast
-from typing_extensions import Concatenate, ParamSpec
+from typing_extensions import ParamSpec
 
 from ...cleanup import _CALLBACK_REPR
 from ..cache import LineProfilingCache
-from ._infrastructure import SingleModulePatch
 
 
-__all__ = ('Queue', 'PutWrapper', 'QuickGetWrapper', 'get_mp_pool_patch')
+__all__ = ('Queue', 'PutWrapper', 'QuickGetWrapper')
 
 T = TypeVar('T')
 PS = ParamSpec('PS')
 
-_POOL_PATCHES: set[str] = set()
 _UNTAGGED_RESULT_WARNING_TEMPLATE = (
     'received a pool-task result `{result}` without the expected tag {tag!r}; '
     'the worker process appears not to have been set up for profiling '
@@ -143,82 +141,3 @@ class QuickGetWrapper(Generic[PS, T]):
         )
         cache._debug_output(msg, 'warning')
         warnings.warn(msg)
-
-
-def get_mp_pool_patch(
-    get_data: Callable[[], T],
-    process_data: Callable[[LineProfilingCache, T], Any],
-    tag: str,
-) -> SingleModulePatch:
-    """
-    Create a patch for :py:mod:`multiprocessing.pool` which:
-
-    - Patches :py:func:`multiprocessing.pool.worker` so that extra data
-      are created in child/worker processes after running EACH task by
-      ``get_data()``, and pushed back to  parent process alongside said
-      task's result.
-
-    - Patches :py:meth:`multiprocessing.pool.Pool._handle_results` so
-      that said extra data is, where possible, retrieved from
-      interprocess communication and processed by the parent's active
-      :py:class:`.LineProfilingCache` instance.
-    """
-    if tag in _POOL_PATCHES:
-        raise RuntimeError(f'tag {tag!r} already in use')
-    _POOL_PATCHES.add(tag)
-
-    wrap_outqueue = partial(PutWrapper, callback=get_data, tag=tag)
-    wrap_quick_get = partial(QuickGetWrapper, callback=process_data, tag=tag)
-
-    @LineProfilingCache._method_wrapper
-    def wrap_handle_results(
-        cache: LineProfilingCache,
-        vanilla_impl: Callable[
-            Concatenate[Queue, Callable[[], tuple[Any, ...] | None], PS],
-            None
-        ],
-        outqueue: Queue,
-        # Since we patched `outqueue.put()` in the child process, the
-        # result pushed to the parent is (normally) a `(tag, data, obj)`
-        # triplet
-        get: Callable[[], tuple[Any, ...] | None],
-        *args: PS.args,
-        **kwargs: PS.kwargs
-    ) -> None:
-        """
-        Wrap around :py:meth:`multiprocessing.pool.Pool._handle_results`
-        so that it handles the extra info (result of calling
-        ``get_data()`` in a child process after each task) included by
-        ``wrap_worker()`` with ``process_data(cache, data)``.
-
-        Note:
-            :py:meth:`multiprocessing.pool.Pool._handle_results` is a
-            static method.
-        """
-        vanilla_impl(outqueue, wrap_quick_get(cache, get), *args, **kwargs)
-
-    @LineProfilingCache._method_wrapper  # nocover
-    def wrap_worker(
-        # We don't need the cache instance, but `@_method_wrapper` does
-        _,
-        vanilla_impl: Callable[Concatenate[Queue, Queue, PS], None],
-        inqueue: Queue,
-        outqueue: Queue,
-        *args: PS.args,
-        **kwargs: PS.kwargs
-    ) -> None:
-        """
-        Wrap around :py:func:`multiprocessing.pool.worker` so that child
-        processes attach the result of ``get_data()`` as they pass the
-        task results back to the parent.
-
-        Note:
-            This is only called in child processes and thus we can't
-            reliably measure coverage thereon, hence the ``# nocover``.
-        """
-        return vanilla_impl(inqueue, wrap_outqueue(outqueue), *args, **kwargs)
-
-    patch = SingleModulePatch('pool')
-    patch.add_method('', 'worker', wrap_worker)
-    patch.add_method('Pool', '_handle_results', wrap_handle_results, 'static')
-    return patch

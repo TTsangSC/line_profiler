@@ -384,7 +384,7 @@ def test_cache_setup_child(
         f'Set up .*profiler.* {id(cache.profiler):#x}': True,
         'Loading preimports': preimports,
         'Created .*' + re.escape(stats_file.name): True,
-        'Cleanup succeeded.*: .*dump_stats': True,
+        '[Ss]ucceeded.*dump_stats': True,
         'Loading results .*' + re.escape(stats_file.name): True,
     }
     search_cache_logs(cache, debug, patterns)
@@ -576,7 +576,7 @@ def _test_apply_mp_patches_inner(
     iter_stats = cast(  # See `ty` issue #3428
         Iterable[Path], filter(is_valid_stats_file, iter_stats),
     )
-    pat = 'Cleanup succeeded.*: .*dump_stats.*{}'
+    pat = '[Ss]ucceeded.*dump_stats.*{}'
     patterns.update({
         pat.format(re.escape(path.name)): True for path in iter_stats
     })
