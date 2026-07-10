@@ -3,7 +3,8 @@ from __future__ import annotations
 import atexit
 import os
 import multiprocessing
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Sequence
 from functools import partial
 from multiprocessing.pool import Pool
 from multiprocessing.process import BaseProcess
@@ -41,7 +42,7 @@ from ._queue import Queue, get_mp_pool_patch
 __all__ = (
     'POOL_WORKER_PID_PATCH', 'PROCESS_SETUP_PATCH',
     'RebootForkserverPatch', 'ResourceTrackerPatch', 'RunpyPatch',
-    'wrap_bootstrap', 'wrap_terminate_pool',
+    'wrap_bootstrap', 'wrap_terminate_pool', 'wrap_join_exited_workers',
 )
 
 T = TypeVar('T')
@@ -140,12 +141,49 @@ def wrap_terminate_pool(
     try:
         vanilla_impl(cls, taskqueue, inqueue, outqueue, pool, *args, **kwargs)
     finally:
-        # Guard against dummy pool; see similar code in
-        # `multiprocessing.pool`
-        if pool and hasattr(pool[0], 'terminate'):
+        if _is_nonempty_normal_pool(pool):
+            failures: list[P] = []
             for worker in pool:
-                assert not worker.is_alive()
+                if worker.is_alive():  # nocover
+                    failures.append(worker)
+                    continue
                 _get_worker_ntasks(worker, cache)
+            if failures:  # nocover
+                msg = (
+                    f'{len(failures)} worker(s) still alive after '
+                    f'`Pool.terminate()`: {failures!r}'
+                )
+                cache._debug_output(msg, 'warning')
+                warnings.warn(msg)
+
+
+@LineProfilingCache._method_wrapper
+def wrap_join_exited_workers(
+    cache: LineProfilingCache,
+    vanilla_impl: Callable[[list[P]], bool],
+    pool: list[P],
+) -> bool:
+    """
+    Wrap around :py:meth:`.Pool._join_exited_workers` so that we recover
+    task info from worker processes which have already exited within the
+    pool's lifetime. If a worker was idle and hasn't processed any task,
+    it is reported to the cache.
+
+    Note:
+        :py:meth:`.Pool._join_exited_workers` is a static method.
+    """
+    if _is_nonempty_normal_pool(pool):
+        for worker in pool:
+            if worker.exitcode is not None:
+                _get_worker_ntasks(worker, cache)
+    return vanilla_impl(pool)
+
+
+def _is_nonempty_normal_pool(pool: Sequence[BaseProcess]) -> bool:
+    """
+    Guard against dummy pool; see similar code in `multiprocessing.pool`
+    """
+    return bool(pool and hasattr(pool[0], 'terminate'))
 
 
 def _get_worker_ntasks(worker: BaseProcess, cache: LineProfilingCache) -> int:
@@ -198,6 +236,9 @@ POOL_WORKER_PID_PATCH = get_mp_pool_patch(
 POOL_WORKER_PID_PATCH.add_method(
     'Pool', '_terminate_pool', wrap_terminate_pool, 'class',
 )
+POOL_WORKER_PID_PATCH.add_method(
+    'Pool', '_join_exited_workers', wrap_join_exited_workers, 'static',
+)
 
 # --------------------------- Misc. patches ----------------------------
 
@@ -231,9 +272,12 @@ class RebootForkserverPatch:
 
     @staticmethod
     def reboot() -> None:
+        fs_obj = forkserver._forkserver
+        stop = getattr(fs_obj, '_stop', None)
         # Appease the type-checker since `._stop()` is not public API
-        stop = getattr(forkserver._forkserver, '_stop', None)
-        assert callable(stop)
+        if not callable(stop):  # nocover
+            msg = f'ForkServer._stop() (= {stop!r}) not callable'
+            raise AssertionError(msg)  # Shouldn't happen
         stop()
 
 
