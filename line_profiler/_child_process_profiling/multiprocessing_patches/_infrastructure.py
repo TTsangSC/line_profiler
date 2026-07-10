@@ -7,7 +7,6 @@ from collections.abc import (
 )
 from functools import partial
 from importlib import import_module
-from importlib.metadata import entry_points
 from inspect import getattr_static
 from operator import attrgetter
 from types import MappingProxyType as mappingproxy, ModuleType
@@ -283,8 +282,7 @@ class Registry(Mapping[str, Patch]):
     """
     Mapping subclass for managing patches.
     """
-    _loaded_instances: ClassVar[dict[str, Registry]] = {}
-    DEFAULT_ENTRY_POINT: ClassVar[str] = 'line_profiler._multiproc_patches'
+    _default: ClassVar[Registry]
 
     def __init__(self) -> None:
         self._patches: dict[str, tuple[float, Patch]] = {}
@@ -425,21 +423,18 @@ class Registry(Mapping[str, Patch]):
         return result
 
     @classmethod
-    def from_entry_point(cls, entry_point: str | None = None) -> Registry:
+    def get_default(cls) -> Registry:
         """
-        Args:
-            entry_point (str | None):
-                Entry point to load patches from;
         Returns:
-            Instance representing the patches loaded from the provided
-            ``entry_point``; default is :py:attr:`.DEFAULT_ENTRY_POINT`
+            Instance summarizing the patches loaded from the various
+            ``.*_patches``  sibling modules
 
         Note:
             This method does NOT create a copy.
 
         Example:
-            >>> reg = Registry.from_entry_point()
-            >>> assert reg.from_entry_point() is reg
+            >>> reg = Registry.get_default()
+            >>> assert reg.get_default() is reg
 
             Check for the default plugins that should be installed and
             their contents:
@@ -471,26 +466,42 @@ class Registry(Mapping[str, Patch]):
                 raise TypeError(f'patch `{patch!r}`: {error}')
             return patch
 
-        if entry_point is None:
-            entry_point = cls.DEFAULT_ENTRY_POINT
         try:
-            return cls._loaded_instances[entry_point]
-        except KeyError:
+            return cls._default
+        except AttributeError:
             pass
+
         instance = Registry()
-        for ep_obj in entry_points(group=entry_point):
+        subpkg, *_ = cls.__module__.rpartition('.')
+        for name, (sibling, patch_loc) in {
+            '__process_setup': ('_mandatory_patches', 'PROCESS_SETUP_PATCH'),
+            '__pool_worker_pid':
+                ('_mandatory_patches', 'POOL_WORKER_PID_PATCH'),
+            '__reboot_forkserver':
+                ('_mandatory_patches', 'RebootForkserverPatch'),
+            '__resource_tracker':
+                ('_mandatory_patches', 'ResourceTrackerPatch'),
+            '__spawn_runpy': ('_mandatory_patches', 'RunpyPatch'),
+
+            'logging': ('_optional_patches', 'LOGGING_PATCH'),
+
+            'pool': ('_profiling_patches', 'POOL_PATCH'),
+            'process': ('_profiling_patches', 'PROCESS_PATCH'),
+        }.items():
             try:
-                patch = check(cast(Patch, ep_obj.load()))
+                mod = import_module(f'{subpkg}.{sibling}')
+                patch = check(cast(Patch, getattr(mod, patch_loc)))
             except Exception as e:
                 error = type(e).__name__
                 if str(error):
                     error = f'{error}: {e}'
                 msg = (
-                    f'failed to load patch {ep_obj.name!r} '
-                    f'from entry point {ep_obj!r}: {error}'
+                    f'failed to load patch {name!r} '
+                    f'from sibling submodule `{subpkg}.{sibling}`: {error}'
                 )
                 diagnostics.log.warning(msg)
                 warnings.warn(msg)
             else:
-                instance.register(ep_obj.name, patch)
-        return cls._loaded_instances.setdefault(entry_point, instance)
+                instance.register(name, patch)
+        cls._default = instance
+        return instance

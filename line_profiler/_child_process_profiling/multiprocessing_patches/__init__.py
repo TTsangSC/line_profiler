@@ -28,7 +28,7 @@ __all__ = ('MPConfig', 'Registry', 'apply')
 PublicPatch = Literal['pool', 'process', 'logging']
 
 _PATCHED_MARKER = '__line_profiler_patched_multiprocessing__'
-_PATCHES = Registry.from_entry_point()
+_PATCHES = Registry.get_default()
 
 
 def apply(
@@ -112,7 +112,8 @@ def apply(
         patches_ = {p.lower() for p in patches}
     # Sanity check on `_PATCHES`
     for patch in get_args(PublicPatch):
-        assert patch in _PATCHES
+        if patch not in _PATCHES:
+            raise RuntimeError(f'Cannot load patch `{patch}`')
     for name, patch in _PATCHES.select(patches_).items():
         if name == '__reboot_forkserver' and not reboot_forkserver:
             continue
