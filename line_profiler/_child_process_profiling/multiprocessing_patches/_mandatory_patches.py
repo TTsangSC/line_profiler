@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import os
 import multiprocessing
-import warnings
 from collections.abc import Callable
 from functools import partial
 from multiprocessing.pool import Pool
@@ -33,21 +32,17 @@ except ImportError:
 else:
     _CAN_USE_RESOURCE_TRACKER = True
 
-from ... import _diagnostics as diagnostics
 from ..cache import LineProfilingCache
 from ..runpy_patches import create_runpy_wrapper
 from ._infrastructure import SingleModulePatch
-from ._queue import Queue, PutWrapper, PID_TAG
+from ._queue import Queue, get_mp_pool_patch
 
 
 __all__ = (
     'POOL_WORKER_PID_PATCH', 'PROCESS_SETUP_PATCH',
     'RebootForkserverPatch', 'ResourceTrackerPatch', 'RunpyPatch',
-    'wrap_bootstrap',
-    'wrap_handle_results', 'wrap_terminate_pool', 'wrap_worker',
+    'wrap_bootstrap', 'wrap_terminate_pool',
 )
-
-_LOCK_FILE_LOC = '__line_profiler_multiprocessing_process_lock_file__'
 
 T = TypeVar('T')
 P = TypeVar('P', bound=BaseProcess)
@@ -121,35 +116,6 @@ PROCESS_SETUP_PATCH.add_method('BaseProcess', '_bootstrap', wrap_bootstrap)
 
 
 @LineProfilingCache._method_wrapper
-def wrap_handle_results(
-    cache: LineProfilingCache,
-    vanilla_impl: Callable[
-        Concatenate[Queue, Callable[[], tuple[Any, ...] | None], PS],
-        None
-    ],
-    outqueue: Queue,
-    # Since we patched `outqueue.put()` in the child process, the result
-    # pushed to the parent is (normally) a `(PID_TAG, pid, obj)` triplet
-    get: Callable[[], tuple[Any, ...] | None],
-    *args: PS.args,
-    **kwargs: PS.kwargs
-) -> None:
-    """
-    Wrap around :py:meth:`.Pool._handle_results` so that it handles the
-    extra info (PID of child process handling the task) included by
-    :py:func:`.wrap_worker`.
-
-    Note:
-        :py:meth:`.Pool._handle_results` is a static method.
-    """
-    # Somehow this doesn't type-check with either `mypy` or `ty` when
-    # we use a `TypeVar` instead of `Any` with the tuple items...
-    # (see `ty` issue #3467)
-    wrapped_get = partial(_wrap_outqueue_quick_get, cache, get)
-    vanilla_impl(outqueue, wrapped_get, *args, **kwargs)
-
-
-@LineProfilingCache._method_wrapper
 def wrap_terminate_pool(
     cache: LineProfilingCache,
     vanilla_impl: Callable[
@@ -182,29 +148,6 @@ def wrap_terminate_pool(
                 _get_worker_ntasks(worker, cache)
 
 
-@LineProfilingCache._method_wrapper  # nocover
-def wrap_worker(
-    _,  # We don't need the cache instance, but `@_method_wrapper` does
-    vanilla_impl: Callable[Concatenate[Queue, Queue, PS], None],
-    inqueue: Queue,
-    outqueue: Queue,
-    *args: PS.args,
-    **kwargs: PS.kwargs
-) -> None:
-    """
-    Wrap around :py:func:`multiprocessing.pool.worker` so that child
-    processes report their PIDs as they pass the task results back to
-    the parent.
-
-    Note:
-        This is only called in child processes and thus we can't
-        reliably measure coverage thereon; see also
-        :py:func:`wrap_bootstrap`.
-    """
-    outqueue = PutWrapper(outqueue, os.getpid, push_to_parent=True)
-    return vanilla_impl(inqueue, outqueue, *args, **kwargs)
-
-
 def _get_worker_ntasks(worker: BaseProcess, cache: LineProfilingCache) -> int:
     """
     Check if the process has run any tasks; if not, report to the cache.
@@ -227,59 +170,12 @@ def _get_worker_ntasks(worker: BaseProcess, cache: LineProfilingCache) -> int:
     return ntasks_finalized.setdefault(key, ntasks)
 
 
-_UNTAGGED_RESULT_WARNING = (
-    'received a pool-task result without the profiling worker-PID tag; '
-    'the worker process appears not to have been set up for profiling '
-    '(e.g. its interpreter never loaded the profiling startup hook), '
-    'so its profiling data will be missing from the output'
-)
-
-
-def _wrap_outqueue_quick_get(
-    cache: LineProfilingCache,
-    vanilla_impl: Callable[PS, tuple[Any, ...] | None],
-    *args: PS.args,
-    **kwargs: PS.kwargs
-) -> tuple[Any, ...] | None:
+def _increment_ntasks(cache: LineProfilingCache, pid: int) -> None:
     """
     Take and process the PID of the child process completing the task.
-
-    Note:
-        A worker which was never patched (its interpreter didn't run
-        the profiling startup hook) pushes vanilla un-tagged results;
-        those are passed through untouched, with a once-per-session
-        warning, so that a mixed patched-parent/vanilla-worker setup
-        degrades to missing profile data instead of killing the pool's
-        result-handler thread (and thereby deadlocking every
-        ``AsyncResult.get()``).
     """
-    result = vanilla_impl(*args, **kwargs)
-    if result is None:
-        return None
-    if (
-        isinstance(result, tuple)
-        and len(result) == 3
-        and result[0] == PID_TAG
-    ):
-        _, pid, orig_result = result
-        ntasks = _get_ntasks(cache)
-        ntasks[pid] = ntasks.get(pid, 0) + 1
-        return orig_result
-    _warn_untagged_result_once(cache)
-    return result
-
-
-def _warn_untagged_result_once(cache: LineProfilingCache) -> None:
-    key = 'warned_untagged_pool_result'
-    # No lock: a race just means an extra warning, and this runs on the
-    # pool's single result-handler thread anyway
-    if cache._additional_data.get(key):
-        return
-    cache._additional_data[key] = True
-    # Log before warning in case the warning is promoted to an error
-    diagnostics.log.warning(_UNTAGGED_RESULT_WARNING)
-    cache._debug_output(_UNTAGGED_RESULT_WARNING)
-    warnings.warn(_UNTAGGED_RESULT_WARNING)
+    ntasks = _get_ntasks(cache)
+    ntasks[pid] = ntasks.get(pid, 0) + 1
 
 
 def _get_ntasks(cache: LineProfilingCache) -> dict[int, int]:
@@ -296,11 +192,11 @@ def _get_ntasks_finalized(
     )
 
 
-POOL_WORKER_PID_PATCH = (
-    SingleModulePatch('pool')
-    .add_method('', 'worker', wrap_worker)
-    .add_method('Pool', '_handle_results', wrap_handle_results, 'static')
-    .add_method('Pool', '_terminate_pool', wrap_terminate_pool, 'class')
+POOL_WORKER_PID_PATCH = get_mp_pool_patch(
+    os.getpid, _increment_ntasks, '__line_profiler_pool_worker_pid__',
+)
+POOL_WORKER_PID_PATCH.add_method(
+    'Pool', '_terminate_pool', wrap_terminate_pool, 'class',
 )
 
 # --------------------------- Misc. patches ----------------------------

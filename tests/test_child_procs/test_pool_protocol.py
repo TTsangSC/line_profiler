@@ -1,8 +1,8 @@
 """
 Tests for the tagged pool result protocol.
 
-Patched pool workers push ``(PID_TAG, pid, result)`` triplets so the
-patched parent can attribute results to worker PIDs.  A worker that was
+Patched pool workers push ``(tag, pid, result)`` triplets so th patched
+parent can e.g. attribute results to worker PIDs.  A worker that was
 never patched (e.g. its interpreter never loaded the profiling startup
 hook, or it runs via ``multiprocessing.set_executable()`` pointing at a
 different Python) pushes vanilla results; the parent must pass those
@@ -11,57 +11,108 @@ the crash presents to the user as ``pool.map()`` hanging forever.
 """
 import math
 import multiprocessing
+import warnings
+from collections.abc import Callable
+from typing import Any, Literal
+from typing_extensions import Never
 
 import pytest
 
-from line_profiler._child_process_profiling import (
-    multiprocessing_patches as mp_patches,
-)
+from line_profiler._child_process_profiling.cache import LineProfilingCache
 from line_profiler._child_process_profiling.multiprocessing_patches import (
-    _queue,
+    _queue, apply as mp_apply,
 )
-from line_profiler._child_process_profiling.multiprocessing_patches import (
-    _mandatory_patches,
-)
+
+from ._test_child_procs_utils import CheckWarnings
 
 
 GET_TIMEOUT = 60
+TEST_TAG = '__test_pool_protocol_test_tag__'
 
 
-def test_put_wrapper_tags_results():
-    pushed = []
+def test_put_wrapper_tags_results() -> None:
+    """
+    Check that :py:class:`line_profiler._child_process_profiling.\
+multiprocessing_patches._queue.PutWrapper`
+    behaves as expected, inserting a tag and the return value of a
+    callback into the pushed tuple.
+    """
+    pushed: list[Any] = []
 
     class FakeQueue:
-        put = staticmethod(pushed.append)
+        @staticmethod
+        def put(obj: Any) -> None:
+            pushed.append(obj)
 
-    wrapper = _queue.PutWrapper(
-        FakeQueue(), lambda: 1234, push_to_parent=True,
-    )
+        @staticmethod
+        def get() -> Never:  # Just here to comply with the interface
+            raise NotImplementedError
+
+    wrapper = _queue.PutWrapper(FakeQueue(), lambda: 1234, tag=TEST_TAG)
     wrapper.put(('job', 0, 'result'))
-    assert pushed == [(_queue.PID_TAG, 1234, ('job', 0, 'result'))]
+    assert pushed == [(TEST_TAG, 1234, ('job', 0, 'result'))]
 
 
 @pytest.mark.parametrize(
-    'incoming, expected, is_tagged',
+    'incoming, expected_result, expected_data, is_tagged, is_sentinel',
     [
-        ((_queue.PID_TAG, 1234, ('job', 0, 'ok')), ('job', 0, 'ok'), True),
-        (('job', 0, 'ok'), ('job', 0, 'ok'), False),  # vanilla worker
-        (None, None, True),  # queue sentinel, never warns
+        (
+            (TEST_TAG, 1234, ('job', 0, 'ok')),
+            ('job', 0, 'ok'), 1234, True, False,
+        ),
+        # vanilla worker
+        (('job', 0, 'ok'), ('job', 0, 'ok'), None, False, False),
+        (None, None, None, True, True),  # queue sentinel, never warns
     ],
 )
-def test_quick_get_unwrapping(create_cache, incoming, expected, is_tagged):
+def test_quick_get_wrapper_unwrapping_results(
+    create_cache: Callable[..., LineProfilingCache],
+    incoming: tuple[Any, ...] | None,
+    expected_result: tuple[Any, ...] | None,
+    expected_data: Any,
+    is_tagged: bool,
+    is_sentinel: bool,
+) -> None:
+    """
+    Check that :py:class:`line_profiler._child_process_profiling.\
+multiprocessing_patches._queue.QuickGetWrapper`
+    behaves as expected, pulling a tag and the extra data from the
+    pulled tuple (where appropriate) and returning the original result.
+    """
+    def get() -> tuple[Any, ...] | None:
+        return incoming
+
+    def store(_, data: int) -> None:
+        stored.append(data)
+
     cache = create_cache(_use_curated_profiler=False)
-    unwrap = _mandatory_patches._wrap_outqueue_quick_get
+    stored: list[Any] = []
+    quick_get = _queue.QuickGetWrapper(cache, get, store, TEST_TAG)
+    checked_warning = {
+        'category': UserWarning,
+        'message': f'.*without the expected tag.*{TEST_TAG}',
+    }
     if is_tagged:
-        assert unwrap(cache, lambda: incoming) == expected
+        with CheckWarnings() as cw:
+            cw.forbid_warnings(**checked_warning)
+            assert quick_get() == expected_result
     else:
-        with pytest.warns(UserWarning, match='without the profiling'):
-            assert unwrap(cache, lambda: incoming) == expected
+        with CheckWarnings(reissue_warnings=False) as cw:
+            cw.expect_warnings(**checked_warning)
+            assert quick_get() == expected_result
         # ... but only once per session
-        assert unwrap(cache, lambda: incoming) == expected
+        with CheckWarnings() as cw:
+            cw.forbid_warnings(**checked_warning)
+            assert quick_get() == expected_result
+    if is_tagged and not is_sentinel:
+        assert stored == [expected_data]
+    else:
+        assert not stored
 
 
-def _run_pool_map(method):
+def _run_pool_map(
+    method: Literal['spawn', 'fork', 'forkserver'],
+) -> list[float]:
     import os
 
     ctx = multiprocessing.get_context(method)
@@ -77,7 +128,9 @@ def _run_pool_map(method):
     return values
 
 
-def test_patched_parent_with_vanilla_spawn_worker(create_cache):
+def test_patched_parent_with_vanilla_spawn_worker(
+    create_cache: Callable[..., LineProfilingCache],
+) -> None:
     """
     The parent is patched, but the spawn children know nothing of the
     profiling session (no env vars are injected, no .pth hook exists
@@ -90,12 +143,14 @@ def test_patched_parent_with_vanilla_spawn_worker(create_cache):
     # Make the wrapped methods resolve `LineProfilingCache.load()` to
     # this instance without injecting env vars (children stay vanilla)
     cache._replace_loaded_instance(force=True)
-    mp_patches.apply(cache)
-    with pytest.warns(UserWarning, match='without the profiling'):
+    mp_apply(cache)
+    with pytest.warns(UserWarning, match='without the expected'):
         assert _run_pool_map('spawn') == [0.0, 1.0, 2.0, 3.0]
 
 
-def test_patched_parent_with_patched_fork_worker(create_cache):
+def test_patched_parent_with_patched_fork_worker(
+    create_cache: Callable[..., LineProfilingCache],
+) -> None:
     """
     Control case: fork children inherit the parent's patches, results
     arrive tagged, and no warning fires.
@@ -104,9 +159,7 @@ def test_patched_parent_with_patched_fork_worker(create_cache):
         pytest.skip("start method 'fork' unavailable")
     cache = create_cache()
     cache._replace_loaded_instance(force=True)
-    mp_patches.apply(cache)
-    import warnings as warnings_mod
-
-    with warnings_mod.catch_warnings():
-        warnings_mod.simplefilter('error')
+    mp_apply(cache)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
         assert _run_pool_map('fork') == [0.0, 1.0, 2.0, 3.0]
