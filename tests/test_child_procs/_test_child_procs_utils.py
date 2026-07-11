@@ -19,7 +19,7 @@ import warnings
 from abc import ABC, abstractmethod
 from argparse import ArgumentError
 from collections.abc import (
-    Callable, Collection, Generator, Iterable, Iterator, Mapping,
+    Callable, Collection, Generator, Iterable, Mapping,
     Sequence, Set,
 )
 from contextlib import ExitStack
@@ -60,7 +60,7 @@ __all__ = (
     'DEBUG', 'DEFAULT_TIMEOUT', 'NOT_SUPPLIED', 'START_METHODS',
     'PATCH_SUMMARIES',
     'StartMethod', 'ModuleFixture', 'Params',
-    'ResultMismatch', 'TestTimeout',
+    'ResultMismatch', 'FuncCallTimeout',
     'preserve_object_attrs', 'preserve_targets',
     'cleanup_extra_pth_files', 'add_timeout',
     'CheckWarnings',
@@ -176,18 +176,8 @@ class ResultMismatch(ValueError):
         call.excinfo = xc.from_exception(xc.value.with_traceback(xc.tb))
         return make_report(call=call)
 
-    @property
-    def rich_message(self) -> str:
-        msg = '{}: {}'.format(type(self).__name__, self.args[0])
-        if self.__traceback__ is not None:
-            tb = self.__traceback__
-            msg = '{}:{}: {}'.format(
-                tb.tb_frame.f_code.co_filename, tb.tb_lineno, msg,
-            )
-        return msg
 
-
-class TestTimeout(RuntimeError):
+class FuncCallTimeout(RuntimeError):
     """
     Error raised by the :py:func:`add_timeout` decorator.
     """
@@ -789,11 +779,18 @@ class preserve_object_attrs(_CallableContextManager[dict[str, Any]]):
         return result
 
     def __exit__(self, *_, **__) -> None:
+        xc: Exception | None = None
         for callback in self._callbacks[::-1]:
             try:
                 callback()
-            except Exception:
-                pass
+            except Exception as e:
+                xc = e
+                rep_xc = type(xc).__name__
+                if str(xc):
+                    rep_xc = f'{rep_xc}: {xc}'
+                self._debug(f'Callback {callback} failed: {rep_xc}')
+        if xc is not None:
+            raise xc
 
 
 class preserve_targets(_CallableContextManager[dict[str, dict[str, Any]]]):
@@ -960,29 +957,120 @@ old['line_profiler.line_profiler']['main']
 
 
 class cleanup_extra_pth_files(_CallableContextManager[frozenset[str]]):
-    def __init__(self, debug: bool = DEBUG) -> None:
+    r"""
+    Protect the venv where the test is run from temporary .pth files
+    created by :py:class:`.LineProfilingCache`.
+
+    Example:
+        >>> from collections.abc import Generator
+        >>> from os import getpid
+        >>> from pathlib import Path
+        >>> from sysconfig import get_path
+        >>> from uuid import uuid4
+        >>> import pytest
+
+        >>> def _propose_alnum() -> Generator[str, None, None]:
+        ...     while True:
+        ...         uuid = str(uuid4())
+        ...         yield from uuid.split('-')
+
+        >>> def _propose_names(
+        ...     glob_pattern: str,
+        ... ) -> Generator[str, None, None]:
+        ...     gen_alnum = _propose_alnum()
+        ...     chunks = glob_pattern.split('*')
+        ...     while True:
+        ...         result: list[str] = [chunks[0]]
+        ...         for chunk in chunks[1:]:
+        ...             result.append(next(gen_alnum))
+        ...             result.append(chunk)
+        ...         yield ''.join(result)
+
+        >>> def get_new_pth(glob_pattern: str) -> Path:
+        ...     gen_names = _propose_names(glob_pattern)
+        ...     while True:
+        ...         path = pth_loc / next(gen_names)
+        ...         if not path.exists():
+        ...             return path
+
+        >>> pth_loc = Path(get_path('purelib'))
+        >>> pth_from_cache = get_new_pth(
+        ...     f'_line_profiler-profiling-hook-*-ppid-{getpid()}.pth',
+        ... )
+        >>> pth_unrelated = get_new_pth(f'my-pth-*.pth')
+
+        >>> try:
+        ...     with cleanup_extra_pth_files(config=False, debug=False):
+        ...         pth_from_cache.write_text('import sys') and None
+        ...         pth_unrelated.write_text('import sys') and None
+        ...         assert pth_from_cache.exists()
+        ...         assert pth_unrelated.exists()
+        ...     # This matches the pattern of filenames created by the
+        ...     # cache and is thus dealt with
+        ...     assert not pth_from_cache.exists()
+        ...     # This is unrealated and is thus left alone
+        ...     assert pth_unrelated.exists()
+        ... except PermissionError:
+        ...     pytest.skip('Can\'t write to the pure-lib directory')
+        ... finally:  # Cleanup
+        ...     for pth in pth_from_cache, pth_unrelated:
+        ...         pth.unlink(missing_ok=True)
+    """
+    def __init__(
+        self,
+        config: os.PathLike[str] | str | bool | None = None,
+        debug: bool = DEBUG,
+    ) -> None:
         self.debug = debug
+        pattern = self._get_glob_pattern(config)
+        self._get_files = partial(self.get_pth_files, pattern)
 
     def __enter__(self) -> frozenset[str]:
-        self.old = self.get_pth_files()
+        self.old = self._get_files()
         return self.old
 
     def __exit__(self, *_, **__) -> None:
-        for new_pth_file in self.get_pth_files() - self.old:
+        for new_pth_file in self._get_files() - self.old:
             self._debug(f'Deleting stray .pth file: {new_pth_file!r}')
             (self._get_path() / new_pth_file).unlink(missing_ok=True)
         del self.old
 
     @classmethod
-    def get_pth_files(cls, name_only: bool = True) -> frozenset[str]:
+    def get_pth_files(
+        cls, pattern: str | None = None, name_only: bool = True,
+    ) -> frozenset[str]:
+        if pattern is None:
+            pattern = cls._get_glob_pattern()
         return frozenset(
             pth.name if name_only else str(pth)
-            for pth in cls._get_path().glob('*.pth')
+            for pth in cls._get_path().glob(pattern)
         )
 
     @staticmethod
     def _get_path() -> Path:
+        """
+        Note:
+            This doesn't go through the entire .pth-location search path
+            (see :py:meth:`.LineProfilingCache.write_pth_hook`), but
+            suffices for the testing environment.
+        """
         return Path(sysconfig.get_path('purelib'))
+
+    @staticmethod
+    def _get_glob_pattern(
+        config: os.PathLike[str] | str | bool | None = None,
+    ) -> str:
+        cmap = (
+            ConfigSource.from_config(config)
+            .get_subconfig('child_processes', 'pth_files')
+            .conf_dict
+        )
+        prefix, suffix_template = LineProfilingCache._normalize_pth_affixes(
+            cmap['prefix'], cmap['suffix'],
+        )
+        pattern = '{}*{}'.format(prefix, suffix_template.format(os.getpid()))
+        assert pattern.endswith('.pth')
+        return pattern
 
 
 def _cleanup_profiling_in_current_thread() -> None:
@@ -1094,7 +1182,7 @@ def add_timeout(
         >>> my_func(4, delay=5)  # doctest: +NORMALIZE_WHITESPACE
         Traceback (most recent call last):
           ...
-        test_child_procs._test_child_procs_utils.TestTimeout:
+        test_child_procs._test_child_procs_utils.FuncCallTimeout:
         my_func(4, delay=5): timed out after 0.5 s
 
     Note:
@@ -1159,7 +1247,7 @@ def add_timeout(
         name = getattr(func, '__name__', repr(func))
         call_repr = f'{name}({", ".join(args_repr)})'
         msg = f'{call_repr}: timed out after {timeout:.2g} s'
-        raise TestTimeout(msg)
+        raise FuncCallTimeout(msg)
 
     new_thread = partial(
         threading.Thread, target=worker, name=name, daemon=True,
@@ -1412,6 +1500,8 @@ class CheckWarnings(Sequence[_WarningInfo]):
     Example:
         >>> import warnings
 
+        Checking for/against warnings:
+
         >>> cw = CheckWarnings(
         ...     reissue_warnings=False, format_warnings=False,
         ... )
@@ -1444,6 +1534,24 @@ expected warnings matching
         got none out of 1 ([...])
         >>> assert len(cw) == 1
         >>> assert str(cw[0].message) == 'foobar'
+
+        Controlling warning propagation:
+
+        >>> with warnings.catch_warnings(record=True) as cw_outer:
+        ...     with cw:
+        ...         cw.suppress_warnings('foo')
+        ...         warnings.warn('foo')
+        ...         warnings.warn('bar')  # Implicitly propagated
+        ...     assert len(cw_outer) == 1
+        ...     assert str(cw_outer[0].message) == 'bar'
+
+        >>> with warnings.catch_warnings(record=True) as cw_outer:
+        ...     with cw:
+        ...         cw.propagate_warnings('foo')
+        ...         warnings.warn('foo')
+        ...         warnings.warn('bar')  # Implicitly suppressed
+        ...     assert len(cw_outer) == 1
+        ...     assert str(cw_outer[0].message) == 'foo'
     """
     def __init__(
         self, /, *,
@@ -1551,21 +1659,6 @@ expected warnings matching
 
     def __len__(self) -> int:
         return len(self._current_warnings)
-
-    def __iter__(self) -> Iterator[_WarningInfo]:
-        return iter(self._current_warnings)
-
-    def __reversed__(self) -> Iterator[_WarningInfo]:
-        return iter(reversed(self._current_warnings))
-
-    def __contains__(self, item: Any, /) -> bool:
-        return item in self._current_warnings
-
-    def index(self, *args, **kwargs) -> int:
-        return self._current_warnings.index(*args, **kwargs)
-
-    def count(self, *args, **kwargs) -> int:
-        return self._current_warnings.count(*args, **kwargs)
 
     @property
     def _current_context(
@@ -1925,7 +2018,23 @@ def _run_kernprof_main_in_process(
         return encode(stdout), encode(stderr)
 
     assert not _kwargs
-    assert cmd[0] == 'kernprof'
+    if cmd[0] == 'kernprof':
+        args = cmd[1:]
+    elif any(
+        list(cmd[:3]) == [python, '-m', 'kernprof']
+        for python in (
+            'python',
+            'python3',
+            f'python3.{sys.version_info.minor}',
+            sys.executable,
+        )
+    ):
+        args = cmd[3:]
+    else:
+        raise AssertionError(
+            'Expected commands like `kernprof ...` or '
+            f'`python -m kernprof ...`, got {cmd!r}'
+        )
 
     cap: pytest.CaptureFixture | None = None
     stdout: str | bytes | None = None
@@ -1968,8 +2077,8 @@ def _run_kernprof_main_in_process(
                 cleanup = stack.enter_context(Cleanup())
                 if env is not None:
                     cleanup.update_mapping(os.environ, env)
-                main(cmd[1:], exit_on_error=False)
-            except TestTimeout:  # `subprocess` uses `SIGKILL`
+                main(args, exit_on_error=False)
+            except FuncCallTimeout:  # `subprocess` uses `SIGKILL`
                 returncode, timed_out = -9, True
                 status = f'error ({returncode})'
             except Exception as e:

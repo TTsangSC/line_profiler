@@ -206,6 +206,7 @@ def test_cache_dump_load(
                 (False, True, False, 'process-only'),
                 (False, False, True, 'logging-only'),
                 (False, False, False, 'no-patches')])).sorted()
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_cache_setup_main_process(
     tmp_path_factory: pytest.TempPathFactory,
     create_cache: Callable[..., LineProfilingCache],
@@ -636,6 +637,7 @@ def _test_apply_mp_patches(
      ('process_test_module', True, True, 'patch-pool-and-process'),
      ('process_test_module', True, False, 'patch-process-only')])
 @pytest.mark.parametrize(('n', 'nprocs'), [(100, 2)])
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_apply_mp_patches_success(
     request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
@@ -688,6 +690,7 @@ def test_apply_mp_patches_success(
      ('process_test_module', True, True, 'patch-pool-and-process'),
      ('process_test_module', True, False, 'patch-process-only')])
 @pytest.mark.parametrize(('n', 'nprocs'), [(100, 2)])
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_apply_mp_patches_failure(
     request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
@@ -812,11 +815,12 @@ def test_multiproc_script_sanity_check(
      'label2'),  # Dummy argument to make `pytest` output more legible
     # This is essentially a no-op since it doesn't actually do
     # line-profiling, but we check that code path for completeness
-    [(['kernprof', '-q', '--no-line'], 'out.prof', False, 'cProfile')]
+    [([sys.executable, '-m', 'kernprof', '-q', '--no-line'],
+      'out.prof', False, 'cProfile')]
     # Run line profiling with and w/o profiling targets
-    + [(['kernprof', '-q', '-l'], 'out.lprof', False,
+    + [([sys.executable, '-m', 'kernprof', '-q', '-l'], 'out.lprof', False,
         'line_profiler-inactive'),
-       (['kernprof', '-q', '-l'], 'out.lprof', True,
+       ([sys.executable, '-m', 'kernprof', '-q', '-l'], 'out.lprof', True,
         'line_profiler-active')],
 )
 def test_running_multiproc_script(
@@ -918,7 +922,7 @@ def _test_profiling_multiproc_script(
         nhits[tag_call] += nprocs
         nhits[tag_loop] += nnums
 
-    runner = ['kernprof', '-l']
+    runner = [sys.executable, '-m', 'kernprof', '-l']
     runner.extend([
         '--{}prof-child-procs'.format('' if prof_child_procs else 'no-'),
         '--{}preimports'.format('' if preimports else 'no-'),
@@ -952,6 +956,7 @@ def _test_profiling_multiproc_script(
     # have quite a lot of subtests tho...
     ('nnums', 'nprocs'), [(2000, 3)],
 )
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_profiling_multiproc_script_success(
     run_func: Callable[..., CompletedProcess],
     request: pytest.FixtureRequest,
@@ -1038,6 +1043,7 @@ def test_profiling_multiproc_script_success(
 
 @(_fuzz_prof_mp_markers[True])
 @pytest.mark.parametrize(('nnums', 'nprocs'), [(2000, 3)])
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_profiling_multiproc_script_failure(
     run_func: Callable[..., CompletedProcess],
     request: pytest.FixtureRequest,
@@ -1120,7 +1126,7 @@ def _test_profiling_bare_python(
     debug_log_file = temp_dir / 'debug.log'
     write_debug = DEBUG and prof_child_procs
     cmd = [
-        'kernprof', '-lv', '--preimports',
+        sys.executable, '-m', 'kernprof', '-lv', '--preimports',
         f'--prof-mod={ext_module.name}',
         f'--outfile={out_file}',
         '--{}prof-child-procs'.format('' if prof_child_procs else 'no-'),
@@ -1170,6 +1176,7 @@ def _test_profiling_bare_python(
 
 
 @_fuzz_bare
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_profiling_bare_python_success(
     tmp_path_factory: pytest.TempPathFactory,
     ext_module: ModuleFixture,
@@ -1199,6 +1206,7 @@ def test_profiling_bare_python_success(
 
 
 @_fuzz_bare
+@pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_profiling_bare_python_failure(
     tmp_path_factory: pytest.TempPathFactory,
     ext_module: ModuleFixture,

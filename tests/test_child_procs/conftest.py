@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import sysconfig
 from collections.abc import Callable, Collection, Generator
 from functools import partial
 from io import StringIO
 from pathlib import Path
+from uuid import uuid4
 from tempfile import TemporaryDirectory
 from textwrap import indent
 from types import ModuleType
@@ -379,7 +381,7 @@ def another_pid() -> int:
     Get a PID which is distinct from the current one.
     """
     curr_pid = os.getpid()
-    pid = (curr_pid - 42) % (2 * 16)
+    pid = curr_pid ^ 42
     assert pid != curr_pid
     return pid
 
@@ -394,3 +396,27 @@ def _trim_mismatch_traceback(pytestconfig: pytest.Config) -> None:
         pytestconfig.pluginmanager.register(ResultMismatch)
     except ValueError:  # Already registered
         pass
+
+
+@pytest.fixture()
+def check_purelib_dir_writable() -> Generator[None, None, None]:
+    """
+    Check that ``sysconfig.get_path('purelib')`` can be written to; if
+    not, the test is skipped.
+    """
+    def propose_names() -> Generator[Path, None, None]:
+        while True:
+            pth = purelib_path / f'_temp-pth-{uuid4()}.pth'
+            if not pth.exists():
+                yield pth
+
+    purelib_path = Path(sysconfig.get_path('purelib'))
+    pth = next(propose_names())
+    try:
+        pth.touch()
+        yield
+    except OSError:
+        msg = f"sysconfig.get_path('purelib') ({purelib_path}) not writable"
+        pytest.skip(msg)
+    finally:
+        pth.unlink(missing_ok=True)
