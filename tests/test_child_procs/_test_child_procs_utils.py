@@ -2049,7 +2049,7 @@ def _run_kernprof_main_in_process(
     machineries as best as we can, so that we can retrieve more
     debugging output when things do go south. Additional safety
     railings:
-    
+
     - `preserve_targets(verify=True)` errors out if any of the patches
       is not reversed by :py:func:`kernprof.main`
 
@@ -2340,7 +2340,10 @@ def _run_test_module(
     return proc, prof_result
 
 
-def check_tagged_line_nhits(output: str, tag: str, nhits: int) -> None:
+def check_tagged_line_nhits(
+    output: str, tag: str, nhits: T, *,
+    comparator: Callable[[T, int], bool] | None = None,
+) -> None:
     """
     Check the output of :py:meth:`LineStats.print` for the number of
     hits on the line tagged with the comment ``# GREP_MARKER[<...>]``.
@@ -2355,10 +2358,15 @@ def check_tagged_line_nhits(output: str, tag: str, nhits: int) -> None:
                 actual_nhits += int(n)
             except Exception:
                 pass
-    ResultMismatch.compare(
+    compare = partial(
+        ResultMismatch.compare,
         nhits, actual_nhits,
         expected=f'{nhits} hit(s) on line(s) tagged with {tag!r}',
     )
+    if comparator is None:
+        compare()
+    else:
+        compare(comparator=comparator)
 
 
 run_module = partial(_run_test_module, _run_as_module)

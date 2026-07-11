@@ -1,0 +1,315 @@
+from __future__ import annotations
+
+import os
+import re
+import site
+import sys
+import sysconfig
+from contextlib import ExitStack
+from multiprocessing import get_all_start_methods
+from pathlib import Path
+from stat import S_IWRITE
+from types import ModuleType
+from typing import Literal
+
+import pytest
+
+from ._test_child_procs_utils import (
+    run_subproc, strip, check_tagged_line_nhits,
+)
+
+
+@pytest.mark.parametrize(('trigger_timeout', 'label1'),
+                         [(True, 'terminate-proc'), (False, 'happy-path')])
+@pytest.mark.parametrize(
+    ('suppress_error', 'label2'),
+    [(True, 'suppress-error'), (False, 'propagate-error')])
+def test_prematurely_terminated_process(
+    tmp_path_factory: pytest.TempPathFactory,
+    process_test_module_object: ModuleType,
+    trigger_timeout: bool,
+    suppress_error: bool,
+    label1: str, label2: str,
+) -> None:
+    """
+    Check that if a :py:class:`multiprocessing.process.BaseProcess` is
+    explicitly and prematurely ended (e.g. ``.terminate()``-ed or
+    ``.kill()``-ed, profiling data therein are lost, but it doesn't
+    crash the session or cause further loss of profiling data.
+    """
+    nlocal = 123
+    nchild = 10
+    delay = .03125
+    nhits = {'INVOCATION': 1, 'LOOP': nlocal}
+    if trigger_timeout:
+        # If the timeout isn't enough, exiting the context in the test
+        # module would have invoked `BaseProcess.terminate()`, impairing
+        # the collection of profiling data
+        timeout: float | None = .125  # Would've needed ~ .3 s
+    else:
+        timeout = None
+        nhits['INVOCATION'] += 1
+        nhits['LOOP'] += nchild
+
+    tmp = tmp_path_factory.mktemp('mytemp')
+    test_module = tmp / 'test.py'
+    out_file = tmp / 'out.lprof'
+    test_module.write_text(strip(f'''
+    from __future__ import annotations
+
+    from time import sleep
+
+    from {process_test_module_object.__name__} import Worker
+
+
+    def my_sum(n: list[int], delay: float = 0.) -> int:
+        result: int = 0  # GREP_MARKER[INVOCATION]
+        for item in range(1, 1 + n):
+            sleep(delay)
+            result += item  # GREP_MARKER[LOOP]
+        return result
+
+
+    def main() -> None:
+        my_sum({nlocal})
+        try:
+            with Worker.new(my_sum, args=[{nchild}, {delay}]) as worker:
+                worker.get_result({timeout})
+        except Exception:
+            if not {suppress_error}:
+                raise
+
+
+    if __name__ == '__main__':
+        main()
+    '''))
+
+    cmd = [
+        sys.executable, '-m', 'kernprof',
+        '--prof-child-procs',
+        '--line-by-line',
+        '--view',
+        f'--prof-mod={test_module}',
+        f'--outfile={out_file}',
+        str(test_module),
+    ]
+    proc = run_subproc(cmd, capture_output=True, text=True)
+
+    # Check: process termination per-se shouldn't cause `kernprof` to
+    # error out
+    assert bool(proc.returncode) == (trigger_timeout and not suppress_error)
+    # Check: collection of profiling data is as expected
+    for tag, num in nhits.items():
+        check_tagged_line_nhits(proc.stdout, tag, num)
+
+
+@pytest.mark.parametrize(('corrupt', 'label'),
+                         [(True, 'with-corruption'), (False, 'no-corruption')])
+def test_corrupted_child_stats_file(
+    tmp_path_factory: pytest.TempPathFactory,
+    corrupt: bool,
+    label: str,
+) -> None:
+    """
+    Check that if a child's stats file is corrupted, the profiling data
+    of said child are lost and a warning is issued, but it doesn't crash
+    the session or cause further loss of profiling data.
+    """
+    def between(range: tuple[int, int], x: int) -> bool:
+        return min(range) <= x <= max(range)
+
+    nlocal = 123
+    nchild = [45, 67, 89, 10]
+    if corrupt:
+        # Since we assume that there are 2+ child-profiling-stats files
+        # and we're corrupting one of them, we should capture SOME but
+        # not ALL of the child-process data
+        min_invocations = 2
+        max_invocations = len(nchild)
+        min_loops = nlocal + min(nchild)
+        max_loops = nlocal + sum(nchild) - min(nchild)
+    else:
+        min_invocations = max_invocations = len(nchild) + 1
+        min_loops = max_loops = sum(nchild) + nlocal
+
+    tmp = tmp_path_factory.mktemp('mytemp')
+    test_module = tmp / 'test.py'
+    out_file = tmp / 'out.lprof'
+    test_module.write_text(strip(f'''
+    from __future__ import annotations
+
+    import multiprocessing
+
+    from line_profiler._child_process_profiling.cache import (
+        LineProfilingCache,
+    )
+
+
+    def my_sum(n: list[int]) -> int:
+        result: int = 0  # GREP_MARKER[INVOCATION]
+        for item in range(1, 1 + n):
+            result += item  # GREP_MARKER[LOOP]
+        return result
+
+
+    def main() -> None:
+        # Accrue local data
+        my_sum({nlocal})
+
+        # Accrue data in child
+        with multiprocessing.Pool(2) as pool:
+            pool.map(my_sum, {nchild[0::2]!r})
+
+        # Boot up another pool to ensure that we at least have had
+        # two worker processes while handled tasks
+        with multiprocessing.Pool(2) as pool:
+            pool.map(my_sum, {nchild[1::2]!r})
+
+        # Retrieve one of the non-empty profiling-data files and corrupt
+        # it
+        if {corrupt}:
+            cache = LineProfilingCache.load()
+            stats, _, *__ = [
+                path for path in cache._get_profiling_outfiles()
+                if path.stat().st_size
+            ]
+            stats.write_bytes(b'foo bar baz')
+
+
+    if __name__ == '__main__':
+        main()
+    '''))
+
+    cmd = [
+        sys.executable, '-m', 'kernprof',
+        '--prof-child-procs',
+        '--line-by-line',
+        '--view',
+        f'--prof-mod={test_module}',
+        f'--outfile={out_file}',
+        str(test_module),
+    ]
+
+    # Check: data corruption shouldn't cause `kernprof` to error out
+    proc = run_subproc(cmd, capture_output=True, text=True, check=True)
+    # Check: collection of profiling data is as expected
+    for tag, min_value, max_value in [
+        ('INVOCATION', min_invocations, max_invocations),
+        ('LOOP', min_loops, max_loops),
+    ]:
+        check_tagged_line_nhits(
+            proc.stdout, tag, (min_value, max_value), comparator=between,
+        )
+    # Check: warning for the corrupted file
+    if corrupt:
+        assert re.search(
+            r'UserWarning: .*1 file\(s\) .*cannot be loaded', proc.stderr,
+        )
+
+
+@pytest.mark.parametrize('start_method', ['spawn', 'fork', 'forkserver'])
+@pytest.mark.parametrize(
+    ('make_unwritable', 'label'),
+    [(True, 'cannot-write-pth'), (False, 'can-write-pth')])
+@pytest.mark.parametrize(('n', 'nprocs'), [(100, 1)])
+def test_unwritable_purelib_path(
+    tmp_path_factory: pytest.TempPathFactory,
+    pool_test_module_object: ModuleType,
+    make_unwritable: bool,
+    start_method: Literal['spawn', 'fork', 'forkserver'],
+    n: int,
+    nprocs: int,
+    label: str,
+) -> None:
+    """
+    Check that if we can't write a .pth file, the profiling data of
+    child processes are lost, but it doesn't crash the session or cause
+    further loss of profiling data.
+    """
+    class revoke_write_access:
+        def __init__(self, path: os.PathLike[str] | str) -> None:
+            self.path = Path(path)
+
+        def __enter__(self) -> None:
+            self._should_restore = False
+            if not self.path.is_dir():
+                return
+            if self.path.stat().st_uid != get_uid():
+                return
+            self._should_restore = self._make_unwritable(self.path)
+
+        def __exit__(self, *_, **__) -> None:
+            if self._should_restore:
+                self._make_writable(self.path)
+
+        @staticmethod
+        def _make_writable(path: Path) -> bool:
+            mode = path.stat().st_mode
+            if mode & S_IWRITE:
+                return False
+            os.chmod(path, mode | S_IWRITE)
+            return True
+
+        @staticmethod
+        def _make_unwritable(path: Path) -> bool:
+            mode = path.stat().st_mode
+            if not mode & S_IWRITE:
+                return False
+            os.chmod(path, mode - S_IWRITE)
+            return True
+
+    def get_uid() -> int:
+        try:
+            return os.getuid()
+        except Exception:
+            # Not available on Windows, work around that by looking at
+            # the UID of the tempdir
+            return os.stat(tmp).st_uid
+
+    # With start methods other than `fork`, we can't extend profiling
+    # into the worker without writing a .pth
+    nhits = {'LOCAL-INVOCATION': 1, 'LOCAL-LOOP': nprocs}
+    if start_method not in get_all_start_methods():
+        pytest.skip(
+            f'start method {start_method!r} not available on '
+            f'the platform {sys.platform!r}'
+        )
+    if start_method == 'fork' or not make_unwritable:
+        nhits['LOCAL-INVOCATION'] += nprocs
+        nhits['LOCAL-LOOP'] += n
+
+    tmp = tmp_path_factory.mktemp('mytemp')
+    module_name = pool_test_module_object.__name__
+    out_file = tmp / 'out.lprof'
+    cmd = [
+        sys.executable, '-m', 'kernprof',
+        '--prof-child-procs',
+        '--line-by-line',
+        '--view',
+        f'--prof-mod={module_name}',
+        f'--outfile={out_file}',
+        '-m',
+        module_name,
+        f'--start-method={start_method}',
+        '-l', str(n),
+        '-n', str(nprocs),
+        '--local',
+    ]
+
+    # Check: even if we can't write a .pth, it shouldn't cause
+    # `kernprof` to error out
+    with ExitStack() as stack:
+        if make_unwritable:
+            for path in [
+                site.getusersitepackages(), sysconfig.get_path('purelib'),
+            ]:
+                stack.enter_context(revoke_write_access(path))
+        proc = run_subproc(cmd, capture_output=True, text=True, check=True)
+    # Check: collection of profiling data is as expected
+    for tag, num in nhits.items():
+        check_tagged_line_nhits(proc.stdout, tag, num)
+    # Check: warning for unwritable .pth locs
+    if make_unwritable:
+        assert re.search(
+            r'UserWarning: .*cannot write a \.pth file', proc.stderr,
+        )
