@@ -1199,42 +1199,29 @@ class _manage_profiler:
         self._ctx.install()
         # Keep the generated pre-imports file to be reused in child
         # processes
-        script_file, preimports_file = _prepare_exec_script(
-            self.options, self.module, self.prof,
-            exit_on_error=self.exit_on_error,
-            keep_preimports_file=self.set_up_child_profiling,
-        )
-        if self.set_up_child_profiling:
-            self.cache = cache = _prepare_child_profiling_cache(
-                self.options, self._ctx, self.prof,
-                preimports_file, script_file,
+        try:
+            script_file, preimports_file = _prepare_exec_script(
+                self.options, self.module, self.prof,
+                exit_on_error=self.exit_on_error,
+                keep_preimports_file=self.set_up_child_profiling,
             )
-            # Add deferred callbacks for gathering debug logfiles
-            # (should run right before `.cache.cache_dir` is wiped):
-            # - Write the debug logs to the `._diagnostics` logger
-            if cache.debug:
-                self._ctx.add_cleanup_with_priority(
-                    cache._dump_debug_logs, CLEANUP_PRIORITIES['gather_logs'],
-                )
-            # - Write the debug logs to a specific file
-            if self.options.debug_log:
-                self._ctx.add_cleanup_with_priority(
-                    self._gather_debug_log,
-                    CLEANUP_PRIORITIES['gather_logs'],
-                    self.options.debug_log,
-                )
-        return self.prof, script_file
+            self._set_up_session_cache(script_file, preimports_file)
+            return self.prof, script_file
+        except BaseException:
+            # Make sure that we don't leak the changes made by `._ctx`
+            # before we've gotten out of `.__enter__()`
+            self._ctx.uninstall()
+            raise
 
     def __exit__(self, *_, **__):
         try:
             extra_stats = None
-            if self.set_up_child_profiling:
-                # Cleaning up here ensures the `multiprocessing`
-                # fork-server process is rebooted, thus any profiling
-                # data on it will be properly collected
-                self.cache.cleanup()
-                extra_stats = self.cache.gather_stats()
-            _post_profile(self.options, self.prof, extra_stats)
+            try:
+                extra_stats = self._gather_child_prof_stats()
+            finally:
+                # Write process-local stats regardless of whether
+                # child-process stats can be successfully gathered
+                _post_profile(self.options, self.prof, extra_stats)
         finally:
             self._ctx.uninstall()
 
@@ -1242,6 +1229,36 @@ class _manage_profiler:
         with open(logfile, mode='w') as fobj:
             for entry in self.cache._gather_debug_log_entries():
                 print(entry.to_text(), file=fobj)
+
+    def _set_up_session_cache(self, script_file, preimports_file):
+        if not self.set_up_child_profiling:
+            return
+        self.cache = cache = _prepare_child_profiling_cache(
+            self.options, self._ctx, self.prof, preimports_file, script_file,
+        )
+        # Add deferred callbacks for gathering debug logfiles
+        # (should run right before `.cache.cache_dir` is wiped):
+        # - Write the debug logs to the `._diagnostics` logger
+        if cache.debug:
+            self._ctx.add_cleanup_with_priority(
+                cache._dump_debug_logs, CLEANUP_PRIORITIES['gather_logs'],
+            )
+        # - Write the debug logs to a specific file
+        if self.options.debug_log:
+            self._ctx.add_cleanup_with_priority(
+                self._gather_debug_log,
+                CLEANUP_PRIORITIES['gather_logs'],
+                self.options.debug_log,
+            )
+
+    def _gather_child_prof_stats(self):
+        if not self.set_up_child_profiling:
+            return None
+        # Cleaning up here ensures the `multiprocessing` fork-server
+        # process is rebooted, thus any profiling data on it will be
+        # properly collected
+        self.cache.cleanup()
+        return self.cache.gather_stats()
 
     @property
     def set_up_child_profiling(self):
