@@ -954,6 +954,15 @@ def main(args=None, *, exit_on_error=True):
         files created during execution may be deferred to when the
         interpreter exits.
     """
+    def rmdir_with_pid_guard(pid, dir, *, defer=False, **kwargs):
+        if os.getpid() != pid:  # Leave cleanup to the main process
+            return
+        callback = functools.partial(_remove, dir, **kwargs)
+        if defer:
+            atexit.register(callback)
+        else:
+            callback()
+
     real_parser, help_parser, special_info = _build_parsers(args=args)
     args = special_info['args']
     module = special_info['module']
@@ -988,7 +997,8 @@ def main(args=None, *, exit_on_error=True):
             cleanup = no_op
         else:
             cleanup = functools.partial(
-                _remove,
+                rmdir_with_pid_guard,
+                os.getpid(),
                 tmpdir,
                 recursive=True,
                 missing_ok=True,
@@ -1005,10 +1015,7 @@ def main(args=None, *, exit_on_error=True):
         except BaseException:
             # Defer deletion to after the traceback has been formatted
             # if needs be
-            if os.listdir(tmpdir):
-                atexit.register(cleanup)
-            else:  # Empty tempdir, just delete it
-                cleanup()
+            cleanup(defer=bool(os.path.isdir(tmpdir) and os.listdir(tmpdir)))
             raise
         else:  # Execution succeeded, delete the tempdir ASAP
             cleanup()
@@ -1072,9 +1079,9 @@ def _write_preimports(prof, options, exclude, keep=False):
         ns = {}  # Use a fresh namespace
         execfile(temp_mod_path, ns, ns)
     # Delete the tempfile ASAP if its execution succeeded
-    if not (keep or diagnostics.KEEP_TEMPDIRS):
-        _remove(temp_mod_path)
-    return temp_mod_path
+    if keep or diagnostics.KEEP_TEMPDIRS:
+        return temp_mod_path
+    _remove(temp_mod_path)
 
 
 def _remove(path, *, recursive=False, missing_ok=False):
@@ -1186,6 +1193,7 @@ class _manage_profiler:
         self.options = options
         self.module = module
         self.exit_on_error = exit_on_error
+        self._pid = os.getpid()
 
     def __enter__(self):
         from line_profiler.curated_profiling import CuratedProfilerContext
@@ -1215,13 +1223,18 @@ class _manage_profiler:
 
     def __exit__(self, *_, **__):
         try:
-            extra_stats = None
-            try:
-                extra_stats = self._gather_child_prof_stats()
-            finally:
-                # Write process-local stats regardless of whether
-                # child-process stats can be successfully gathered
-                _post_profile(self.options, self.prof, extra_stats)
+            # Guard against when we've forked inside the executed and
+            # profiled code...
+            if os.getpid() == self._pid:
+                extra_stats = None
+                try:
+                    extra_stats = self._gather_child_prof_stats()
+                finally:
+                    # Write process-local stats regardless of whether
+                    # child-process stats can be successfully gathered...
+                    # but watch out for when we've forked inside the
+                    # executed code
+                    _post_profile(self.options, self.prof, extra_stats)
         finally:
             self._ctx.uninstall()
 

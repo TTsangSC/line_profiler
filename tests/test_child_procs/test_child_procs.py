@@ -15,7 +15,7 @@ from runpy import run_path
 from subprocess import CompletedProcess
 from textwrap import indent
 from types import ModuleType
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 
@@ -472,7 +472,7 @@ def test_load_pth_hook(
 
 
 @cleanup_extra_pth_files()
-@preserve_targets()
+@preserve_targets(verify=True)
 def _test_apply_mp_patches_inner(
     tmp_path_factory: pytest.TempPathFactory,
     create_cache: Callable[..., LineProfilingCache],
@@ -866,23 +866,24 @@ _fuzz_prof_mp_markers = (
      + _get_mp_start_method_fuzzer(None))
     # Test all `multiproc` start methods with both locally- and
     # externally-defined profiling targets
-    * (Params.new(('preimports', 'label3'), [(False, 'no-preimports')])
-       + Params.new(('use_local_func', 'label4'),
-                    [(True, 'local'), (False, 'external')],
-                    defaults=(False, 'external')))
+    * Params.new(('use_local_func', 'label3'),
+                 [(True, 'local'), (False, 'external')],
+                 defaults=(False, 'external'))
     # Test all of the above with both test modules
     * Params.new('test_module', ['pool_test_module', 'process_test_module'])
+    # Add missing params
+    * Params.new(('preimports', 'label4'), [(False, 'no-preimports')])
+    * Params.new(('subproc', 'label5'), [(False, 'in-proc')])
     # The 'with-preimports' case is already tested rather thoroughly in
     # `test_apply_mp_patches()`, so exclude these from the above "main"
     # param matrix and just test the different `kernprof` modes via the
     # `run_func()`s
     + (_fuzz_prof_mp_run_func
-       + Params.new(('preimports', 'label3'), [(True, 'with-preimports')]))
-    # Just throw in a case where we actually run `kernprof` in a
-    # subprocess, otherwise it is more convenient to do so in-process
-    + Params.new(('subproc', 'label5'),
-                 [(True, 'subproc'), (False, 'in-proc')],
-                 defaults=(False, 'in-proc'))
+       * Params.new(('preimports', 'label4'), [(True, 'with-preimports')]))
+    # Similar to the above, we also run at least 1 subtest with
+    # `subproc=True` for each `(start_method, fail)`
+    + (_get_mp_start_method_fuzzer(None)
+       * Params.new(('subproc', 'label5'), [(True, 'subproc')]))
 ).sorted().split_on_params('fail')
 
 
@@ -1087,10 +1088,10 @@ def test_profiling_multiproc_script_failure(
     )
 
 
+_TestBarePythonCase = Literal['subprocess.run', 'os.system', 'os.fork']
 _fuzz_bare = (
-    Params.new(('use_subprocess', 'label1'),
-               [(True, 'subprocess.run'), (False, 'os.system')])
-    * Params.new(('prof_child_procs', 'label2'),
+    Params.new('case', ['subprocess.run', 'os.system', 'os.fork'])
+    * Params.new(('prof_child_procs', 'label'),
                  [(True, 'with-child-prof'), (False, 'no-child-prof')])
     * Params.new('n', [200])
 )
@@ -1099,28 +1100,13 @@ _fuzz_bare = (
 def _test_profiling_bare_python(
     tmp_path_factory: pytest.TempPathFactory,
     ext_module: ModuleFixture,
-    use_subprocess: bool,
+    case: _TestBarePythonCase,
     prof_child_procs: bool,
     fail: bool,
     n: int,
 ) -> None:
     ext_module.install(children=True)
     temp_dir = tmp_path_factory.mktemp('mytemp')
-
-    script_path = temp_dir / 'my-script.py'
-    script_content = strip("""
-    from {EXT_MODULE} import my_external_sum
-
-
-    if __name__ == '__main__':
-        numbers = list(range(1, 1 + {N}))
-        result = my_external_sum(numbers, {FAIL})
-    """.format(
-        EXT_MODULE=ext_module.name,
-        N=n,
-        FAIL=fail,
-    ))
-    script_path.write_text(script_content)
 
     out_file = temp_dir / 'out.lprof'
     debug_log_file = temp_dir / 'debug.log'
@@ -1133,31 +1119,84 @@ def _test_profiling_bare_python(
     ]
     if write_debug:
         cmd.append(f'--debug-log={debug_log_file}')
-    sub_cmd = [sys.executable, str(script_path)]
-    if use_subprocess:
-        code = strip(f"""
-        import subprocess
 
+    if case == 'os.fork':
+        if not callable(getattr(os, 'fork', None)):
+            pytest.skip(f'Cannot fork on {sys.platform}')
 
-        subprocess.run({sub_cmd!r}, check=True)
-        """)
-    else:
         code = strip("""
         import os
 
+        from {EXT_MODULE} import my_external_sum
 
-        if os.system({!r}):
-            raise RuntimeError('called process failed')
-        """.format(concat_command_line(sub_cmd)))
-    cmd.extend(['-c', code])
+
+        def main(n: int, fail: bool) -> None:
+            numbers = list(range(1, 1 + n))
+            child_pid = os.fork()
+            offset = int(not child_pid)  # Literal[0, 1]
+            try:
+                my_external_sum(numbers[offset::2], fail)
+            finally:
+                if child_pid:  # Always join the forked child
+                    os.waitpid(child_pid, 0)
+
+
+        if __name__ == '__main__':
+            main({N}, {FAIL})
+        """.format(
+            EXT_MODULE=ext_module.name,
+            N=n,
+            FAIL=fail,
+        ))
+        cmd.extend(['-c', code])
+        nhits = {'EXT-INVOCATION': 2, 'EXT-LOOP': n}
+        if not prof_child_procs:
+            for k in nhits:  # We still have the data in the main proc
+                nhits[k] //= 2
+    else:
+        script_path = temp_dir / 'my-script.py'
+        script_content = strip("""
+        from {EXT_MODULE} import my_external_sum
+
+
+        if __name__ == '__main__':
+            numbers = list(range(1, 1 + {N}))
+            result = my_external_sum(numbers, {FAIL})
+        """.format(
+            EXT_MODULE=ext_module.name,
+            N=n,
+            FAIL=fail,
+        ))
+        script_path.write_text(script_content)
+
+        sub_cmd = [sys.executable, str(script_path)]  # FIXME
+        if case == 'subprocess.run':
+            code = strip(f"""
+            import subprocess
+
+
+            subprocess.run({sub_cmd!r}, check=True)
+            """)
+        elif case == 'os.system':
+            code = strip("""
+            import os
+
+
+            if os.system({!r}):
+                raise RuntimeError('called process failed')
+            """.format(concat_command_line(sub_cmd)))
+        else:
+            msg = f'case = {case!r}: expected {_TestBarePythonCase}'
+            raise AssertionError(msg)
+        cmd.extend(['-c', code])
+        nhits = {'EXT-INVOCATION': 1, 'EXT-LOOP': n}
+        if not prof_child_procs:
+            for k in nhits:
+                nhits[k] = 0
+
     proc = run_subproc(
         cmd, text=True, capture_output=True, timeout=DEFAULT_TIMEOUT,
     )
-
-    nhits = {'EXT-INVOCATION': 1, 'EXT-LOOP': n}
-    if not prof_child_procs:
-        for k in nhits:
-            nhits[k] = 0
 
     try:
         # Check that the code errors out when expected
@@ -1180,17 +1219,17 @@ def _test_profiling_bare_python(
 def test_profiling_bare_python_success(
     tmp_path_factory: pytest.TempPathFactory,
     ext_module: ModuleFixture,
-    use_subprocess: bool,
+    case: _TestBarePythonCase,
     prof_child_procs: bool,
     n: int,
-    # Dummy arguments to make `pytest` output more legible
-    label1: str, label2: str,
+    # Dummy argument to make `pytest` output more legible
+    label: str,
 ) -> None:
     """
     Check that `kernprof` can profile the target functions if the code
-    invokes another bare Python process (via either :py:func:`os.system`
-    or :py:func:`subprocess.run`) that calls them and exits without
-    errors.
+    invokes another bare Python process (via either
+    :py:func:`os.system`, :py:func:`subprocess.run`, or forking) that
+    calls them and exits WITHOUT errors.
 
     See also:
         :py:func:`test_profiling_bare_python_failure`
@@ -1198,7 +1237,7 @@ def test_profiling_bare_python_success(
     _test_profiling_bare_python(
         tmp_path_factory=tmp_path_factory,
         ext_module=ext_module,
-        use_subprocess=use_subprocess,
+        case=case,
         prof_child_procs=prof_child_procs,
         fail=False,
         n=n,
@@ -1210,16 +1249,16 @@ def test_profiling_bare_python_success(
 def test_profiling_bare_python_failure(
     tmp_path_factory: pytest.TempPathFactory,
     ext_module: ModuleFixture,
-    use_subprocess: bool,
+    case: _TestBarePythonCase,
     prof_child_procs: bool,
     n: int,
-    label1: str,
-    label2: str,
+    label: str,
 ) -> None:
     """
     Check that `kernprof` can profile the target functions if the code
-    invokes another bare Python process (via either :py:func:`os.system`
-    or :py:func:`subprocess.run`) that calls them and exits with errors.
+    invokes another bare Python process (via either
+    :py:func:`os.system`, :py:func:`subprocess.run`, or forking) that
+    calls them and exits WITH errors.
 
     See also:
         :py:func:`test_profiling_bare_python_success`
@@ -1227,7 +1266,7 @@ def test_profiling_bare_python_failure(
     _test_profiling_bare_python(
         tmp_path_factory=tmp_path_factory,
         ext_module=ext_module,
-        use_subprocess=use_subprocess,
+        case=case,
         prof_child_procs=prof_child_procs,
         fail=True,
         n=n,

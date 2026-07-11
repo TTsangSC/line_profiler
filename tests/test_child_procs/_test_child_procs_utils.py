@@ -796,10 +796,14 @@ class preserve_object_attrs(_CallableContextManager[dict[str, Any]]):
 class preserve_targets(_CallableContextManager[dict[str, dict[str, Any]]]):
     """
     Protect attributes on multiple target objects, which are resolved at
-    context entry.
+    context entry. If ``verify`` is true, check that the targets have
+    all been restored to their original value on context exit, and raise
+    an :py:class:`AssertionError` if that is not the case (before
+    restoring them anyways).
 
     Example:
-        >>> from functools import wraps
+        >>> import builtins
+        >>> from functools import partial, wraps
         >>> from line_profiler.curated_profiling import (
         ...     CuratedProfilerContext,
         ... )
@@ -807,23 +811,23 @@ class preserve_targets(_CallableContextManager[dict[str, dict[str, Any]]]):
 
         >>> assert not hasattr(CuratedProfilerContext, 'foo')
         >>> old_main = line_profiler.main
-        >>>
-        >>>
+        >>> new_context = partial(preserve_targets, debug=False)
+
         >>> def foo(_) -> None:
         ...     pass
-        ...
-        >>>
+
         >>> @wraps(old_main)
         ... def main(*a, **k):
         ...     return old_main(*a, **k)
-        ...
-        >>>
+
+        Basic use:
+
         >>> preserved = {
         ...     'line_profiler.curated_profiling'
         ...     '.CuratedProfilerContext': {'foo'},
         ...     'line_profiler.line_profiler': {'main'},
         ... }
-        >>> with preserve_targets(preserved, debug=False) as old:
+        >>> with new_context(preserved) as old:
         ...     assert old == {
         ...         'line_profiler.curated_profiling'
         ...         '.CuratedProfilerContext': {'foo': NOT_SUPPLIED},
@@ -839,29 +843,67 @@ class preserve_targets(_CallableContextManager[dict[str, dict[str, Any]]]):
 old['line_profiler.line_profiler']['main']
         >>> assert old_main is line_profiler.main
         >>> assert main is not line_profiler.main
+
+        With ``verify``:
+
+        >>> preserved = {'builtins': {'foo', 'bar'}}
+        >>> expected = {
+        ...     'builtins': {'foo': NOT_SUPPLIED, 'bar': NOT_SUPPLIED},
+        ... }
+        >>> ctx = new_context(preserved, verify=True)
+        >>> with ctx as old:
+        ...     assert old == expected
+        ...     builtins.foo = 1
+        ...     del builtins.foo
+        ...     print('ok')
+        ok
+        >>> with ctx as old:  # doctest: +ELLIPSIS
+        ...     assert old == expected
+        ...     builtins.foo = 1
+        ...     # `bar` not restored -> `.__exit__()` error out
+        ...     builtins.bar = 2
+        ...     del builtins.foo
+        ...     print('ok, but...')
+        ok, but...
+        Traceback (most recent call last):
+          ...
+        AssertionError: Compared `builtins.bar` \
+(old:...NOT_SUPPLIED...; new: 2...)...
+
+        >>> assert not hasattr(builtins, 'foo')
+        >>> assert not hasattr(builtins, 'bar')  # Still cleaned up
     """
     def __init__(
         self, targets: Mapping[str, Collection[str]] | None = None, *,
-        static: bool = True, debug: bool = DEBUG,
+        static: bool = True, debug: bool = DEBUG, verify: bool = False,
     ) -> None:
         self.targets = targets
-        self._stacks: list[ExitStack] = []
+        self._ctxs: list[tuple[ExitStack, dict[str, dict[str, Any]]]] = []
         self.static = static
         self.debug = debug
+        self.verify = verify
 
     def __enter__(self) -> dict[str, dict[str, Any]]:
         stack = ExitStack()
-        self._stacks.append(stack)
-        result: dict[str, Any] = {}
+        old: dict[str, Any] = {}
         for target, attrs in self.targets.items():
-            result[target] = stack.enter_context(preserve_object_attrs(
+            old[target] = stack.enter_context(preserve_object_attrs(
                 import_target(target), attrs,
                 debug=self.debug, static=self.static,
             ))
-        return result
+        self._ctxs.append((stack, old))
+        # Decouple the stored and returned maps for the original values
+        # in case the user messes around with the latter
+        old_copy = {key: value.copy() for key, value in old.items()}
+        return old_copy
 
     def __exit__(self, *_, **__) -> None:
-        self._stacks.pop().close()
+        stack, old = self._ctxs.pop()
+        try:
+            if self.verify:
+                self.compare_with_current_values(old, verbose=self.debug)
+        finally:
+            stack.close()
 
     @staticmethod
     def fetch_current_values(
@@ -885,6 +927,7 @@ old['line_profiler.line_profiler']['main']
         comparator: Callable[[Any, Any], bool] = operator.is_,
         assert_true: bool | Mapping[str, Mapping[str, bool]] = True,
         static: bool = True,
+        verbose: bool = True,
     ) -> dict[str, dict[str, bool]]:
         def get_from_mapping(target: str, attr: str) -> bool:
             if TYPE_CHECKING:
@@ -906,7 +949,8 @@ old['line_profiler.line_profiler']['main']
             new_values = new[target]
             cmp_results = result[target] = {}
             for attr, old_value in old_values.items():
-                print(f'Checking: {target}.{attr}')
+                if verbose:
+                    print(f'Checking: {target}.{attr}')
                 new_value = new_values[attr]
                 cmp_results[attr] = cmp_result = comparator(
                     new_value, old_value,
@@ -934,7 +978,8 @@ old['line_profiler.line_profiler']['main']
                     message = format_msg(
                         f'comparison result with {comparator!r}: {cmp_result}'
                     )
-                print(message)
+                if verbose:
+                    print(message)
         assert (not failures), '\n'.join(failures)
         return result
 
@@ -1885,7 +1930,7 @@ def run_subproc(
         cmd_str = concat_command_line(cmd)
 
     print('Command:', cmd_str)
-    _print_env_deltas(kwargs.get('env'))
+    _get_env_deltas(kwargs.get('env'))
     print('-- Process start --')
     # Note: somehow `mypy` doesn't agree with simply unpacking the
     # `*args` into `subprocess.run()`...
@@ -1987,7 +2032,7 @@ def _run_as_literal_code(
 
 
 @cleanup_extra_pth_files()
-@preserve_targets()
+@preserve_targets(verify=True)
 def _run_kernprof_main_in_process(
     request: pytest.FixtureRequest, check_warnings: bool, cmd: Sequence[str],
     *,
@@ -2002,7 +2047,16 @@ def _run_kernprof_main_in_process(
     """
     Emulate running ``kernprof`` in a subprocess with in-process
     machineries as best as we can, so that we can retrieve more
-    debugging output when things do go south.
+    debugging output when things do go south. Additional safety
+    railings:
+    
+    - `preserve_targets(verify=True)` errors out if any of the patches
+      is not reversed by :py:func:`kernprof.main`
+
+    - Same goes for the key-value pairs in :py:data:`os.environ`.
+
+    In both cases, if we don't get a match, an
+    :py:class:`AssertionError` is raised.
     """
     def get_streams(
     ) -> tuple[str, str] | tuple[bytes, bytes] | tuple[None, None]:
@@ -2042,7 +2096,7 @@ def _run_kernprof_main_in_process(
     if capture_output:
         cap = request.getfixturevalue('capsys')
     print('Command:', concat_command_line(cmd))
-    _print_env_deltas(env)
+    _get_env_deltas(env)
     print('-- Emulated process start --')
     get_streams()  # Don't include the above in the captured outputs
 
@@ -2077,7 +2131,16 @@ def _run_kernprof_main_in_process(
                 cleanup = stack.enter_context(Cleanup())
                 if env is not None:
                     cleanup.update_mapping(os.environ, env)
-                main(args, exit_on_error=False)
+                old_environ = dict(os.environ)
+                try:
+                    main(args, exit_on_error=False)
+                finally:
+                    env_diff = _get_env_deltas(os.environ, old_environ, False)
+                    if env_diff:
+                        raise AssertionError(
+                            f'{len(env_diff)} `os.environ` pollution(s): '
+                            f'{env_diff!r}'
+                        )
             except FuncCallTimeout:  # `subprocess` uses `SIGKILL`
                 returncode, timed_out = -9, True
                 status = f'error ({returncode})'
@@ -2118,12 +2181,18 @@ def _run_kernprof_main_in_process(
             )
 
 
-def _print_env_deltas(env: Mapping[str, str] | None = None) -> None:
+def _get_env_deltas(
+    env: Mapping[str, str] | None = None,
+    original: Mapping[str, str] | None = None,
+    verbose: bool = True,
+) -> list[str]:
     if env is None:
-        return
+        return []
     diff: list[str] = []
-    for key in set(os.environ).union(env):
-        old = os.environ.get(key)
+    if original is None:
+        original = os.environ
+    for key in set(original).union(env):
+        old = original.get(key)
         new = env.get(key)
         if old is not None is new:
             item = f'{old!r} -> (deleted)'
@@ -2134,8 +2203,9 @@ def _print_env_deltas(env: Mapping[str, str] | None = None) -> None:
                 continue
             item = f'{old!r} -> {new!r}'
         diff.append(f'${{{key}}}: {item}')
-    if diff:
+    if verbose and diff:
         print('Env:', indent('\n'.join(diff), '  '), sep='\n')
+    return diff
 
 
 @cleanup_extra_pth_files()
