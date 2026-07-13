@@ -1902,7 +1902,7 @@ PATCH_SUMMARIES['default'] = _get_patch_summary_union(
 # it's been around since 2.4, seems stable enough, and does exactly what
 # is needed
 concat_command_line: Callable[[Sequence[str]], str]
-if sys.platform == 'win32':
+if sys.platform.startswith('win32'):
     concat_command_line = subprocess.list2cmdline
 else:
     concat_command_line = shlex.join
