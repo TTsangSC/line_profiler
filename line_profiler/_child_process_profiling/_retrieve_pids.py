@@ -56,7 +56,7 @@ def get_active_processes_windows() -> set[int]:
     # CSV formatted output
     cmd = [_find_executable('tasklist'), '/fo', 'csv']
     tasklist = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    rows = tasklist.stdout.splitlines()
+    rows = tasklist.stdout.lower().splitlines()  # Normalize cases
     # XXX: this is *probably* locale-safe given that even JP has PID as
     # a header... but who knows.
     # Might have to test in an RTL language...
@@ -64,10 +64,13 @@ def get_active_processes_windows() -> set[int]:
         return {int(row['pid']) for row in csv.DictReader(rows)}
     except Exception as e:  # nocover
         n = 10
-        head = '\n'.join(rows[:n])
+        head_raw = '\n'.join(tasklist.stdout.splitlines()[:n])
+        error = type(e).__name__
+        if str(e):
+            error = f'{error}: {e}'
         raise RuntimeError(  # Context for debugging
             'Error reading PIDs from `tasklist` output '
-            f'(first {n} line(s)):\n{indent(head, "  ")}'
+            f'({error}; first {n} line(s)):\n{indent(head_raw, "  ")}'
         ) from e
 
 
