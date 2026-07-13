@@ -6,6 +6,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Collection
 from shutil import which
+from textwrap import indent
 from typing import NoReturn
 
 
@@ -55,18 +56,19 @@ def get_active_processes_windows() -> set[int]:
     # CSV formatted output
     cmd = [_find_executable('tasklist'), '/fo', 'csv']
     tasklist = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    header_line, *rows = tasklist.stdout.splitlines()
-    headers = {h.strip() for h in header_line.lower().split(',')}
+    rows = tasklist.stdout.splitlines()
     # XXX: this is *probably* locale-safe given that even JP has PID as
-    # a header... but who knows
-    if 'pid' not in headers:
-        raise RuntimeError(
-            'cannot find PID column in `tasklist` output, '
-            f'got CSV header: {header_line!r}'
-        )
-    return {
-        int(row['pid']) for row in csv.DictReader([header_line.lower(), *rows])
-    }
+    # a header... but who knows.
+    # Might have to test in an RTL language...
+    try:
+        return {int(row['pid']) for row in csv.DictReader(rows)}
+    except Exception as e:  # nocover
+        n = 10
+        head = '\n'.join(rows[:n])
+        raise RuntimeError(  # Context for debugging
+            'Error reading PIDs from `tasklist` output '
+            f'(first {n} line(s)):\n{indent(head, "  ")}'
+        ) from e
 
 
 def get_active_processes_not_supported() -> NoReturn:  # nocover
