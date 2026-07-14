@@ -67,6 +67,13 @@ def _process_test_module(_ext_module: Path) -> Generator[Path, None, None]:
     )
 
 
+@pytest.fixture(scope='session')
+def _concurrent_test_module(_ext_module: Path) -> Generator[Path, None, None]:
+    yield from _dependent_module_path(
+        _ext_module, 'concurrent_test_module.py', 'my_concurrent_test_module',
+    )
+
+
 def _dependent_module_path(
     _ext_module: Path, basename: str, module_name: str,
 ) -> Generator[Path, None, None]:
@@ -174,6 +181,22 @@ def process_test_module(
     )
 
 
+@pytest.fixture
+def concurrent_test_module(
+    _concurrent_test_module: Path,
+    ext_module: ModuleFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[ModuleFixture, None, None]:
+    """
+    Yields:
+        :py:class:`ModuleFixture` helper object containing the code at
+        ``./multiproc_examples/concurrent_test_module.py``
+    """
+    yield from _yield_test_module(
+        _concurrent_test_module, ext_module, monkeypatch,
+    )
+
+
 def _yield_test_module(
     test_module: Path,
     ext_module: ModuleFixture,
@@ -224,6 +247,19 @@ def process_test_module_object(
         down at the end of the test
     """
     yield from process_test_module._import_module_helper()
+
+
+@pytest.fixture
+def concurrent_test_module_object(
+    concurrent_test_module: ModuleFixture, ext_module_object: ModuleType,
+) -> Generator[ModuleType, None, None]:
+    """
+    Yields:
+        :py:class:`ModuleType` object containing the code at
+        ``./multiproc_examples/concurrent_test_module.py``, and is torn
+        down at the end of the test
+    """
+    yield from concurrent_test_module._import_module_helper()
 
 
 # =========================== Misc. fixtures ===========================

@@ -15,7 +15,8 @@ from runpy import run_path
 from subprocess import CompletedProcess
 from textwrap import indent
 from types import ModuleType
-from typing import Literal, cast
+from typing import Literal, cast, overload
+from typing_extensions import ParamSpec
 
 import pytest
 
@@ -43,6 +44,8 @@ from ._test_child_procs_utils import (
     strip, search_cache_logs,
 )
 
+
+PS = ParamSpec('PS')
 
 # ============================= Unit tests =============================
 
@@ -623,6 +626,49 @@ def _test_apply_mp_patches(
         )
 
 
+@overload
+def _test_apply_mp_patches_decorator_helper(
+    func: Callable[PS, None], label_arg_name: str = 'label',
+) -> Callable[PS, None]:
+    ...
+
+
+@overload
+def _test_apply_mp_patches_decorator_helper(
+    func: None = None, label_arg_name: str = 'label',
+) -> Callable[[Callable[PS, None]], Callable[PS, None]]:
+    ...
+
+
+def _test_apply_mp_patches_decorator_helper(
+    func: Callable[PS, None] | None = None, label_arg_name: str = 'label',
+) -> Callable[[Callable[PS, None]], Callable[PS, None]] | Callable[PS, None]:
+    Decorator = Callable[[Callable[PS, None]], Callable[PS, None]]
+    if func is None:
+        return partial(
+            _test_apply_mp_patches_decorator_helper,
+            label_arg_name=label_arg_name,
+        )
+    fuzz_modules_and_patches: Decorator = pytest.mark.parametrize(
+        ('test_module', 'patch_process', 'patch_pool', label_arg_name),
+        [('pool_test_module', True, True, 'patch-pool-and-process'),
+         ('pool_test_module', False, True, 'patch-pool-only'),
+         ('process_test_module', True, True, 'patch-pool-and-process'),
+         ('process_test_module', True, False, 'patch-process-only'),
+         ('concurrent_test_module', True, True, 'patch-pool-and-process'),
+         ('concurrent_test_module', True, False, 'patch-process-only')],
+    )
+    fuzz_params: Decorator = pytest.mark.parametrize(
+        ('n', 'nprocs'), [(100, 2)],
+    )
+    purelib_guard: Decorator = pytest.mark.usefixtures(
+        'check_purelib_dir_writable',
+    )
+    for decorator in purelib_guard, fuzz_params, fuzz_modules_and_patches:
+        func = decorator(func)
+    return func
+
+
 @(Params.new('start_method', ['fork', 'forkserver', 'spawn', 'dummy'],
              defaults='dummy')
   # We only need to check if `intercept_logs = logging` work, the other
@@ -630,14 +676,7 @@ def _test_apply_mp_patches(
   + Params.new(('intercept_logs', 'label1'),
                [(True, 'with-logging'), (False, 'no-logging')],
                defaults=(None, 'default-logging'))).sorted()
-@pytest.mark.parametrize(
-    ('test_module', 'patch_process', 'patch_pool', 'label2'),
-    [('pool_test_module', True, True, 'patch-pool-and-process'),
-     ('pool_test_module', False, True, 'patch-pool-only'),
-     ('process_test_module', True, True, 'patch-pool-and-process'),
-     ('process_test_module', True, False, 'patch-process-only')])
-@pytest.mark.parametrize(('n', 'nprocs'), [(100, 2)])
-@pytest.mark.usefixtures('check_purelib_dir_writable')
+@_test_apply_mp_patches_decorator_helper(label_arg_name='label2')
 def test_apply_mp_patches_success(
     request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
@@ -683,14 +722,7 @@ def test_apply_mp_patches_success(
 
 @pytest.mark.parametrize('start_method',
                          ['fork', 'forkserver', 'spawn', 'dummy'])
-@pytest.mark.parametrize(
-    ('test_module', 'patch_process', 'patch_pool', 'label'),
-    [('pool_test_module', True, True, 'patch-pool-and-process'),
-     ('pool_test_module', False, True, 'patch-pool-only'),
-     ('process_test_module', True, True, 'patch-pool-and-process'),
-     ('process_test_module', True, False, 'patch-process-only')])
-@pytest.mark.parametrize(('n', 'nprocs'), [(100, 2)])
-@pytest.mark.usefixtures('check_purelib_dir_writable')
+@_test_apply_mp_patches_decorator_helper
 def test_apply_mp_patches_failure(
     request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
@@ -757,7 +789,9 @@ def _get_mp_start_method_fuzzer(label_name: str | None) -> Params:
     return fuzz_fail * fuzz_start
 
 
-@(Params.new('test_module', ['pool_test_module', 'process_test_module'])
+@(Params.new(
+    'test_module',
+    ['pool_test_module', 'process_test_module', 'concurrent_test_module'])
   * Params.new(('run_func', 'label1'),
                [(run_module, 'module'), (run_script, 'script')])
   * Params.new(('use_local_func', 'label2'),
@@ -768,7 +802,9 @@ def _get_mp_start_method_fuzzer(label_name: str | None) -> Params:
   # because `Worker` is locally-defined
   + Params.new(
       ('test_module', 'run_func', 'label1', 'use_local_func', 'label2'),
-      [('pool_test_module', run_literal_code, 'literal-code', False, 'ext')])
+      [('pool_test_module', run_literal_code, 'literal-code', False, 'ext'),
+       ('concurrent_test_module', run_literal_code, 'literal-code',
+        False, 'ext')])
   # Also fuzz the parallelization-related stuff, esp. check what
   # happens if an exception is raised inside the parallelly-run func
   + _get_mp_start_method_fuzzer('label3')
@@ -869,8 +905,10 @@ _fuzz_prof_mp_markers = (
     * Params.new(('use_local_func', 'label3'),
                  [(True, 'local'), (False, 'external')],
                  defaults=(False, 'external'))
-    # Test all of the above with both test modules
-    * Params.new('test_module', ['pool_test_module', 'process_test_module'])
+    # Test all of the above with all test modules
+    * Params.new(
+        'test_module',
+        ['pool_test_module', 'process_test_module', 'concurrent_test_module'])
     # Add missing params
     * Params.new(('preimports', 'label4'), [(False, 'no-preimports')])
     * Params.new(('subproc', 'label5'), [(False, 'in-proc')])
@@ -1169,7 +1207,7 @@ def _test_profiling_bare_python(
         ))
         script_path.write_text(script_content)
 
-        sub_cmd = [sys.executable, str(script_path)]  # FIXME
+        sub_cmd = [sys.executable, str(script_path)]
         if case == 'subprocess.run':
             code = strip(f"""
             import subprocess
