@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import (
-    Executor, ThreadPoolExecutor, ProcessPoolExecutor,
+    Executor, Future, ThreadPoolExecutor, ProcessPoolExecutor,
 )
 from multiprocessing import get_context
-from typing import Literal
+from typing import Literal, TypeVar
 
 from external_module import my_external_sum
 from external_module import split_workload  # See issue #433
@@ -15,6 +15,7 @@ from external_module import split_workload  # See issue #433
 NUM_NUMBERS = 100
 NUM_PROCS = 4
 
+T = TypeVar('T')
 StartMethod = Literal['fork', 'forkserver', 'spawn', 'dummy']
 
 
@@ -25,6 +26,32 @@ def my_local_sum(x: list[int], fail: bool = False) -> int:
     if fail:
         raise RuntimeError('forced failure')
     return result
+
+
+def gather_results(
+    futures: Sequence[Future[T]], timeout: float | None = None,
+) -> list[T]:
+    """
+    Attempt to gather all partial results from all futures even if some
+    futures errored out.
+
+    Note:
+        - The ``timeout`` is applied on a per-future basis.
+
+        - We do this instead of :py:meth:`.Executor.map` because the
+          latter results in unrun tasks being cancelled when earlier
+          ones error out.
+    """
+    result: list[T] = []
+    xc: BaseException | None = None
+    for future in futures:
+        try:
+            result.append(future.result(timeout))
+        except BaseException as e:
+            xc = e
+    if xc is None:
+        return result
+    raise xc
 
 
 def sum_in_child_procs(
@@ -39,10 +66,11 @@ def sum_in_child_procs(
         ctx = get_context(start_method)
         executor = ProcessPoolExecutor(n, mp_context=ctx)
     with executor:
-        results = executor.map(
-            my_sum, split_workload(length, n), [fail] * n, timeout=timeout,
-        )
-        return my_sum(list(results), fail)
+        futures = [
+            executor.submit(my_sum, workload, fail)
+            for workload in split_workload(length, n)
+        ]
+        return my_sum(gather_results(futures, timeout=timeout), fail)
 
 
 def main(args: list[str] | None = None) -> None:
