@@ -5,8 +5,8 @@ from functools import partial
 from typing import TypeVar
 from typing_extensions import Concatenate, ParamSpec
 
+from .._patching_infrastructure import SingleModulePatch
 from ..cache import LineProfilingCache
-from ._infrastructure import SingleModulePatch
 
 
 __all__ = ('LOGGING_PATCH', 'tee_log')

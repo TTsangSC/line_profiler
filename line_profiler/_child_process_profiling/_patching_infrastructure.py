@@ -17,8 +17,8 @@ from typing import (
 )
 from typing_extensions import Self
 
-from ... import _diagnostics as diagnostics
-from ..cache import LineProfilingCache
+from .. import _diagnostics as diagnostics
+from .cache import LineProfilingCache
 
 
 __all__ = ('Patch', 'SingleModulePatch', 'Registry')
@@ -210,7 +210,7 @@ Literal['class', 'static'] | None):
             replacements (list[str]):
                 Names of entities replaced
         """
-        submod_name = f'{self.package}.{self.submodule}'
+        submod_name = self.module
         get_attribute = getattr_static if static else getattr
         result: list[str] = []
         try:

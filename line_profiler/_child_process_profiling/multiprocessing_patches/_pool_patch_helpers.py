@@ -8,8 +8,8 @@ from multiprocessing.process import BaseProcess
 from typing import Any, TypeVar
 from typing_extensions import Concatenate, ParamSpec
 
+from .._patching_infrastructure import SingleModulePatch
 from ..cache import LineProfilingCache
-from ._infrastructure import SingleModulePatch
 from ._queue import Queue, PutWrapper, QuickGetWrapper
 
 

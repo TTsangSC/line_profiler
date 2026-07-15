@@ -31,9 +31,9 @@ except ImportError:
 else:
     _CAN_USE_RESOURCE_TRACKER = True
 
+from .._patching_infrastructure import SingleModulePatch
 from ..cache import LineProfilingCache
 from ..runpy_patches import create_runpy_wrapper
-from ._infrastructure import SingleModulePatch
 from ._pool_patch_helpers import (
     get_per_task_callback_patch, get_worker_finalization_patch,
 )
