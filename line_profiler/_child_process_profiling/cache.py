@@ -583,7 +583,7 @@ class LineProfilingCache(Cleanup):
 
             >>> with ExitStack() as stack:
             ...     fobj = stack.enter_context(StringIO())
-            ...     stack.enter_context(redirect_stdout(fobj))
+            ...     _ = stack.enter_context(redirect_stdout(fobj))
             ...     bad_module_stmts = get_pth(
             ...         'buuiltins', 'print', 'foo',
             ...     )
