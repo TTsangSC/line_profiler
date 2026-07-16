@@ -15,20 +15,108 @@ en/latest/subprocess.html#using-multiprocessing>`__.
 from __future__ import annotations
 
 import multiprocessing
-from collections.abc import Collection
-from typing import Literal, get_args
+import warnings
+from collections.abc import Collection, Mapping
+from functools import lru_cache
+from importlib import import_module
+from typing import Literal, TypeVar, cast, get_args
 
+from ... import _diagnostics as diagnostics
 from ..cache import LineProfilingCache
-from ._infrastructure import Registry
+from .._patching_infrastructure import Registry, Patch
 from .mp_config import MPConfig
 
 
 __all__ = ('MPConfig', 'Registry', 'apply')
 
 PublicPatch = Literal['pool', 'process', 'logging']
+P = TypeVar('P', bound=Patch)
 
 _PATCHED_MARKER = '__line_profiler_patched_multiprocessing__'
-_PATCHES = Registry.get_default()
+
+
+@lru_cache(1)
+def get_registry() -> Registry:
+    """
+    Returns:
+        :py:class:`.Registry` instance summarizing the patches loaded
+        from the various ``.*_patches``  sibling modules
+
+    Note:
+        This function always return the same instance.
+
+    Example:
+        >>> reg = get_registry()
+        >>> assert get_registry() is reg
+
+        Check for the default plugins that should be installed and
+        their contents:
+
+        >>> assert 'pool' in reg
+        >>> assert 'process' in reg
+        >>> assert 'logging' in reg
+
+        >>> assert (
+        ...     'multiprocessing.process.BaseProcess' in reg.summary
+        ... )
+        >>> assert (
+        ...     'worker'
+        ...     in reg.summary.get('multiprocessing.pool', set())
+        ... )
+    """
+    def check(patch: P) -> P:
+        error: str | None = None
+        if not hasattr(patch, 'priority'):
+            error = 'expected a `.priority: float | None` field'
+        elif not isinstance(getattr(patch, 'summary', None), Mapping):
+            error = 'expected a `.summary: Mapping[str, Set[str]]` field'
+        elif not callable(getattr(patch, 'apply', None)):
+            error = (
+                'expected an `.apply(cache: LineProfilingCache, ...)` '
+                'method'
+            )
+        if error:
+            raise TypeError(f'patch `{patch!r}`: {error}')
+        return patch
+
+    instance = Registry()
+    subpkg = get_registry.__module__
+    for name, (sibling, patch_loc) in {
+        '__process_setup': ('_mandatory_patches', 'PROCESS_SETUP_PATCH'),
+        '__pool_worker_pid':
+            ('_mandatory_patches', 'POOL_WORKER_PID_PATCH'),
+        '__reboot_forkserver':
+            ('_mandatory_patches', 'RebootForkserverPatch'),
+        '__resource_tracker':
+            ('_mandatory_patches', 'ResourceTrackerPatch'),
+        '__spawn_runpy': ('_mandatory_patches', 'RunpyPatch'),
+
+        'logging': ('_optional_patches', 'LOGGING_PATCH'),
+
+        'pool': ('_profiling_patches', 'POOL_PATCH'),
+        'process': ('_profiling_patches', 'PROCESS_PATCH'),
+    }.items():
+        try:
+            mod = import_module(f'{subpkg}.{sibling}')
+            patch = check(cast(Patch, getattr(mod, patch_loc)))
+        except Exception as e:
+            error = type(e).__name__
+            if str(error):
+                error = f'{error}: {e}'
+            msg = (
+                f'failed to load patch {name!r} '
+                f'from sibling submodule `{subpkg}.{sibling}`: {error}'
+            )
+            diagnostics.log.warning(msg)
+            warnings.warn(msg)
+        else:
+            instance.register(name, patch)
+
+    # Sanity/Consistency check
+    for patch in get_args(PublicPatch):
+        if patch not in instance:
+            raise RuntimeError(f'Cannot load patch `{patch}`')
+    return instance
 
 
 def apply(
@@ -38,7 +126,7 @@ def apply(
 ) -> None:
     """
     Set up profiling in :py:mod:`multiprocessing` child processes by
-    applying patches to the module.
+    applying patches to the package.
 
     Args:
         cache (LineProfilingCache):
@@ -112,11 +200,7 @@ def apply(
         patches_: set[str] = {p for p, use in patches_dict.items() if use}
     else:
         patches_ = {p.lower() for p in patches}
-    # Sanity check on `_PATCHES`
-    for patch in get_args(PublicPatch):
-        if patch not in _PATCHES:
-            raise RuntimeError(f'Cannot load patch `{patch}`')
-    for name, patch in _PATCHES.select(patches_).items():
+    for name, patch in get_registry().select(patches_).items():
         if name == '__reboot_forkserver' and not reboot_forkserver:
             continue
         msg = f'applying `multiprocessing` patch {name!r}'

@@ -234,5 +234,5 @@ def wrap_bootstrap(
             dump_stats_quick(cache, reason=reason)
 
 
-PROCESS_PATCH = SingleModulePatch('process')
+PROCESS_PATCH = SingleModulePatch('multiprocessing.process')
 PROCESS_PATCH.add_method('BaseProcess', '_bootstrap', wrap_bootstrap)

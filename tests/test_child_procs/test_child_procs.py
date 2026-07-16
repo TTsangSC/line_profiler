@@ -26,7 +26,7 @@ from line_profiler._child_process_profiling.runpy_patches import (
     create_runpy_wrapper,
 )
 from line_profiler._child_process_profiling.multiprocessing_patches import (
-    MPConfig, _PATCHES as MP_PATCHES,
+    MPConfig, get_registry as get_mp_patches,
 )
 from line_profiler.line_profiler import LineStats
 from line_profiler.toml_config import ConfigSource
@@ -241,7 +241,7 @@ def test_cache_setup_main_process(
         (True, PATCH_SUMMARIES['minimal']),
         *(
             (name in mp_patches, filter_mp_patch_summary(patch.summary))
-            for name, patch in MP_PATCHES.items()
+            for name, patch in get_mp_patches().items()
             if not mp_patch_is_internal(name)
         ),
     ])

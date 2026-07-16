@@ -110,7 +110,7 @@ def wrap_bootstrap(
     return vanilla_impl(self, *args, **kwargs)
 
 
-PROCESS_SETUP_PATCH = SingleModulePatch('process', priority=1)
+PROCESS_SETUP_PATCH = SingleModulePatch('multiprocessing.process', priority=1)
 PROCESS_SETUP_PATCH.add_method('BaseProcess', '_bootstrap', wrap_bootstrap)
 
 # ---------------------- PID bookkeeping patches -----------------------

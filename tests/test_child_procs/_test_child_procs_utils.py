@@ -48,7 +48,7 @@ from _line_profiler_hooks import load_pth_hook
 from kernprof import main as kernprof_main
 from line_profiler._child_process_profiling.cache import LineProfilingCache
 from line_profiler._child_process_profiling.multiprocessing_patches import (
-    _PATCHED_MARKER as MP_PATCHED_MARKER, _PATCHES as _MP_PATCHES,
+    _PATCHED_MARKER as MP_PATCHED_MARKER, get_registry as _get_mp_patches,
 )
 from line_profiler.autoprofile.util_static import modpath_to_modname
 from line_profiler.cleanup import Cleanup
@@ -1723,6 +1723,7 @@ expected warnings matching
 
 # ================= `multiprocessing` patch resolution =================
 
+_MP_PATCHES = _get_mp_patches()
 _PatchSummary = Mapping[str, Set[str]]
 
 mp_patch_is_internal: Callable[[str], bool]

@@ -96,7 +96,7 @@ def get_per_task_callback_patch(
         return vanilla_impl(inqueue, outqueue, *args, **kwargs)
 
     if patch is None:
-        patch = SingleModulePatch('pool')
+        patch = SingleModulePatch('multiprocessing.pool')
     _check_patch(patch)
     patch.add_method('', 'worker', wrap_worker)
     patch.add_method('Pool', '_handle_results', wrap_handle_results, 'static')
@@ -179,7 +179,7 @@ def get_worker_finalization_patch(
         return True
 
     if patch is None:
-        patch = SingleModulePatch('pool')
+        patch = SingleModulePatch('multiprocessing.pool')
     _check_patch(patch)
     add = partial(patch.add_method, 'Pool')
     add('_terminate_pool', wrap_terminate_pool, 'class')
@@ -188,10 +188,10 @@ def get_worker_finalization_patch(
 
 
 def _check_patch(patch: SingleModulePatch) -> None:
-    if patch.submodule == 'pool':
+    if patch.module == 'multiprocessing.pool':
         return
     msg = (
-        'patch = {0!r}, .submodule = {0.submodule!r}: '
+        'patch = {0!r}, .module = {0.module!r}: '
         'expected patch target to be `multiprocessing.pool`'
     )
     raise AssertionError(msg.format(patch))

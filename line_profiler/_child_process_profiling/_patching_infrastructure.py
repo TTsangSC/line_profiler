@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import warnings
 from collections.abc import (
     Callable, Collection, Generator, Mapping, Sequence, Set,
 )
@@ -11,13 +10,10 @@ from inspect import getattr_static
 from operator import attrgetter
 from types import MappingProxyType as mappingproxy, ModuleType
 from typing import (
-    TYPE_CHECKING,
-    Any, ClassVar, Literal, Protocol, TypeVar,
-    cast, final, overload,
+    TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast, final, overload,
 )
 from typing_extensions import Self
 
-from .. import _diagnostics as diagnostics
 from .cache import LineProfilingCache
 
 
@@ -77,14 +73,14 @@ class Patch(Protocol):
 @dataclasses.dataclass
 class SingleModulePatch:
     """
-    Patch to apply to a module component in :py:mod:`multiprocessing`.
+    Patch to apply to a module component.
 
     Attributes:
-        submodule (str):
-            Name of the :py:mod:`multiprocessing` submodule.
+        module (str):
+            Name of the module.
         targets (dict[str,\
 dict[str, Callable[[Any], Any] | Sequence[Callable[[Any], Any]]]]):
-            Dictionary mapping (dot-chained) names in said submodule to
+            Dictionary mapping (dot-chained) names in said module to
             a dictionary of patches; said patches dictionary should have
             the format of
             ``dict[simple_attribute, wrapper | [wrapper1, ...]]``. See
@@ -98,23 +94,20 @@ dict[str, Callable[[Any], Any] | Sequence[Callable[[Any], Any]]]]):
         ``SingleModulePatch('foo', {'bar.baz': {'foobar': foofoo},\
 '': {'spam': [ham, eggs]}})``.
         This instance would perform the following patches on the module
-        ``multiprocessing.foo``:
+        ``foo``:
 
-        - Replace ``multiprocessing.foo.bar.baz.foobar`` with
-          ``foofoo(multiprocessing.foo.bar.baz.foobar)``
+        - Replace ``foo.bar.baz.foobar`` with
+          ``foofoo(foo.bar.baz.foobar)``
 
-        - Replace ``multiprocessing.foo.spam`` with
-          ``eggs(ham(multiprocessing.foo.spam))``;
+        - Replace ``foo.spam`` with ``eggs(ham(foo.spam))``;
           note that the two wrappers are applied in order to the
           original attribute.
     """
-    submodule: str
+    module: str
     targets: dict[
         str, dict[str, Callable[[Any], Any] | Sequence[Callable[[Any], Any]]]
     ] = dataclasses.field(default_factory=dict)
     priority: float | None = None
-
-    package: ClassVar[str] = 'multiprocessing'
 
     def add_target(
         self,
@@ -129,7 +122,7 @@ dict[str, Callable[[Any], Any] | Sequence[Callable[[Any], Any]]]]):
 
         Args:
             target (str):
-                Dotted path to the object in :py:attr:`.submodule`
+                Dotted path to the object in :py:attr:`.module`
             patches (Mapping[str, Callable[[Any], Any] \
 | Sequence[Callable[[Any], Any]]]):
                 Mapping from patched attrbute names to the wrappers to
@@ -158,7 +151,7 @@ dict[str, Callable[[Any], Any] | Sequence[Callable[[Any], Any]]]]):
 
         Args:
             target (str):
-                Dotted path to the object in :py:attr:`.submodule`
+                Dotted path to the object in :py:attr:`.module`
             method (str):
                 Name of the (class, static, or instance) method to patch
             wrapper (Callable[[Any], Any]):
@@ -258,13 +251,6 @@ Literal['class', 'static'] | None):
         return sep.join(string for string in (s, *strs) if string)
 
     @property
-    def module(self) -> str:
-        """
-        Module where the patches are applied
-        """
-        return self._join(self.package, self.submodule)
-
-    @property
     def summary(self) -> mappingproxy[str, frozenset[str]]:
         """
         Summary of the dotted paths to the patched objects and their
@@ -282,8 +268,6 @@ class Registry(Mapping[str, Patch]):
     """
     Mapping subclass for managing patches.
     """
-    _default: ClassVar[Registry]
-
     def __init__(self) -> None:
         self._patches: dict[str, tuple[float, Patch]] = {}
 
@@ -421,87 +405,3 @@ class Registry(Mapping[str, Patch]):
         for name, (priority, patch) in self._patches.items():
             result.setdefault(priority, {})[name] = patch
         return result
-
-    @classmethod
-    def get_default(cls) -> Registry:
-        """
-        Returns:
-            Instance summarizing the patches loaded from the various
-            ``.*_patches``  sibling modules
-
-        Note:
-            This method does NOT create a copy.
-
-        Example:
-            >>> reg = Registry.get_default()
-            >>> assert reg.get_default() is reg
-
-            Check for the default plugins that should be installed and
-            their contents:
-
-            >>> assert 'pool' in reg
-            >>> assert 'process' in reg
-            >>> assert 'logging' in reg
-
-            >>> assert (
-            ...     'multiprocessing.process.BaseProcess' in reg.summary
-            ... )
-            >>> assert (
-            ...     'worker'
-            ...     in reg.summary.get('multiprocessing.pool', set())
-            ... )
-        """
-        def check(patch: P) -> P:
-            error: str | None = None
-            if not hasattr(patch, 'priority'):
-                error = 'expected a `.priority: float | None` field'
-            elif not isinstance(getattr(patch, 'summary', None), Mapping):
-                error = 'expected a `.summary: Mapping[str, Set[str]]` field'
-            elif not callable(getattr(patch, 'apply', None)):
-                error = (
-                    'expected an `.apply(cache: LineProfilingCache, ...)` '
-                    'method'
-                )
-            if error:
-                raise TypeError(f'patch `{patch!r}`: {error}')
-            return patch
-
-        try:
-            return cls._default
-        except AttributeError:
-            pass
-
-        instance = Registry()
-        subpkg, *_ = cls.__module__.rpartition('.')
-        for name, (sibling, patch_loc) in {
-            '__process_setup': ('_mandatory_patches', 'PROCESS_SETUP_PATCH'),
-            '__pool_worker_pid':
-                ('_mandatory_patches', 'POOL_WORKER_PID_PATCH'),
-            '__reboot_forkserver':
-                ('_mandatory_patches', 'RebootForkserverPatch'),
-            '__resource_tracker':
-                ('_mandatory_patches', 'ResourceTrackerPatch'),
-            '__spawn_runpy': ('_mandatory_patches', 'RunpyPatch'),
-
-            'logging': ('_optional_patches', 'LOGGING_PATCH'),
-
-            'pool': ('_profiling_patches', 'POOL_PATCH'),
-            'process': ('_profiling_patches', 'PROCESS_PATCH'),
-        }.items():
-            try:
-                mod = import_module(f'{subpkg}.{sibling}')
-                patch = check(cast(Patch, getattr(mod, patch_loc)))
-            except Exception as e:
-                error = type(e).__name__
-                if str(error):
-                    error = f'{error}: {e}'
-                msg = (
-                    f'failed to load patch {name!r} '
-                    f'from sibling submodule `{subpkg}.{sibling}`: {error}'
-                )
-                diagnostics.log.warning(msg)
-                warnings.warn(msg)
-            else:
-                instance.register(name, patch)
-        cls._default = instance
-        return instance

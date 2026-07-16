@@ -53,7 +53,7 @@ def tee_log(
     )
 
 
-LOGGING_PATCH = SingleModulePatch('util').add_target(
+LOGGING_PATCH = SingleModulePatch('multiprocessing.util').add_target(
     # The logging functions exists directly in the module namespace so
     # no further attribute access is needed
     '', {func: partial(partial, tee_log, func) for func in _LOGGERS},
