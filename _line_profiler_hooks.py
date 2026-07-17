@@ -54,8 +54,23 @@ def load_pth_hook(ppid: int) -> None:
     # profiled Python process, so we can be more liberal with the
     # imports without worrying about overhead
     import warnings
-    from line_profiler._diagnostics import log
-    from line_profiler._child_process_profiling.cache import LineProfilingCache
+
+    try:
+        from line_profiler._diagnostics import log
+        from line_profiler._child_process_profiling.cache import (
+            LineProfilingCache,
+        )
+    except ImportError as e:
+        # XXX: in some edge cases (eg. subinterpreters) `line_profiler`
+        # can't be imported because the Cython module isn't compatible;
+        # just warn and bail.
+        msg = (
+            f'Cannot import `line_profiler` ({type(e).__name__}: {e}); '
+            'continuing without profiling'
+        )
+        warnings.warn(msg)
+        load_pth_hook.called = True  # type: ignore
+        return
 
     try:
         cache = LineProfilingCache.load()
