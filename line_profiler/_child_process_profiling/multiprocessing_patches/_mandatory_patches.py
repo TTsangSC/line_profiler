@@ -3,11 +3,11 @@ from __future__ import annotations
 import atexit
 import os
 import multiprocessing
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import partial
 from multiprocessing.process import BaseProcess
-from types import MappingProxyType as mappingproxy, MethodType
-from typing import Any, ClassVar, TypeVar, cast
+from types import MappingProxyType as mappingproxy
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
 from typing_extensions import Concatenate, ParamSpec
 
 try:
@@ -25,7 +25,7 @@ else:
         'forkserver' in multiprocessing.get_all_start_methods()
     )
 try:
-    from multiprocessing import resource_tracker
+    from multiprocessing import resource_tracker  # noqa
 except ImportError:
     _CAN_USE_RESOURCE_TRACKER = False
 else:
@@ -40,8 +40,8 @@ from ._pool_patch_helpers import (
 
 
 __all__ = (
-    'POOL_WORKER_PID_PATCH', 'PROCESS_SETUP_PATCH',
-    'RebootForkserverPatch', 'ResourceTrackerPatch', 'RunpyPatch',
+    'POOL_WORKER_PID_PATCH', 'PROCESS_SETUP_PATCH', 'RESOURCE_TRACKER_PATCH',
+    'RebootForkserverPatch', 'RunpyPatch',
     'wrap_bootstrap',
 )
 
@@ -57,32 +57,73 @@ def setup_mp_child(  # nocover
 ) -> None:
     """
     Perform :py:mod:`multiprocessing`-specific setup in a child process
-    curated by the module. Currently it does the following:
+    curated by the package. Currently it does the following:
 
     - Unregister the :py:mod:`atexit` hook associated with ``cache`` to
       avoid possible clashes with the profiling-file writing managed by
       this module.
     """
+    _manage_mp_child(cache, 'setup', [_unregister_atexit_hook], proc)
+
+
+def teardown_mp_child(cache: LineProfilingCache) -> None:  # nocover
+    """
+    Perform :py:mod:`multiprocessing`-specific teardown in a child
+    process curated by the package. Currently it does the following:
+
+    - Disable the :py:attr:`.LineProfilingCache.profiler` so that the
+      trace callbacks are not called during interpreter teardown (e.g.
+      when :py:mod:`atexit` hooks are called), which can result in noise
+      (because facilities used by
+      :py:mod:`line_profiler._line_profiler` are being pulled out from
+      underneath it)
+    """
+    _manage_mp_child(cache, 'teardown', [_disable_cache_profiler])
+
+
+def _manage_mp_child(
+    cache: LineProfilingCache,
+    action: str,
+    callbacks: Sequence[Callable[Concatenate[LineProfilingCache, PS], Any]],
+    /,
+    *args: PS.args,
+    **kwargs: PS.kwargs
+) -> None:
     if cache.main_pid == os.getpid():  # Not in a child process
         return
     xc: Exception | None = None
-    msg = 'Performing setup for `multiprocessing` child processes...'
+    msg = (
+        f'Performing {action.lower()} for `multiprocessing` child processes...'
+    )
     cache._debug_output(msg)
-    setup: Callable[[LineProfilingCache, BaseProcess], Any]
-    for setup in [_unregister_atexit_hook]:
+    for setup in callbacks:
         try:
-            setup(cache, proc)
+            setup(cache, *args, **kwargs)
         except Exception as e:
             xc = e
     if xc is None:
-        msg = 'Setup for `multiprocessing` child process succeeded'
-        cache._debug_output(msg)
+        state = 'succeeded'
     else:
-        xc_str = type(xc).__name__
+        state = f'failed: {type(xc).__name__}'
         if str(xc):
-            xc_str = f'{xc_str}: {xc}'
-        cache._debug_output(f'Setup failed: {xc_str}')
+            state = f'{state}: {xc}'
+    msg = (
+        f'{action.capitalize()} for `multiprocessing` child process {state}'
+    )
+    cache._debug_output(msg)
+    if xc is not None:
         raise xc
+
+
+def _disable_cache_profiler(cache: LineProfilingCache) -> None:
+    prof = cache.profiler
+    if prof is None:
+        return
+    if TYPE_CHECKING:
+        assert hasattr(prof, 'enable_count')
+        assert isinstance(prof.enable_count, int)
+    for _ in range(prof.enable_count):
+        prof.disable_by_count()
 
 
 def _unregister_atexit_hook(  # nocover
@@ -104,10 +145,14 @@ def wrap_bootstrap(
 ) -> T:
     """
     Wrap around :py:meth:`.BaseProcess._bootstrap` to perform setups
-    specific to :py:mod:`multiprocessing`-managed processes.
+    and teardowns specific to :py:mod:`multiprocessing`-managed
+    processes.
     """
-    setup_mp_child(cache, self)
-    return vanilla_impl(self, *args, **kwargs)
+    try:
+        setup_mp_child(cache, self)
+        return vanilla_impl(self, *args, **kwargs)
+    finally:
+        teardown_mp_child(cache)
 
 
 PROCESS_SETUP_PATCH = SingleModulePatch('multiprocessing.process', priority=1)
@@ -174,6 +219,54 @@ get_worker_finalization_patch(_get_worker_ntasks, POOL_WORKER_PID_PATCH)
 # --------------------------- Misc. patches ----------------------------
 
 
+@LineProfilingCache._method_wrapper
+def wrap_main(
+    cache: LineProfilingCache, vanilla_impl: Callable[PS, T], /,
+    *args: PS.args, **kwargs: PS.kwargs
+) -> T:
+    """
+    Wrap around :py:func:`multiprocessing.resource_tracker.main` to
+    tear the profiling stuff down.
+
+    Note:
+        The ``ResourceTracker`` server process is spawned when the first
+        :py:mod:`multiprocessing` child process is created via the
+        ``spawn`` or ``forkserver`` start methods. While this server
+        process does not meaningfully contribute to the profiling result
+        either way, since it can be created with profiling set up, its
+        longevity means that:
+
+        - :py:meth:`.LineProfilingCache.gather_stats` may catch empty
+          .lprof files which it has occupied but not written to,
+          resulting in a warning in the main process.
+
+        - When the main process exits and takes with it the server
+          process, said server process may emit errors because resources
+          used by its :py:class:`.LineProfilingCache` instance (e.g.
+          :py:attr:`.LineProfilingCache.cache_dir`) have already been
+          torn down by the cache instance in the main process.
+    """
+    callbacks: list[Callable[[], Any]] = []
+
+    callbacks.append(partial(atexit.unregister, cache._atexit_hook))
+    reason = 'resource-tracker server process not to be profiled'
+    callbacks.append(partial(cache.cleanup, reason=reason))
+    if cache._stats_helper is not None:
+        callbacks.append(partial(os.unlink, cache._stats_helper.outfile))
+
+    for callback in callbacks:
+        try:
+            callback()
+        except Exception:
+            pass
+    return vanilla_impl(*args, **kwargs)
+
+
+RESOURCE_TRACKER_PATCH = SingleModulePatch('multiprocessing.resource_tracker')
+if _CAN_USE_RESOURCE_TRACKER:
+    RESOURCE_TRACKER_PATCH.add_method('', 'main', wrap_main)
+
+
 class RebootForkserverPatch:
     """
     Reboot the process backing the global
@@ -199,7 +292,9 @@ class RebootForkserverPatch:
         if not _CAN_USE_FORKSERVER:
             return
         cls.reboot()
-        cache.add_cleanup(cls.reboot)
+        # Make sure this happens AFTER we've torn down all the machinery
+        # (e.g. the .pth file, the environment variables)
+        cache.add_cleanup_with_priority(cls.reboot, -1)
 
     @staticmethod
     def reboot() -> None:
@@ -210,78 +305,6 @@ class RebootForkserverPatch:
             msg = f'ForkServer._stop() (= {stop!r}) not callable'
             raise AssertionError(msg)  # Shouldn't happen
         stop()
-
-
-class ResourceTrackerPatch:
-    """
-    Patch :py:mod:`multiprocessing.resource_tracker` so that
-    :py:func:`multiprocessing.resource_tracker.ensure_running` and the
-    eponymous method of
-    :py:class:`multiprocessing.resource_tracker.ResourceTracker` report
-    the resource-tracker server PIDs to the session cache.
-
-    Note:
-        The ``ResourceTracker`` server process is spawned when the first
-        :py:mod:`multiprocessing` child process is created via the
-        ``spawn`` or ``forkserver`` start methods. While this server
-        process does not meaningfully contribute to the profiling result
-        either way, since it can be created with profiling set up, its
-        longevity means that :py:meth:`.LineProfilingCache.gather_stats`
-        often catches empty .lprof files which it has occupied but not
-        written to.
-
-        To reduce noise while keeping the empty-file warning for other
-        output files, we report the PIDs used by the server to the
-        session cache so that they can be ignored if necessary.
-    """
-    if _CAN_USE_RESOURCE_TRACKER:
-        summary: ClassVar[mappingproxy[str, frozenset[str]]] = mappingproxy({
-            'multiprocessing.resource_tracker':
-            frozenset({'ensure_running'}),
-            'multiprocessing.resource_tracker.ResourceTracker':
-            frozenset({'ensure_running'}),
-        })
-    else:
-        summary = mappingproxy({})
-    priority: ClassVar[float | None] = None
-
-    @staticmethod
-    @LineProfilingCache._method_wrapper
-    def wrap_ensure_running(
-        cache: LineProfilingCache,
-        vanilla_impl: Callable[['resource_tracker.ResourceTracker'], None],
-        self: 'resource_tracker.ResourceTracker',
-    ) -> None:
-        """
-        Wrap around :py:meth:`multiprocessing.resource_tracker\
-.ResourceTracker.ensure_running`
-        so that the session cache can keep track of the PIDs used by the
-        resource-tracer server.
-        """
-        maybe_pids: set[int | None] = {getattr(self, '_pid', None)}
-        try:
-            vanilla_impl(self)
-        finally:
-            maybe_pids.add(getattr(self, '_pid', None))
-            pids = cast(set[int], maybe_pids - {None})
-            if pids:
-                cache._warn_possible_lack_of_stats(pids)
-
-    @classmethod
-    def apply(
-        cls, cache: LineProfilingCache, *, cleanup: bool = True, **_,
-    ) -> list[str]:
-        if _CAN_USE_RESOURCE_TRACKER:
-            patch = partial(cache.patch, cleanup=cleanup)
-            # Patch the method on the class
-            method = resource_tracker.ResourceTracker.ensure_running
-            method = cls.wrap_ensure_running(method)
-            patch(resource_tracker.ResourceTracker, 'ensure_running', method)
-            # Patch the preexisting bound method on the module
-            instance = resource_tracker._resource_tracker
-            bound_method = MethodType(method, instance)
-            patch(resource_tracker, 'ensure_running', bound_method)
-        return list(cls.summary)
 
 
 class RunpyPatch:

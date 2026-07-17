@@ -15,7 +15,7 @@ from runpy import run_path
 from subprocess import CompletedProcess
 from textwrap import indent
 from types import ModuleType
-from typing import Literal, cast, overload
+from typing import Any, Literal, cast, overload
 from typing_extensions import ParamSpec
 
 import pytest
@@ -811,7 +811,7 @@ def _get_mp_start_method_fuzzer(label_name: str | None) -> Params:
   + Params.new(('nnums', 'nprocs'), [(200, None), (None, 3)],
                defaults=(None, None))).sorted()
 def test_multiproc_script_sanity_check(
-    run_func: Callable[..., CompletedProcess],
+    run_func: Callable[..., Any],
     request: pytest.FixtureRequest,
     test_module: str,
     tmp_path_factory: pytest.TempPathFactory,
@@ -860,7 +860,7 @@ def test_multiproc_script_sanity_check(
         'line_profiler-active')],
 )
 def test_running_multiproc_script(
-    run_func: Callable[..., CompletedProcess],
+    run_func: Callable[..., Any],
     request: pytest.FixtureRequest,
     pool_test_module: ModuleFixture,
     tmp_path_factory: pytest.TempPathFactory,
@@ -926,7 +926,7 @@ _fuzz_prof_mp_markers = (
 
 
 def _test_profiling_multiproc_script(
-    run_func: Callable[..., CompletedProcess],
+    run_func: Callable[..., tuple[CompletedProcess, Any]],
     request: pytest.FixtureRequest,
     test_module: ModuleFixture,
     ext_module: ModuleFixture,
@@ -972,7 +972,7 @@ def _test_profiling_multiproc_script(
     kwargs.setdefault('timeout', DEFAULT_TIMEOUT)
     if prof_child_procs and DEBUG:
         kwargs.setdefault('debug_log', 'debug.log')
-    run_func(
+    proc, _ = run_func(
         request, test_module, tmp_path_factory,
         runner=runner,
         outfile='out.lprof',
@@ -987,6 +987,11 @@ def _test_profiling_multiproc_script(
         ),
         **kwargs,
     )
+    # Check that we don't get noisy messages from botched teardowns
+    # (e.g. `atexit` hooks in child processes)
+    if not proc.stderr:
+        return
+    assert 'Exception ignored' not in proc.stderr
 
 
 @(_fuzz_prof_mp_markers[False])
@@ -997,7 +1002,7 @@ def _test_profiling_multiproc_script(
 )
 @pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_profiling_multiproc_script_success(
-    run_func: Callable[..., CompletedProcess],
+    run_func: Callable[..., tuple[CompletedProcess, Any]],
     request: pytest.FixtureRequest,
     test_module: str,
     ext_module: ModuleFixture,
@@ -1084,7 +1089,7 @@ def test_profiling_multiproc_script_success(
 @pytest.mark.parametrize(('nnums', 'nprocs'), [(2000, 3)])
 @pytest.mark.usefixtures('check_purelib_dir_writable')
 def test_profiling_multiproc_script_failure(
-    run_func: Callable[..., CompletedProcess],
+    run_func: Callable[..., tuple[CompletedProcess, Any]],
     request: pytest.FixtureRequest,
     test_module: str,
     ext_module: ModuleFixture,

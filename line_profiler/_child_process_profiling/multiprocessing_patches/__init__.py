@@ -85,10 +85,10 @@ def get_registry() -> Registry:
         '__process_setup': ('_mandatory_patches', 'PROCESS_SETUP_PATCH'),
         '__pool_worker_pid':
             ('_mandatory_patches', 'POOL_WORKER_PID_PATCH'),
+        '__resource_tracker':
+            ('_mandatory_patches', 'RESOURCE_TRACKER_PATCH'),
         '__reboot_forkserver':
             ('_mandatory_patches', 'RebootForkserverPatch'),
-        '__resource_tracker':
-            ('_mandatory_patches', 'ResourceTrackerPatch'),
         '__spawn_runpy': ('_mandatory_patches', 'RunpyPatch'),
 
         'logging': ('_optional_patches', 'LOGGING_PATCH'),
