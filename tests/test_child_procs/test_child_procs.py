@@ -117,8 +117,10 @@ def test_runpy_patches(
         called_func = 'run_path'
 
     # Check that the code is run
-    module.install(local=True, deps_only=not as_module)
-    with restore_argv():
+    with ExitStack() as stack:
+        enter = stack.enter_context
+        enter(module.install(local=True, deps_only=not as_module))
+        enter(restore_argv())
         sys.argv[:] = [first_arg, f'--length={nnums}', '-n', str(nprocs)]
         runner(first_arg, run_name='__main__')
     stdout = capsys.readouterr().out
@@ -1141,6 +1143,13 @@ _fuzz_bare = (
 
 
 def _test_profiling_bare_python(
+    *, ext_module: ModuleFixture, **kwargs
+) -> None:
+    with ext_module.install(children=True):
+        _test_profiling_bare_python_inner(ext_module=ext_module, **kwargs)
+
+
+def _test_profiling_bare_python_inner(
     tmp_path_factory: pytest.TempPathFactory,
     ext_module: ModuleFixture,
     case: _TestBarePythonCase,
@@ -1148,7 +1157,6 @@ def _test_profiling_bare_python(
     fail: bool,
     n: int,
 ) -> None:
-    ext_module.install(children=True)
     temp_dir = tmp_path_factory.mktemp('mytemp')
 
     out_file = temp_dir / 'out.lprof'

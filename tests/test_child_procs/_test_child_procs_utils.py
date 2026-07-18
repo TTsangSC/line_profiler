@@ -25,7 +25,7 @@ from collections.abc import (
 from contextlib import ExitStack
 from functools import lru_cache, partial, wraps
 from io import BytesIO
-from importlib import import_module
+from importlib import import_module, invalidate_caches
 from multiprocessing.pool import (  # type: ignore
     ExceptionWithTraceback as ExceptionHelper,
 )
@@ -325,7 +325,7 @@ class ModuleFixture:
     def install(
         self, *,
         local: bool = False, children: bool = False, deps_only: bool = False,
-    ) -> None:
+    ) -> Cleanup:
         """
         Set the module at :py:attr:`~.path` up to be importable.
 
@@ -339,31 +339,55 @@ class ModuleFixture:
             deps_only (bool):
                 If true, only does the equivalent setup for
                 dependencies.
+
+        Returns:
+            :py:class:`.Cleanup` object which :py:meth:`.uninstall`s the
+            module from :py:attr:`sys.modules` and the import system
         """
+        ctx = Cleanup()
         for dep in self.dependencies:
-            dep.install(local=local, children=children)
+            sub_ctx = dep.install(local=local, children=children)
+            ctx.add_cleanup(sub_ctx.cleanup)
+        if not deps_only:
+            path = str(self.path.parent)
+            if local:
+                self.monkeypatch.syspath_prepend(path)
+            if children:
+                self.monkeypatch.setenv('PYTHONPATH', path, prepend=os.pathsep)
+            ctx.add_cleanup(self.uninstall)
+        return ctx
+
+    def uninstall(self, *, deps_only: bool = False) -> None:
+        """
+        Reverse the installation of the module and its
+        :py:class:`.ModuleFixture` dependencies.
+
+        Args:
+            deps_only (bool):
+                If true, only does the equivalent teardown for
+                dependencies.
+        """
+        self._uninstall(deps_only)
+        invalidate_caches()
+
+    def _uninstall(self, deps_only: bool) -> None:
+        for dep in self.dependencies:
+            dep._uninstall(False)
         if deps_only:
             return
-        path = str(self.path.parent)
-        if local:
-            self.monkeypatch.syspath_prepend(path)
-        if children:
-            self.monkeypatch.setenv('PYTHONPATH', path, prepend=os.pathsep)
+        if self.name not in sys.modules:
+            return
+        try:
+            fname = getattr(sys.modules[self.name], '__file__', None)
+            if not self.path.samefile(cast(Any, fname)):
+                return
+        except Exception:  # E.g. can't find a `.__file__`
+            return
+        sys.modules.pop(self.name)
 
     def _import_module_helper(self) -> Generator[ModuleType, None, None]:
-        def iter_module_names(
-            module: ModuleFixture,
-        ) -> Generator[str, None, None]:
-            yield module.name
-            for dep in module.dependencies:
-                yield from iter_module_names(dep)
-
-        self.install(local=True, children=True)
-        try:
+        with self.install(local=True, children=True):
             yield import_module(self.name)
-        finally:
-            for name in set(iter_module_names(self)):
-                sys.modules.pop(name, None)
 
     @staticmethod
     def propose_name(prefix: str) -> Generator[str, None, None]:
@@ -1990,8 +2014,8 @@ def _run_as_script(
         run: Callable[..., subprocess.CompletedProcess] = run_subproc
     else:
         run = partial(_run_kernprof_main_in_process, request, check_warnings)
-    test_module.install(children=True, local=not subproc, deps_only=True)
-    return run(cmd, **kwargs)
+    with test_module.install(children=True, local=not subproc, deps_only=True):
+        return run(cmd, **kwargs)
 
 
 def _run_as_module(
@@ -2009,8 +2033,8 @@ def _run_as_module(
         run: Callable[..., subprocess.CompletedProcess] = run_subproc
     else:
         run = partial(_run_kernprof_main_in_process, request, check_warnings)
-    test_module.install(children=True, local=not subproc)
-    return run(cmd, **kwargs)
+    with test_module.install(children=True, local=not subproc):
+        return run(cmd, **kwargs)
 
 
 def _run_as_literal_code(
@@ -2028,8 +2052,8 @@ def _run_as_literal_code(
         run: Callable[..., subprocess.CompletedProcess] = run_subproc
     else:
         run = partial(_run_kernprof_main_in_process, request, check_warnings)
-    test_module.install(children=True, local=not subproc, deps_only=True)
-    return run(cmd, **kwargs)
+    with test_module.install(children=True, local=not subproc, deps_only=True):
+        return run(cmd, **kwargs)
 
 
 @cleanup_extra_pth_files()
@@ -2128,6 +2152,7 @@ def _run_kernprof_main_in_process(
                     category=DeprecationWarning,
                 )
         try:
+            xc: Exception | None = None
             try:
                 cleanup = stack.enter_context(Cleanup())
                 if env is not None:
@@ -2142,12 +2167,14 @@ def _run_kernprof_main_in_process(
                             f'{len(env_diff)} `os.environ` pollution(s): '
                             f'{env_diff!r}'
                         )
-            except FuncCallTimeout:  # `subprocess` uses `SIGKILL`
+            except FuncCallTimeout as e:  # `subprocess` uses `SIGKILL`
+                xc = e
                 returncode, timed_out = -9, True
                 status = f'error ({returncode})'
             except Exception as e:
                 # Format and output the tracebacks, otherwise we would've
                 # suppressed them
+                xc = e
                 traceback.print_exception(e)
                 returncode = 2 if isinstance(e, ArgumentError) else 1
                 status = f'error ({returncode})'
@@ -2163,7 +2190,7 @@ def _run_kernprof_main_in_process(
             if check and returncode:
                 raise subprocess.CalledProcessError(
                     returncode, cmd, stdout, stderr,
-                )
+                ) from xc
             return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
         finally:
             time = monotonic() - time
