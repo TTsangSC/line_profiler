@@ -228,9 +228,7 @@ from line_profiler.cli_utils import (
     positive_float,
     short_string_path,
 )
-from line_profiler.line_profiler_utils import (
-    restore as _restore,  # Compatibility
-)
+from line_profiler.line_profiler_utils import restore
 from line_profiler.profiler_mixin import ByCountProfilerMixin
 from line_profiler._logger import Logger
 from line_profiler import _diagnostics as diagnostics
@@ -813,9 +811,9 @@ def _parse_arguments(
     return options, tempfile_source_and_content
 
 
-@_restore.sequence(sys.argv)
-@_restore.sequence(sys.path)
-@_restore.instance_dict(diagnostics, ['log'])
+@restore.sequence(sys.argv)
+@restore.sequence(sys.path)
+@restore.instance_dict(diagnostics, ['log'])
 def main(args=None, *, exit_on_error=True):
     """
     Runs the command line interface
@@ -1263,7 +1261,7 @@ def _main_profile(options, module=False, exit_on_error=True):
                 runner, target = 'execfile', script_file
             assert runner in module_ns
 
-            with _restore.mapping(sys.modules, ['__main__']):
+            with restore.mapping(sys.modules, ['__main__']):
                 sys.modules['__main__'] = module_obj
                 if options.builtin:
                     call(module_ns[runner], target, module_ns)

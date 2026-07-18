@@ -588,7 +588,9 @@ def test_ppe_pickling(n: int, preimport_ppe: bool):
 
 
     def main() -> None:
-        with ProcessPoolExecutor(mp_context=get_context('spawn')) as ex:
+        with ProcessPoolExecutor(
+            max_workers=2, mp_context=get_context('spawn'),
+        ) as ex:
             print(list(ex.map(my_sum, [[1, 2], [3, 4], [5, 6]])))
 
 
