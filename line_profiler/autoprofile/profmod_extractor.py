@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import sys
-from typing import Literal, cast, overload
+from typing import Literal, cast
 from warnings import warn
 from .util_static import (
     modname_to_modpath,
@@ -246,32 +246,11 @@ class ProfmodExtractor:
             modnames_found_in_tree.setdefault(tree_index, []).append(name)
         return modnames_found_in_tree
 
-    @overload
-    def run(
-        self, *, assume_single_target_imports: Literal[True] = True,
-    ) -> dict[int, str]:
-        ...
-
-    @overload
-    def run(
-        self, *, assume_single_target_imports: Literal[False],
-    ) -> dict[int, list[str]]:
-        ...
-
-    def run(
-        self, *, assume_single_target_imports: bool = True,
-    ) -> dict[int, str] | dict[int, list[str]]:
+    def extract_all(self) -> dict[int, list[str]]:
         """Map prof_mod to imports in an abstract syntax tree.
 
         Takes the paths and dotted paths in prof_mod and finds their respective imports in an
-        abstract syntax tree, returning their alias and the index they appear in the AST.
-
-        Args:
-            assume_single_target_imports (bool):
-                If true, return ``dict[int, str]``, consistent to legacy
-                behavior where only the last import target in a
-                multi-target (from-)import statement will be profiled;
-                otherwise, return ``dict[int, list[str]]``
+        abstract syntax tree, returning their aliases and the index they appear in the AST.
 
         Returns:
             tree_imports_to_profile_dict (dict[int, str] | dict[int, list[str]]);
@@ -280,52 +259,60 @@ class ProfmodExtractor:
                         index of import in AST
                     value (str | list[str]):
                         list of aliases (or names if no alias used) to
-                        import;
-                        if ``assume_single_target_imports=True``, only
-                        the last name in an import statement is reported
-
-        Warning:
-            ``assume_single_target_imports=True`` results in a
-            :py:class:`DeprecationWarning`, and an additional
-            warning if any potential ``prof_mod`` target is dropped from
-            being profiled.
+                        import
         """
-        def issue_warning(
-            msg: str, category: type[Warning] | None = None, *args, **kwargs,
-        ) -> None:
-            if category is None:
-                log_msg = msg
-            else:
-                log_msg = f'{category.__name__}: {msg}'
-            diagnostics.log.warning(log_msg)
-            warn(msg, category, *args, **kwargs)
-
         modnames_to_profile = self._get_modnames_to_profile_from_prof_mod(
             self._script_file, self._prof_mod
         )
 
         module_dict_list = self._ast_get_imports_from_tree(self._tree)
 
-        tree_imports_to_profile_dict = self._find_modnames_in_tree_imports(
-            modnames_to_profile, module_dict_list
+        return self._find_modnames_in_tree_imports(
+            modnames_to_profile, module_dict_list,
         )
-        if not assume_single_target_imports:
-            return tree_imports_to_profile_dict
+
+    def run(self) -> dict[int, str]:
+        """
+        Deprecated, legacy method kept for backward compatibility.
+
+        Returns:
+            tree_imports_to_profile_dict (dict[int, str])
+                dict of imports to profile
+                    key (int):
+                        index of import in AST
+                    value (str):
+                        alias (or name if no alias used) of the LAST
+                        target to import in the corresponding
+                        :py:class:`ast.Import` or
+                        :py:class:`ast.ImportFrom` statement
+
+        Notes:
+            - New code should use the :py:meth:`.extract_all` method,
+              which handles multi-target import statements (see #434).
+
+            - Calling this method issues a
+              :py:class:`DeprecationWarning`.
+
+            - For multi-target import statements, this only preserves
+              the last target. If this results in import targets being
+              dropped, a :py:class:`UserWarning` is issued.
+        """
         msg = (
-            'Invoking `ProfmodExtractor.run()` directly is now deprecated, '
-            'because it returns a `dict[int, str]` and cannot handle '
-            'multi-target import statements; '
-            'pass `assume_single_target_imports=False` to return a '
-            '`dict[int, list[str]]` and avoid this warning'
+            '`ProfmodExtractor.run()` is now deprecated, because it cannot '
+            'correctly resolve multi-target import statements; '
+            'use `ProfmodExtractor.extract_all()` instead.'
         )
-        issue_warning(msg, DeprecationWarning, stacklevel=2)
-        conflated_result: dict[int, str] = {}
+        _issue_warning(msg, DeprecationWarning, stacklevel=2)
+        result: dict[int, str] = {}
         dropped_names: set[str] = set()
-        for i, names in tree_imports_to_profile_dict.items():
+        for i, names in self.extract_all().items():
             *remainder, last = names
             dropped_names.update(remainder)
-            conflated_result[i] = last
-        dropped_names -= set(conflated_result.values())
+            # In case a later import shadows a dropped name from an
+            # earlier import
+            dropped_names.discard(last)
+            result[i] = last
+        dropped_names -= set(result.values())
         if dropped_names:
             msg = (
                 '{}: {} would-be profiling target(s) dropped because the '
@@ -333,5 +320,20 @@ class ProfmodExtractor:
             ).format(
                 self._script_file, len(dropped_names), sorted(dropped_names),
             )
-            issue_warning(msg, stacklevel=2)
-        return conflated_result
+            _issue_warning(msg, stacklevel=2)
+        return result
+
+
+def _issue_warning(
+    msg: str,
+    category: type[Warning] | None = None,
+    stacklevel: int = 1,
+    *args,
+    **kwargs,
+) -> None:
+    if category is None:
+        log_msg = msg
+    else:
+        log_msg = f'{category.__name__}: {msg}'
+    diagnostics.log.warning(log_msg)
+    warn(msg, category, stacklevel + 1, *args, **kwargs)

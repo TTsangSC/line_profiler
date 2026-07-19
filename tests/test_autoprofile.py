@@ -8,9 +8,7 @@ import subprocess
 import sys
 import shlex
 import tempfile
-from collections.abc import Callable, Sequence
-from functools import partial
-from typing import Literal, cast
+from typing import Any, ClassVar, Literal
 from warnings import catch_warnings, WarningMessage
 
 import pytest
@@ -1262,130 +1260,172 @@ def test_multitarget_import_resolution(
 
 
 @pytest.mark.parametrize(
-    ('prof_mod', 'expected',
-     'assume_single_target_imports', 'expect_dropped_target_warning'),
-    [(['foo', 'foobar.ham'], {0: ['foo'], 2: ['ham']}, False, None),
+    ('prof_mod', 'expected', 'method', 'expect_dropped_target_warning'),
+    [(['foo', 'foobar.ham'], {0: ['foo'], 2: ['ham']}, 'extract_all', None),
+     (['baz', 'foobar'], {1: ['baz'], 2: ['spam', 'ham', 'jam']},
+      'extract_all', None),
+     (['foobar', 'qux'], {2: ['spam', 'ham', 'jam'], 3: ['ham']},
+      'extract_all', None),
      # This doesn't result in a `UserWarning` for dropped targets,
      # because there is only one selected target on the multi-target
      # import line
-     (['foo', 'foobar.ham'], {0: 'foo', 2: 'ham'}, True, None),
-     # Also test not passing `assume_single_target_imports` (defaults to
-     # true)
-     (['foo', 'foobar.ham'], {0: 'foo', 2: 'ham'}, True, None),
-     (['baz', 'foobar'], {1: ['baz'], 2: ['spam', 'ham', 'jam']}, False, None),
+     (['foo', 'foobar.ham'], {0: 'foo', 2: 'ham'}, 'run', None),
      # This however results in the warning that `spam` and `ham` are
      # supposed to be profiled, but are dropped
-     (['baz', 'foobar'], {1: 'baz', 2: 'jam'}, True,
-      r"2 .* target.* dropped .* \['ham', 'spam'\]")])
+     (['baz', 'foobar'], {1: 'baz', 2: 'jam'}, 'run',
+      r"2 .* target.* dropped .* \['ham', 'spam'\]"),
+     # And here we only warn against `spam`, because `foobar.ham` is
+     # shadowed by `qux.ham`
+     (['foobar', 'qux'], {2: 'jam', 3: 'ham'}, 'run',
+      r"1 .* target.* dropped .* \['spam'\]")])
 def test_profmod_extractor_multitarget_behavior(
     prof_mod: list[str],
-    expected: dict[str, int] | dict[str, list[int]],
-    assume_single_target_imports: bool | None,
+    expected: dict[int, str] | dict[int, list[str]],
+    method: Literal['extract_all', 'run'],
     expect_dropped_target_warning: str | None,
 ) -> None:
     """
-    Test that :py:meth:`.ProfmodExtractor.run` behaves as expected:
+    Test that :py:meth:`.ProfmodExtractor.extract_all` and
+    :py:meth:`.ProfmodExtractor.run` behaves as expected:
 
-    ``assume_single_target_imports=True``
+    ``.run()`` (legacy method):
 
-        - Return ``dict[int, str]``, in accordance with legacy behavior
+        - Returns ``dict[int, str]``, where ``str`` is the last target
+          in a (multi-target) import(-from) statement
 
-        - Warn against bare calls not specifying otherwise
+        - Issues a :py:class:`DeprecationWarning` urging users to use
+          :py:meth:`.ProfmodExtractor.extract_all` instead
 
-        - Warn against dropped profiling targets (if any)
+        - Issues a :py:class:`UserWarning` against dropped profiling
+          targets (if any)
 
-    ``assume_single_target_imports=True``
+    ``.extract_all()`` (new method):
 
-        - Return ``dict[int, list[str]]``
+        - Returns ``dict[int, list[str]]``
 
         - Does not result in the above warnings
+
+    See also:
+        Issue #433
     """
-    def forbid_warnings(
-        msgs: Sequence[WarningMessage],
-        pattern: str,
-        category: type[Warning] = Warning,
-    ) -> None:
-        regex = re.compile(pattern)
-        for msg in msgs:
-            if not issubclass(msg.category, category):
-                continue
-            if not regex.search(str(msg.message)):
-                continue
-            raise ValueError(
-                f'{pattern=!r}, {category=!r}: matched warning: {msg}',
-            )
-
-    def expect_warnings(
-        msgs: Sequence[WarningMessage],
-        pattern: str,
-        category: type[Warning] = Warning,
-    ) -> None:
-        regex = re.compile(pattern)
-        if any(
-            issubclass(msg.category, category)
-            and regex.search(str(msg.message))
-            for msg in msgs
-        ):
-            return
-        raise ValueError(
-            f'{pattern=!r}, {category=!r}: '
-            f'no matches among {len(msgs)} warnings: '
-            f'{[str(m) for m in msgs]!r}',
-        )
-
     code = ub.codeblock(
         """
         import foo, bar
         import baz
         from foobar import spam, ham, eggs as jam
+        from qux import ham  # This shadows `foobar.ham` above
 
 
         def func() -> None:
             pass
         """,
     )
-    depr_warning_pattern = 'assume_single_target_imports'
+    depr_warning_pattern = 'run.* deprecated.* use .*extract_all'
     targets_warning_pattern = 'profiling target.* dropped.* multi-target'
-    checks: list[Callable[[Sequence[WarningMessage]], None]] = []
+    warnings: list[WarningMessage]
+    checks: list[tuple[bool, str, type[Warning]]] = []
+    # Check that the deprecation warning is only issued when using
+    # `.run()`
+    checks.append((method == 'run', depr_warning_pattern, DeprecationWarning))
+    # Check that the user warnin is only issued when a target has been
+    # dropped (and not shadowed by a later import)
+    if expect_dropped_target_warning:
+        checks.append((True, expect_dropped_target_warning, UserWarning))
+    else:
+        checks.append((False, targets_warning_pattern, UserWarning))
+
     with contextlib.ExitStack() as stack:
         tmpdir = stack.enter_context(tempfile.TemporaryDirectory())
         fname = ub.Path(tmpdir) / 'script.py'
         fname.write_text(code)
 
         warnings = stack.enter_context(catch_warnings(record=True))
-        if assume_single_target_imports in (True, None):
-            checks.append(partial(
-                expect_warnings,
-                pattern=depr_warning_pattern, category=DeprecationWarning,
-            ))
-        else:
-            checks.append(partial(
-                forbid_warnings,
-                pattern=depr_warning_pattern, category=DeprecationWarning,
-            ))
-        if expect_dropped_target_warning:
-            checks.append(partial(
-                expect_warnings,
-                pattern=expect_dropped_target_warning,
-                category=UserWarning,
-            ))
-        else:
-            checks.append(partial(
-                forbid_warnings,
-                pattern=targets_warning_pattern, category=UserWarning,
-            ))
-
         extractor = ProfmodExtractor(ast.parse(code), str(fname), prof_mod)
-        if assume_single_target_imports is None:  # Default
-            result: dict[int, str] | dict[int, list[str]] = extractor.run()
+        if method == 'run':
+            assert extractor.run() == expected
         else:
-            result = extractor.run(  # `mypy` needs a bit of help here
-                assume_single_target_imports=cast(
-                    Literal[True, False],
-                    assume_single_target_imports,
-                ),
+            assert extractor.extract_all() == expected
+
+    for warning_expected, pattern, WarningType in checks:
+        regex = re.compile(pattern)
+        matches = [
+            msg for msg in warnings
+            if issubclass(msg.category, WarningType)
+            if regex.search(str(msg.message))
+        ]
+        if bool(matches) == warning_expected:
+            continue
+        if warning_expected:
+            # Note: Until Python 3.14 `WarningMessage.__repr__()` is
+            # terse; use `.__str__()` to show more context
+            raise AssertionError(
+                f'expected {WarningType.__name__} matching {pattern!r}, '
+                f'didn\'t get a match out of {len(warnings)} '
+                f'warnings captured: {[str(m) for m in warnings]!r}'
+            )
+        else:
+            raise AssertionError(
+                f'expected no {WarningType.__name__} matching {pattern!r}, '
+                f'got {len(matches)} match(es): {[str(m) for m in matches]!r}'
             )
 
-    assert result == expected
-    for check in checks:
-        check(warnings)
+
+def test_multitarget_import_transformation_executes() -> None:
+    """
+    Test the runtime behavior of the transformed AST, including:
+    - multiple targets in one import statement;
+    - aliases;
+    - selection of profiling targets;
+    - preservation of profiling-call order;
+    - passing the actual imported objects to the profiler.
+
+    See also:
+        Issue #433
+    """
+    from xml.etree.ElementTree import Element, dump, XMLParser
+
+    class RecordingProfiler:
+        """
+        Mock :py:class:`line_profiler.LineProfiler` object.
+        """
+        @classmethod
+        def add_imported_function_or_module(cls, obj) -> None:
+            cls.profiled_objects.append(obj)
+
+        profiled_objects: ClassVar[list[Any]] = []
+
+    input_module = ub.codeblock("""
+        import os, sys as system
+        from xml.etree.ElementTree import (  # `xml_dump` not profiled
+            Element, dump as xml_dump, XMLParser as Parser,
+        )
+    """)
+    with tempfile.TemporaryDirectory() as tmp:
+        fpath = ub.Path(tmp) / 'script.py'
+        fpath.write_text(input_module)
+        module_ast = AstTreeProfiler(
+            str(fpath),
+            [
+                'os',
+                'sys',
+                'xml.etree.ElementTree.Element',
+                'xml.etree.ElementTree.XMLParser',
+            ],
+            False,
+        ).profile()
+        namespace = {'profile': RecordingProfiler()}
+        code = compile(module_ast, str(fpath), 'exec')
+        exec(code, namespace)
+
+    assert RecordingProfiler.profiled_objects == [
+        os,
+        sys,
+        Element,
+        XMLParser,
+    ]
+    # Also verify that the aliases created by the original imports resolve
+    # to the same objects that were passed to the profiler.
+    assert namespace['system'] is sys
+    assert namespace['Element'] is Element
+    assert namespace['xml_dump'] is dump
+    assert namespace['Parser'] is XMLParser

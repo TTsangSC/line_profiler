@@ -186,7 +186,7 @@ class AstTreeProfiler:
 
         tree_imports_to_profile_dict = self._profmod_extractor_class_handler(
             tree, self._script_file, self._prof_mod
-        ).run(assume_single_target_imports=False)
+        ).extract_all()
         tree_profiled = self._profile_ast_tree(
             tree,
             tree_imports_to_profile_dict,
