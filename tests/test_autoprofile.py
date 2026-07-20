@@ -1260,12 +1260,18 @@ def test_multitarget_import_resolution(
 
 
 @pytest.mark.parametrize(
-    ('prof_mod', 'expected', 'method', 'expect_dropped_target_warning'),
+    ('prof_mod', 'expected', 'method', 'expect_warning'),
     [(['foo', 'foobar.ham'], {0: ['foo'], 2: ['ham']}, 'extract_all', None),
      (['baz', 'foobar'], {1: ['baz'], 2: ['spam', 'ham', 'jam']},
       'extract_all', None),
-     (['foobar', 'qux'], {2: ['spam', 'ham', 'jam'], 3: ['ham']},
+     (['foobar', 'qux', 'fred'],
+      {2: ['spam', 'ham', 'jam'], 3: ['ham'], 5: ['alexa', 'bob']},
       'extract_all', None),
+     # `from quux import *` cannot be profiled as of now, and results in
+     # a warning
+     (['qux', 'quux'], {3: ['ham']}, 'extract_all',
+      r'1 .* target.* dropped .* import \*.*'
+      r'- line 5: quux.*'),
      # This doesn't result in a `UserWarning` for dropped targets,
      # because there is only one selected target on the multi-target
      # import line
@@ -1273,16 +1279,26 @@ def test_multitarget_import_resolution(
      # This however results in the warning that `spam` and `ham` are
      # supposed to be profiled, but are dropped
      (['baz', 'foobar'], {1: 'baz', 2: 'jam'}, 'run',
-      r"2 .* target.* dropped .* \['ham', 'spam'\]"),
-     # And here we only warn against `spam`, because `foobar.ham` is
-     # shadowed by `qux.ham`
-     (['foobar', 'qux'], {2: 'jam', 3: 'ham'}, 'run',
-      r"1 .* target.* dropped .* \['spam'\]")])
+      '2 .* target.* dropped .* multi-target.*'
+      r'- line 3: ham \(= foobar.ham\), spam \(= foobar.spam\)'),
+     # - Despite how `foobar.ham` is shadowed by `qux.ham`, the former
+     #   is still dropped profiling; and so we include that in the
+     #   warning message, and also indicate the name's source
+     # - Note that the warning message is multiline because there are
+     #   dropped imports on multiple lines
+     (['foobar', 'qux', 'fred'], {2: 'jam', 3: 'ham', 5: 'bob'}, 'run',
+      '3 .* target.* dropped .* multi-target.*'
+      r'\n- line 3: ham \(= foobar.ham\), spam \(= foobar.spam\)'
+      r'\n- line 6: alexa \(= fred.alice\)'),
+     # Same warning for `quux.*` as above for `.extract_all()`
+     (['qux', 'quux'], {3: 'ham'}, 'run',
+      r'1 .* target.* dropped .* import \*.*'
+      r'- line 5: quux.*')])
 def test_profmod_extractor_multitarget_behavior(
     prof_mod: list[str],
     expected: dict[int, str] | dict[int, list[str]],
     method: Literal['extract_all', 'run'],
-    expect_dropped_target_warning: str | None,
+    expect_warning: str | None,
 ) -> None:
     """
     Test that :py:meth:`.ProfmodExtractor.extract_all` and
@@ -1297,13 +1313,18 @@ def test_profmod_extractor_multitarget_behavior(
           :py:meth:`.ProfmodExtractor.extract_all` instead
 
         - Issues a :py:class:`UserWarning` against dropped profiling
-          targets (if any)
+          targets because of multi-target import statements (if any)
+
+        - Issues a :py:class:`UserWarning` against dropped profiling
+          targets because of the currently unsupported
+          ``from ... import *`` statements (if any)
 
     ``.extract_all()`` (new method):
 
         - Returns ``dict[int, list[str]]``
 
-        - Does not result in the above warnings
+        - Does not result in the above warnings, except for the
+          ``from ... import *`` case
 
     See also:
         Issue #433
@@ -1314,14 +1335,16 @@ def test_profmod_extractor_multitarget_behavior(
         import baz
         from foobar import spam, ham, eggs as jam
         from qux import ham  # This shadows `foobar.ham` above
+        from quux import *  # Star-imports ignored for now
+        from fred import alice as alexa, bob
 
 
         def func() -> None:
             pass
         """,
-    )
+    ).strip('\n')
     depr_warning_pattern = 'run.* deprecated.* use .*extract_all'
-    targets_warning_pattern = 'profiling target.* dropped.* multi-target'
+    targets_warning_pattern = 'profiling target.* dropped.*'
     warnings: list[WarningMessage]
     checks: list[tuple[bool, str, type[Warning]]] = []
     # Check that the deprecation warning is only issued when using
@@ -1329,8 +1352,8 @@ def test_profmod_extractor_multitarget_behavior(
     checks.append((method == 'run', depr_warning_pattern, DeprecationWarning))
     # Check that the user warnin is only issued when a target has been
     # dropped (and not shadowed by a later import)
-    if expect_dropped_target_warning:
-        checks.append((True, expect_dropped_target_warning, UserWarning))
+    if expect_warning:
+        checks.append((True, expect_warning, UserWarning))
     else:
         checks.append((False, targets_warning_pattern, UserWarning))
 
