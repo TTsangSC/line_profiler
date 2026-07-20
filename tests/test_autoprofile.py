@@ -1321,7 +1321,10 @@ def test_profmod_extractor_multitarget_behavior(
 
     ``.extract_all()`` (new method):
 
-        - Returns ``dict[int, list[str]]``
+        - Returns \
+``dict[tuple[Literal['body'], int], list[ImportTarget]]``,
+          where ``ImportTarget.resolved_name`` is the name of the import
+          target in the namespace
 
         - Does not result in the above warnings, except for the
           ``from ... import *`` case
@@ -1367,7 +1370,16 @@ def test_profmod_extractor_multitarget_behavior(
         if method == 'run':
             assert extractor.run() == expected
         else:
-            assert extractor.extract_all() == expected
+            result: dict[int, list[str | None]] = {}
+            for loc, imports in extractor.extract_all().items():
+                # XXX: these assertions are true for the time being, but
+                # will become false when we extend to non-top-level
+                # import statements
+                assert len(loc) == 2
+                assert loc[0] == 'body'
+                assert isinstance(loc[1], int)
+                result[loc[1]] = [imp.resolved_name for imp in imports]
+            assert result == expected
 
     for warning_expected, pattern, WarningType in checks:
         regex = re.compile(pattern)

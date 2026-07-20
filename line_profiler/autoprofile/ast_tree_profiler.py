@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import os
+from collections.abc import MutableSequence, Sequence
+from typing import Any
 
 from .ast_profile_transformer import (
     AstProfileTransformer,
     ast_create_profile_node,
 )
-from .profmod_extractor import ProfmodExtractor
+from .profmod_extractor import ImportTarget, ProfmodExtractor
 
 __docstubs__ = """
 from .ast_profile_transformer import AstProfileTransformer
@@ -109,35 +111,46 @@ class AstTreeProfiler:
     def _profile_ast_tree(
         self,
         tree: ast.Module,
-        tree_imports_to_profile_dict: dict[int, list[str]],
+        tree_imports_to_profile_dict: dict[
+            tuple[str | int, ...], list[ImportTarget]
+        ],
         profile_full_script: bool = False,
         profile_imports: bool = False,
     ) -> ast.Module:
-        """Add profiling to an abstract syntax tree.
+        """
+        Add profiling to an abstract syntax tree by adding nodes to the
+        AST that adds the specified objects to the profiler.
 
-        Adds nodes to the AST that adds the specified objects to the profiler.
-        If profile_full_script is True, all functions/methods, classes & modules in the script
-        have a node added to the AST to add them to the profiler.
-        If profile_imports is True as well as profile_full_script, all imports are have a node
-        added to the AST to add them to the profiler.
+        - If ``profile_full_script`` is True, all functions/methods,
+          classes & modules in the script have a node added to the AST
+          to add them to the profiler.
+
+        - If ``profile_imports ``is True as well as
+          ``profile_full_script``, all imports are have a node added to
+          the AST to add them to the profiler.
 
         Args:
             tree (_ast.Module):
                 abstract syntax tree to be profiled.
 
-            tree_imports_to_profile_dict (dict[int, list[str]]):
+            tree_imports_to_profile_dict (dict[tuple[str | int, ...], \
+list[str]]):
                 dict of imports to profile
-                    key (int):
-                        index of import in AST
-                    value (list[str]):
-                        list of aliases (or names if no alias used) to
-                        import
+                    key (tuple[str | int, ...]):
+                        Location of import in AST, e.g. ``('body', 0)``
+                        for the case where it is the first statement in
+                        the :py:attr:`ast.Module.body`
+                    value (list[ImportTarget]):
+                        list of import targets (see the documentation of
+                        :py:class:`line_profiler.autoprofile\
+.profmod_extractor.ImportTarget`)
 
             profile_full_script (bool):
-                if True, profile whole script.
+                if True, profile the entire script.
 
             profile_imports (bool):
-                if True, and profile_full_script is True, profile all imports aswell.
+                if True, and ``profile_full_script`` is True, profile
+                all imports as well.
 
         Returns:
             (_ast.Module): tree
@@ -147,13 +160,20 @@ class AstTreeProfiler:
         argsort_tree_indexes = sorted(
             list(tree_imports_to_profile_dict), reverse=True
         )
-        for tree_index in argsort_tree_indexes:
-            names = tree_imports_to_profile_dict[tree_index]
-            for name in reversed(names):
+        for tree_loc in argsort_tree_indexes:
+            imports = tree_imports_to_profile_dict[tree_loc]
+            *loc, tree_index = tree_loc
+            assert isinstance(tree_index, int)
+            body = self._descend(tree, loc)
+            assert isinstance(body, MutableSequence)
+            for imp in reversed(imports):
                 # Reversing keeps the order of the inserted nodes
                 # consistent with the imports
+                name = imp.resolved_name
+                if name is None:  # Star-imports; TODO: handle this
+                    continue
                 expr = ast_create_profile_node(name)
-                tree.body.insert(tree_index + 1, expr)
+                body.insert(tree_index + 1, expr)
                 profiled_imports.append(name)
         if profile_full_script:
             tree = self._ast_transformer_class_handler(
@@ -194,3 +214,28 @@ class AstTreeProfiler:
             profile_imports=self._profile_imports,
         )
         return tree_profiled
+
+    @staticmethod
+    def _descend(obj: Any, loc: Sequence[str | int]) -> Any:
+        """
+        Follow ``loc``, a sequence of indices (item access) and names
+        (attribute access), to descend into an object.
+
+        Examples:
+            >>> from types import SimpleNamespace as ns
+
+            >>> my_ns = ns(
+            ...     foo={1: 2, 3: ['foo', 'bar']},
+            ...     bar=[ns(spam=1), ns(ham=[1, 2], eggs=None)]
+            ... )
+            >>> AstTreeProfiler._descend(my_ns, ['foo', 3, 1, 2])
+            'r'
+            >>> AstTreeProfiler._descend(my_ns, ['bar', 1, 'ham', 0])
+            1
+        """
+        for index_or_attr in loc:
+            if isinstance(index_or_attr, int):
+                obj = obj[index_or_attr]
+            else:  # Attribute name
+                obj = getattr(obj, index_or_attr)
+        return obj
