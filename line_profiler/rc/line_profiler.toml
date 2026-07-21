@@ -223,6 +223,10 @@ percent = 8
 #     we won't descend therein to look for imports.
 #   - If all these options are set to false, only raw (from-)import
 #     statements on the top level of the profiled code will be checked.
+# - For performance reasons (each generated call to
+#   `add_imported_function_or_module()` can result in arbitrarily deep
+#   descent into the obejc tto be profiled), import discovery in loops
+#   and function/method definitions are disable dby default.
 
 [tool.line_profiler.prof_mod_import_discovery]
 
@@ -237,7 +241,10 @@ try_except = true
 contexts = true
 # - `loops` (bool):
 #   Whether to look into `[async] for-else` and `while-else` statements.
-loops = true
-# - `definitions` (bool):
-#   Whether to look into `[async] def` and `class` statements.
-definitions = false
+loops = false
+# - `func_defs` (bool):
+#   Whether to look into `[async] def` statements.
+func_defs = false
+# - `class_defs` (bool):
+#   Whether to look into `class` statements.
+class_defs = true

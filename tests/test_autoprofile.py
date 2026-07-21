@@ -10,7 +10,7 @@ import sys
 import textwrap
 import tempfile
 from collections.abc import Collection, Sequence
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal, get_args
 from warnings import catch_warnings, WarningMessage
 
 import pytest
@@ -1424,6 +1424,17 @@ def _check_warnings(
             )
 
 
+class _RecordingProfiler:
+    """
+    Mock :py:class:`line_profiler.LineProfiler` object.
+    """
+    def __init__(self) -> None:
+        self.profiled_objects: list[Any] = []
+
+    def add_imported_function_or_module(self, obj) -> None:
+        self.profiled_objects.append(obj)
+
+
 def test_multitarget_import_transformation_executes() -> None:
     """
     Test the runtime behavior of the transformed AST, including:
@@ -1438,22 +1449,13 @@ def test_multitarget_import_transformation_executes() -> None:
     """
     from xml.etree.ElementTree import Element, dump, XMLParser
 
-    class RecordingProfiler:
-        """
-        Mock :py:class:`line_profiler.LineProfiler` object.
-        """
-        @classmethod
-        def add_imported_function_or_module(cls, obj) -> None:
-            cls.profiled_objects.append(obj)
-
-        profiled_objects: ClassVar[list[Any]] = []
-
     input_module = ub.codeblock("""
         import os, sys as system
         from xml.etree.ElementTree import (  # `xml_dump` not profiled
             Element, dump as xml_dump, XMLParser as Parser,
         )
     """)
+    mock_prof = _RecordingProfiler()
     with tempfile.TemporaryDirectory() as tmp:
         fpath = ub.Path(tmp) / 'script.py'
         fpath.write_text(input_module)
@@ -1467,11 +1469,11 @@ def test_multitarget_import_transformation_executes() -> None:
             ],
             False,
         ).profile()
-        namespace = {'profile': RecordingProfiler()}
+        namespace = {'profile': mock_prof}
         code = compile(module_ast, str(fpath), 'exec')
         exec(code, namespace)
 
-    assert RecordingProfiler.profiled_objects == [
+    assert mock_prof.profiled_objects == [
         os,
         sys,
         Element,
@@ -1486,7 +1488,8 @@ def test_multitarget_import_transformation_executes() -> None:
 
 
 _ImportDiscoveryOption = Literal[
-    'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
+    'conditionals', 'try_except', 'contexts', 'loops',
+    'func_defs', 'class_defs',
 ]
 _CompoundStatement = Literal[
     'function-def',
@@ -1505,12 +1508,13 @@ _CompoundStatement = Literal[
 
 
 def _get_toml_import_discovery_section(
-    options: set[_ImportDiscoveryOption],
+    options: set[_ImportDiscoveryOption] | None = None,
 ) -> str:
+    all_options = set(get_args(_ImportDiscoveryOption))
+    if options is None:
+        options = all_options
     config_file_lines = ['[tool.line_profiler.prof_mod_import_discovery]']
-    for option in [
-        'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
-    ]:
+    for option in all_options:
         line = f'{option} = {str(option in options).lower()}'
         config_file_lines.append(line)
     return '\n'.join(config_file_lines)
@@ -1601,7 +1605,9 @@ def test_handle_star_imports(
      (['ersatz_foobar.my_baz'], {'baz'}, {'try_except', 'contexts'}),
      (['os.fork', 'foobar.bar'], {'fork'}, {'try_except', 'contexts'}),
      (['backup_fred', 'operator'], {'methodcaller', 'setitem'},
-      {'definitions'}),
+      {'func_defs'}),
+     (['backup_fred', 'operator'], {'__getattr__'},
+      {'class_defs'}),
      (['backup_fred', 'operator'], {'fred'}, {'loops'})])
 def test_nested_import_discovery(
     prof_mod: list[str],
@@ -1617,11 +1623,12 @@ def test_nested_import_discovery(
     statements.
     """
     test_module = ub.codeblock("""
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterable, Mapping
     from contextlib import contextmanager
     from functools import partial
     from importlib import import_module
     from sys import path, version_info
+    from typing import Any
 
     notify_fork = partial(print, 'Forking...')
     try:
@@ -1651,6 +1658,18 @@ def test_nested_import_discovery(
             yield
         finally:
             setitem(path, slice(None), old)
+
+    class MyMapping(Mapping[str, Any]):
+        from operator import getitem as __getattr__
+
+        def __getitem__(self, key: str) -> Any:
+            ...
+
+        def __iter__(self) -> Iterable[str]:
+            ...
+
+        def __len__(self) -> int:
+            ...
 
 
     with _restore_sys_path():
@@ -1696,15 +1715,15 @@ def test_nested_import_discovery(
 @pytest.mark.parametrize(
     ('compound_statement', 'options', 'should_be_profiled'),
     [('function-def', set(), False),
-     ('function-def', {'definitions'}, True),
+     ('function-def', {'func_defs'}, True),
      ('async-function-def', set(), False),
-     ('async-function-def', {'definitions'}, True),
+     ('async-function-def', {'func_defs'}, True),
      ('class-def', set(), False),
-     ('class-def', {'definitions'}, True),
+     ('class-def', {'class_defs'}, True),
      ('for-else', set(), False),
      ('for-else', {'loops'}, True),
-     ('async-for-else', {'definitions'}, False),
-     ('async-for-else', {'definitions', 'loops'}, True),
+     ('async-for-else', {'func_defs'}, False),
+     ('async-for-else', {'func_defs', 'loops'}, True),
      ('while-else', set(), False),
      ('while-else', {'loops'}, True),
      ('if-elif-else', set(), False),
@@ -1713,8 +1732,8 @@ def test_nested_import_discovery(
      ('match-case', {'conditionals'}, True),
      ('with', set(), False),
      ('with', {'contexts'}, True),
-     ('async-with', {'definitions'}, False),
-     ('async-with', {'definitions', 'contexts'}, True),
+     ('async-with', {'func_defs'}, False),
+     ('async-with', {'func_defs', 'contexts'}, True),
      ('try-except-else-finally', set(), False),
      ('try-except-else-finally', {'try_except'}, True),
      ('try-except*-else-finally', set(), False),
@@ -1877,3 +1896,76 @@ def test_import_discovery_in_all_compound_statements(
 
     expected = all_names if should_be_profiled else set()
     assert set(_grep_profiled_names(output)) == expected
+
+
+@pytest.mark.parametrize('call', ['first', 'second', 'third'])
+def test_nested_imports_correct_deduplication_across_scopes(
+    call: Literal['first', 'second', 'third'],
+) -> None:
+    """
+    Test that there is no aliasing in the check we have against
+    inserting duplicate ``profile.add_imported_function_or_module(...)``
+    statements: duplicates should only be counted within the same scope.
+
+    Note:
+        - At runtime, duplicates don't really matter in terms of
+          CORRECTNESS, because ultimately
+          :py:class:`line_profiler.LineProfiler.add_callable` is
+          idempotent.
+
+        - However, since calls to
+          :py:func:`line_profiler.autoprofile.line_profiler_utils\
+.add_imported_function_or_module`
+          can result in arbitrary deep descent into the profiled object,
+          these interpolated calls can have an impact on the
+          PERFORMANCE, especially when inserted into function/method
+          bodies. For this reason, import discovery in function bodies
+          is off by default.
+    """
+    from textwrap import indent
+
+    test_module = ub.codeblock("""
+    def first() -> str:
+        from textwrap import indent
+
+        return indent('first', '  ')
+
+
+    def second() -> str:
+        from textwrap import indent as ind
+
+        return ind('second', '  ')
+
+
+    def third() -> str:
+        from textwrap import indent, dedent
+        from textwrap import indent as _indent  # Duplicate
+
+        return _indent('third', '  ')
+    """).strip('\n')
+
+    mock_prof = _RecordingProfiler()
+    with tempfile.TemporaryDirectory() as tmp:
+        mod_fname = os.path.join(tmp, 'test_module.py')
+        with open(mod_fname, 'w') as fobj:
+            print(test_module, file=fobj)
+
+        cfg_fname = os.path.join(tmp, 'config.toml')
+        with open(cfg_fname, 'w') as fobj:
+            print(_get_toml_import_discovery_section(), file=fobj)
+
+        mod_ast = AstTreeProfiler(
+            mod_fname, ['textwrap.indent'], False,
+            config=ConfigSource.from_config(cfg_fname),
+        ).profile()
+        print(ast.unparse(mod_ast))
+
+        namespace: dict[str, Any] = {'profile': mock_prof}
+        code = compile(mod_ast, mod_fname, 'exec')
+        exec(code, namespace)
+
+    # Make the call; regardless of which of the functions is called,
+    # `textwrap.indent()` should be presented to the profiler exactly
+    # once
+    assert namespace[call]() == '  ' + call
+    assert mock_prof.profiled_objects == [indent]

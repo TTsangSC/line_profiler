@@ -21,8 +21,10 @@ from ._import_targets import ImportTarget
 _CompoundNodeType = Literal[
     # Basic top-level nodes
     'Module', 'Interactive',
-    # Definition nodes
-    'FunctionDef', 'AsyncFunctionDef', 'ClassDef',
+    # Function-definition nodes
+    'FunctionDef', 'AsyncFunctionDef',
+    # Class-definition nodes
+    'ClassDef',
     # Loop nodes
     'For', 'AsyncFor', 'While',
     # Conditional nodes
@@ -61,49 +63,63 @@ class _ImportFinder(ast.NodeVisitor):
         cls,
         node: ast.AST,
         *,
-        collect_from_conditionals: bool = True,
-        collect_from_try_except: bool = True,
-        collect_from_contexts: bool = True,
-        collect_from_loops: bool = True,
-        collect_from_definitions: bool = False,
+        collect_from_conditionals: bool | None = None,
+        collect_from_try_except: bool | None = None,
+        collect_from_contexts: bool | None = None,
+        collect_from_loops: bool | None = None,
+        collect_from_func_defs: bool | None = None,
+        collect_from_class_defs: bool | None = None,
     ) -> dict[tuple[str | int, ...], list[ImportTarget]]:
         """
         Parameters:
             node (ast.AST):
                 AST node
-            collect_from_conditionals (bool):
+            collect_from_conditionals (bool | None):
                 Whether to collect imports inside :py:class:`ast.If` and
                 :py:class:`ast.match_case` nodes (and their children).
-            collect_from_try_except (bool):
+            collect_from_try_except (bool | None):
                 Whether to collect imports inside
                 :py:class:`ast.ExceptHandler`, :py:class:`ast.Try`, and
                 :py:class:`ast.TryStar` nodes (and their children).
-            collect_from_contexts (bool):
+            collect_from_contexts (bool | None):
                 Whether to collect imports inside
                 :py:class:`ast.AsyncWith` and :py:class:`ast.With` nodes
                 (and their children).
-            collect_from_loops (bool):
+            collect_from_loops (bool | None):
                 Whether to collect imports inside
                 :py:class:`ast.AsyncFor`, :py:class:`ast.For`, and
                 :py:class:`ast.While` nodes (and their children).
-            collect_from_definitions (bool):
+            collect_from_func_defs (bool | None):
                 Whether to collect imports inside
-                :py:class:`AsyncFunctionDef`, :py:class:`ast.ClassDef`
-                and :py:class:`ast.FunctionDef` nodes (and their
-                children).
+                :py:class:`AsyncFunctionDef` and
+                :py:class:`ast.FunctionDef` nodes (and their children).
+            collect_from_class_defs (bool | None):
+                Whether to collect imports inside
+                :py:class:`ast.ClassDef` nodes (and their children).
 
         Returns:
             found_imports \
 (dict[tuple[str | int, ...], list[ImportTarget]]):
                 The import targets and their locations in the AST
+
+        Notes:
+            If a ``collect_from_*`` option is set to :py:const:`None`,
+            the value is taken from the default configs.
         """
-        node_types = cls.filter_node_types(
-            collect_from_conditionals=collect_from_conditionals,
-            collect_from_try_except=collect_from_try_except,
-            collect_from_contexts=collect_from_contexts,
-            collect_from_loops=collect_from_loops,
-            collect_from_definitions=collect_from_definitions,
-        )
+        default_config = ConfigSource.from_default()
+        filter_kwargs = {
+            'collect_from_conditionals': collect_from_conditionals,
+            'collect_from_try_except': collect_from_try_except,
+            'collect_from_contexts': collect_from_contexts,
+            'collect_from_loops': collect_from_loops,
+            'collect_from_func_defs': collect_from_func_defs,
+            'collect_from_class_defs': collect_from_class_defs,
+        }
+        consolidated_filter_kwargs: dict[str, bool] = {
+            k: v if filter_kwargs[k] is None else cast(bool, filter_kwargs[k])
+            for k, v in cls._get_filter_args(default_config).items()
+        }
+        node_types = cls.filter_node_types(**consolidated_filter_kwargs)
         visitor = cls(node_types)
         visitor.visit(node)
         return visitor.found_imports
@@ -112,11 +128,12 @@ class _ImportFinder(ast.NodeVisitor):
     def filter_node_types(
         cls,
         *,
-        collect_from_conditionals: bool = True,
-        collect_from_try_except: bool = True,
-        collect_from_contexts: bool = True,
-        collect_from_loops: bool = True,
-        collect_from_definitions: bool = False,
+        collect_from_conditionals: bool = False,
+        collect_from_try_except: bool = False,
+        collect_from_contexts: bool = False,
+        collect_from_loops: bool = False,
+        collect_from_func_defs: bool = False,
+        collect_from_class_defs: bool = False,
     ) -> dict[_CompoundNodeType, bool]:
         """
         Select the which of the compound node types (i.e. those than can
@@ -132,13 +149,29 @@ class _ImportFinder(ast.NodeVisitor):
             allowed.update({'AsyncWith', 'With'})
         if collect_from_loops:
             allowed.update({'AsyncFor', 'For', 'While'})
-        if collect_from_definitions:
-            allowed.update({
-                'AsyncFunctionDef', 'ClassDef', 'FunctionDef',
-            })
+        if collect_from_func_defs:
+            allowed.update({'AsyncFunctionDef', 'FunctionDef'})
+        if collect_from_class_defs:
+            allowed.update({'ClassDef'})
         return {
             node_type: node_type in allowed
             for node_type in cls._compound_node_types
+        }
+
+    @staticmethod
+    def _get_filter_args(config: ConfigSource) -> dict[str, bool]:
+        cfg = (
+            config
+            .get_subconfig('prof_mod_import_discovery')
+            .conf_dict
+        )
+        return {
+            'collect_from_conditionals': cfg['conditionals'],
+            'collect_from_try_except': cfg['try_except'],
+            'collect_from_contexts': cfg['contexts'],
+            'collect_from_loops': cfg['loops'],
+            'collect_from_func_defs': cfg['func_defs'],
+            'collect_from_class_defs': cfg['class_defs'],
         }
 
     def generic_visit(self, node: ast.AST) -> None:
@@ -222,11 +255,7 @@ class ProfmodExtractor:
         self._prof_mod = prof_mod
         if config is None:
             config = ConfigSource.from_default()
-        self._config = (
-            config
-            .get_subconfig('prof_mod_import_discovery')
-            .conf_dict
-        )
+        self._config = config
 
     @staticmethod
     def _is_path(text: str) -> bool:
@@ -326,7 +355,14 @@ class ProfmodExtractor:
 
         return modnames_to_profile
 
-    _ast_get_imports_from_tree = _ImportFinder.find
+    @staticmethod
+    def _ast_get_imports_from_tree(
+        node: ast.AST, config: ConfigSource | None = None,
+    ) -> dict[tuple[str | int, ...], list[ImportTarget]]:
+        if config is None:
+            config = ConfigSource.from_default()
+        kwargs = _ImportFinder._get_filter_args(config)
+        return _ImportFinder.find(node, **kwargs)
 
     @staticmethod
     def _find_modnames_in_tree_imports(
@@ -421,12 +457,7 @@ class ProfmodExtractor:
             self._script_file, self._prof_mod
         )
         import_targets = self._ast_get_imports_from_tree(
-            self._tree,
-            collect_from_conditionals=self._config['conditionals'],
-            collect_from_try_except=self._config['try_except'],
-            collect_from_contexts=self._config['contexts'],
-            collect_from_loops=self._config['loops'],
-            collect_from_definitions=self._config['definitions'],
+            self._tree, self._config,
         )
         raw: dict[tuple[str | int, ...], list[ImportTarget]] = {
             (*loc, index): filtered_imports
