@@ -1485,6 +1485,44 @@ def test_multitarget_import_transformation_executes() -> None:
     assert namespace['Parser'] is XMLParser
 
 
+_ImportDiscoveryOption = Literal[
+    'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
+]
+_CompoundStatement = Literal[
+    'function-def',
+    'async-function-def',  # 3.5+
+    'class-def',
+    'for-else',
+    'async-for-else',  # 3.5+
+    'while-else',
+    'if-elif-else',
+    'match-case',  # 3.10+
+    'with',
+    'async-with',  # 3.5+
+    'try-except-else-finally',
+    'try-except*-else-finally',  # 3.11+
+]
+
+
+def _get_toml_import_discovery_section(
+    options: set[_ImportDiscoveryOption],
+) -> str:
+    config_file_lines = ['[tool.line_profiler.prof_mod_import_discovery]']
+    for option in [
+        'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
+    ]:
+        line = f'{option} = {str(option in options).lower()}'
+        config_file_lines.append(line)
+    return '\n'.join(config_file_lines)
+
+
+def _grep_profiled_names(module_text: str) -> list[str]:
+    prof_pattern = (
+        r'\badd_imported_function_or_module\((\w+(?:\.\w+)*)\)'
+    )
+    return re.findall(prof_pattern, module_text)
+
+
 @pytest.mark.parametrize(
     ('prof_mod', 'expected_targets', 'profile_imports', 'profile_whole_file',
      'expect_warnings'),
@@ -1564,20 +1602,19 @@ def test_handle_star_imports(
      (['os.fork', 'foobar.bar'], {'fork'}, {'try_except', 'contexts'}),
      (['backup_fred', 'operator'], {'methodcaller', 'setitem'},
       {'definitions'}),
-     (['backup_fred', 'operator'], {'fred'}, {'loops'})],
-)
+     (['backup_fred', 'operator'], {'fred'}, {'loops'})])
 def test_nested_import_discovery(
     prof_mod: list[str],
     expected: set[str],
-    options: set[Literal[
-        'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
-    ]],
+    options: set[_ImportDiscoveryOption],
 ) -> None:
     """
     Check the source code transformed by :py:class:`.AstTreeProfiler` to
     see if the import-discovery selection options in the TOML file
     (``[tool.line_profiler.prof_mod_import_discovery]``) are handled
-    correctly.
+    correctly in a real-ish script, with some of the compound statements
+    hosting the import statements nested inside other coumpound
+    statements.
     """
     test_module = ub.codeblock("""
     from collections.abc import Generator
@@ -1635,14 +1672,6 @@ def test_nested_import_discovery(
         import backup_fred as fred
     """).strip('\n')
 
-    config_file_lines = ['[tool.line_profiler.prof_mod_import_discovery]']
-    for option in [
-        'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
-    ]:
-        line = f'{option} = {str(option in options).lower()}'
-        config_file_lines.append(line)
-    config_file = '\n'.join(config_file_lines)
-
     with tempfile.TemporaryDirectory() as tmp:
         mod_fname = os.path.join(tmp, 'test_module.py')
         with open(mod_fname, 'w') as fobj:
@@ -1650,7 +1679,7 @@ def test_nested_import_discovery(
 
         cfg_fname = os.path.join(tmp, 'config.toml')
         with open(cfg_fname, 'w') as fobj:
-            print(config_file, file=fobj)
+            print(_get_toml_import_discovery_section(options), file=fobj)
 
         config = ConfigSource.from_config(cfg_fname)
         atp = AstTreeProfiler(mod_fname, prof_mod, False, config=config)
@@ -1661,8 +1690,190 @@ def test_nested_import_discovery(
     ]:
         print(f'{label.capitalize()}:\n{textwrap.indent(module_text, "  ")}\n')
 
-    prof_pattern = (
-        r'\badd_imported_function_or_module\((\w+(?:\.\w+)*)\)'
+    assert set(_grep_profiled_names(output_module)) == expected
+
+
+@pytest.mark.parametrize(
+    ('compound_statement', 'options', 'should_be_profiled'),
+    [('function-def', set(), False),
+     ('function-def', {'definitions'}, True),
+     ('async-function-def', set(), False),
+     ('async-function-def', {'definitions'}, True),
+     ('class-def', set(), False),
+     ('class-def', {'definitions'}, True),
+     ('for-else', set(), False),
+     ('for-else', {'loops'}, True),
+     ('async-for-else', {'definitions'}, False),
+     ('async-for-else', {'definitions', 'loops'}, True),
+     ('while-else', set(), False),
+     ('while-else', {'loops'}, True),
+     ('if-elif-else', set(), False),
+     ('if-elif-else', {'conditionals'}, True),
+     ('match-case', set(), False),
+     ('match-case', {'conditionals'}, True),
+     ('with', set(), False),
+     ('with', {'contexts'}, True),
+     ('async-with', {'definitions'}, False),
+     ('async-with', {'definitions', 'contexts'}, True),
+     ('try-except-else-finally', set(), False),
+     ('try-except-else-finally', {'try_except'}, True),
+     ('try-except*-else-finally', set(), False),
+     ('try-except*-else-finally', {'try_except'}, True)])
+def test_import_discovery_in_all_compound_statements(
+    compound_statement: _CompoundStatement,
+    options: set[_ImportDiscoveryOption],
+    should_be_profiled: bool,
+) -> None:
+    """
+    Exhaustive "unit" test for imports nested in all the kwown
+    compound-statement language constructions, and all their respective
+    config-level switches.
+
+    Notes:
+        - If a construction is not valid in the current Python version,
+          the subtest is skipped.
+
+        - Some ``async`` constructions are nested inside a coroutine
+          definition by necessity.
+    """
+    test_cases = {
+        'function-def': """
+        def func():
+            import foo, bar
+            import baz
+            import foobar
+
+            ...
+        """,
+        'async-function-def': """
+        async def coroutine(awaitable):
+            import foo
+            import bar
+            import baz, foobar
+
+            await awaitable
+        """,
+        'class-def': """
+        class Class:
+            import foo
+            import bar, baz
+            import foobar
+
+            ...
+        """,
+        'for-else': """
+        for _ in range(5):
+            import foo
+            import bar
+
+            ...
+        else:
+            import baz
+            import foobar
+
+            ...
+        """,
+        'async-for-else': """
+        async def agen(awaitable):
+            async for x in (await awaitable):
+                import foo, bar
+
+                yield x
+            else:
+                import baz, foobar
+                ...
+        """,
+        'while-else': """
+        while True:
+            import foo, bar, baz
+            ...
+        else:
+            import foobar
+        """,
+        'if-elif-else': """
+        if True:
+            import foo
+        elif False:
+            import bar, baz
+        else:
+            import foobar
+        """,
+        'match-case': """
+        match [1, 2, 3]:
+            case [1, *a, 2]:
+                import foo
+                ...
+            case [1, 2, 3, b]:
+                import bar
+                ...
+            case [1, *c]:
+                import baz
+                ...
+            case _:
+                import foobar
+        """,
+        'with': """
+        with ctx:
+            import foo, bar, baz, foobar
+            ...
+        """,
+        'async-with': """
+        async def afunc():
+            async with actx:
+                import foo
+                import bar, baz, foobar
+                ...
+        """,
+        'try-except-else-finally': """
+        try:
+            import foo
+        except ImportError:
+            import bar
+        else:
+            import baz
+        finally:
+            import foobar
+        """,
+    }
+    test_cases['try-except*-else-finally'] = (
+        test_cases['try-except-else-finally'].replace('except', 'except*')
     )
-    profiled_names = re.findall(prof_pattern, output_module)
-    assert set(profiled_names) == expected
+    version_bounds = {
+        'async-function-def': (3, 5),
+        'async-def': (3, 5),
+        'async-for-else': (3, 5),
+        'async-with': (3, 5),
+        'match-case': (3, 10),
+        'try-except*-else-finally': (3, 11),
+    }
+    all_names = {'foo', 'bar', 'baz', 'foobar'}
+
+    test_case = ub.codeblock(test_cases[compound_statement]).strip('\n')
+    version_bound: tuple[int, ...] = version_bounds.get(compound_statement, ())
+    if sys.version_info < version_bound:
+        pytest.skip(
+            reason=f'cannot test {compound_statement} on {sys.version_info}',
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        case_fname = os.path.join(tmp, 'test_case.py')
+        with open(case_fname, 'w') as fobj:
+            print(test_case, file=fobj)
+
+        cfg_fname = os.path.join(tmp, 'config.toml')
+        with open(cfg_fname, 'w') as fobj:
+            print(_get_toml_import_discovery_section(options), file=fobj)
+
+        config = ConfigSource.from_config(cfg_fname)
+        atp = AstTreeProfiler(
+            case_fname, list(all_names), False, config=config,
+        )
+        output = ast.unparse(atp.profile())
+
+    for label, module_text in [
+        ('input', test_case), ('output', output),
+    ]:
+        print(f'{label.capitalize()}:\n{textwrap.indent(module_text, "  ")}\n')
+
+    expected = all_names if should_be_profiled else set()
+    assert set(_grep_profiled_names(output)) == expected

@@ -18,7 +18,7 @@ from ._import_targets import ImportTarget
 
 
 # Node types where code blocks can be found
-_BodiedNodeType = Literal[
+_CompoundNodeType = Literal[
     # Basic top-level nodes
     'Module', 'Interactive',
     # Definition nodes
@@ -39,13 +39,13 @@ class _ImportFinder(ast.NodeVisitor):
     Locate all the imports inside an AST, including those nested inside
     other nodes.
     """
-    _bodied_node_types: ClassVar[set[_BodiedNodeType]] = cast(
-        set[_BodiedNodeType], set(get_args(_BodiedNodeType)),
+    _compound_node_types: ClassVar[set[_CompoundNodeType]] = cast(
+        set[_CompoundNodeType], set(get_args(_CompoundNodeType)),
     )
 
     def __init__(
         self,
-        node_types: dict[_BodiedNodeType, bool],
+        node_types: dict[_CompoundNodeType, bool],
         found_imports: (
             dict[tuple[str | int, ...], list[ImportTarget]] | None
         ) = None,
@@ -117,13 +117,13 @@ class _ImportFinder(ast.NodeVisitor):
         collect_from_contexts: bool = True,
         collect_from_loops: bool = True,
         collect_from_definitions: bool = False,
-    ) -> dict[_BodiedNodeType, bool]:
+    ) -> dict[_CompoundNodeType, bool]:
         """
-        Select the which of the "bodied" node types (i.e. those than can
-        contain nexted code blocks, e.g. try-except statements) to
+        Select the which of the compound node types (i.e. those than can
+        contain nested code blocks, e.g. try-except statements) to
         visit.
         """
-        allowed: set[_BodiedNodeType] = {'Module', 'Interactive'}
+        allowed: set[_CompoundNodeType] = {'Module', 'Interactive'}
         if collect_from_conditionals:
             allowed.update({'If', 'match_case'})
         if collect_from_try_except:
@@ -138,17 +138,19 @@ class _ImportFinder(ast.NodeVisitor):
             })
         return {
             node_type: node_type in allowed
-            for node_type in cls._bodied_node_types
+            for node_type in cls._compound_node_types
         }
 
     def generic_visit(self, node: ast.AST) -> None:
         """
-        For the "bodied" node types, only visit their children if said
+        For the compound node types, only visit their children if said
         type is selected via the init args; for other types, visit by
         default.
         """
         node_type = type(node).__name__
-        if not self._should_visit.get(cast(_BodiedNodeType, node_type), True):
+        if not self._should_visit.get(
+            cast(_CompoundNodeType, node_type), True,
+        ):
             return  # Deselected types
         for field, value in ast.iter_fields(node):
             if isinstance(value, ast.AST):
@@ -157,7 +159,7 @@ class _ImportFinder(ast.NodeVisitor):
                     self.visit(value)
                 finally:
                     self._current_loc.pop()
-            elif isinstance(value, Sequence):  # Node with "body"
+            elif isinstance(value, Sequence):  # Compound node
                 if not all(isinstance(item, ast.AST) for item in value):
                     continue
                 if TYPE_CHECKING:
