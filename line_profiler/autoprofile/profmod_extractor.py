@@ -3,7 +3,8 @@ from __future__ import annotations
 import ast
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
+from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, Literal, cast, get_args
 from warnings import warn
 
@@ -366,7 +367,7 @@ class ProfmodExtractor:
 
     @staticmethod
     def _find_modnames_in_tree_imports(
-        modnames_to_profile: Sequence[str],
+        modnames_to_profile: Collection[str],
         import_targets: Sequence[ImportTarget],
     ) -> dict[int, list[ImportTarget]]:
         """Map modnames to imports from an abstract sytax tree.
@@ -380,7 +381,7 @@ class ProfmodExtractor:
         The import's alias is stored in the output dict.
 
         Args:
-            modnames_to_profile (Sequence[str]):
+            modnames_to_profile (Collection[str]):
                 list of dotted paths to profile.
 
             import_targets (Sequence[ImportTarget]):
@@ -400,12 +401,7 @@ class ProfmodExtractor:
             modname = import_target.name
             if modname in modname_added_list:
                 continue
-            # Check if either the parent module or submodule are in
-            # `modnames_to_profile`
-            if (
-                modname not in modnames_to_profile
-                and modname.rsplit('.', 1)[0] not in modnames_to_profile
-            ):
+            if not _should_profile(modnames_to_profile, modname):
                 continue
             modname_added_list.append(modname)
             try:
@@ -414,12 +410,19 @@ class ProfmodExtractor:
                 filtered_imports[import_target.index] = [import_target]
         return filtered_imports
 
-    def extract_all(self) -> dict[tuple[str | int, ...], list[ImportTarget]]:
+    def extract_all(
+        self, filter_star_imports: bool = True,
+    ) -> dict[tuple[str | int, ...], list[ImportTarget]]:
         """
         Map ``prof_mod`` to imports in an abstract syntax tree.
         Takes the paths and dotted paths in ``prof_mod`` and finds their
         respective imports in an abstract syntax tree, returning their
         aliases and the location they appear in the AST.
+
+        Args:
+            filter_star_imports (bool):
+                If true, filter out star imports
+                (``from <module> import *``) with a warning.
 
         Returns:
             tree_imports_to_profile_dict \
@@ -448,14 +451,7 @@ class ProfmodExtractor:
                             Name under which the import is inserted into
                             the namespace (should never be
                             :py:const`None` for non-star-imports)
-
-        Notes:
-            As of now, ``from <module> import *`` is not supported, and
-            will result in a :py:class:`UserWarning`.
         """
-        modnames_to_profile = self._get_modnames_to_profile_from_prof_mod(
-            self._script_file, self._prof_mod
-        )
         import_targets = self._ast_get_imports_from_tree(
             self._tree, self._config,
         )
@@ -463,14 +459,12 @@ class ProfmodExtractor:
             (*loc, index): filtered_imports
             for loc, imports in import_targets.items()
             for index, filtered_imports in self._find_modnames_in_tree_imports(
-                modnames_to_profile, imports
+                self._modnames_to_profile, imports,
             ).items()
         }
         filtered: dict[tuple[str | int, ...], list[ImportTarget]] = {}
         star_imports: set[ImportTarget] = set()
         for loc, imports in raw.items():
-            # TODO: runtime introspection of imports to handle
-            # star-imports
             # Notes:
             # - We don't issue the warning in
             #   `._find_modnames_in_tree_imports()` because that is a
@@ -482,15 +476,16 @@ class ProfmodExtractor:
             #   which would be the sole target thereof (so
             #   `indices_to_drop` should either be `[]` or `[0]`);
             #   but it doesn't hurt to be cautious
-            indices_to_drop = [
-                i for i, imp in enumerate(imports)
-                if imp.resolved_name is None  # Star-imports
-            ]
-            for i in reversed(indices_to_drop):
-                imp = imports.pop(i)
-                star_imports.add(imp)
+            if filter_star_imports:
+                indices_to_drop = [
+                    i for i, imp in enumerate(imports)
+                    if imp.resolved_name is None  # Star-imports
+                ]
+                for i in reversed(indices_to_drop):
+                    star_imports.add(imports.pop(i))
             if imports:
                 filtered[loc] = imports
+        # Attribute the warning to the caller
         ImportTarget._check_and_warn_dropped_imports(
             star_imports,
             "we don't currently handle `from ... import *` statements",
@@ -563,3 +558,18 @@ class ProfmodExtractor:
             stacklevel=2,  # Attribute warning to caller
         )
         return result
+
+    @cached_property
+    def _modnames_to_profile(self) -> frozenset[str]:
+        return frozenset(self._get_modnames_to_profile_from_prof_mod(
+            self._script_file, self._prof_mod,
+        ))
+
+
+def _should_profile(targets: Collection[str], modname: str) -> bool:
+    """
+    Check if either the parent module or submodule are in
+    `targets`
+    """
+    names = {modname, modname.rsplit('.', 1)[0]}
+    return bool(names.intersection(targets))

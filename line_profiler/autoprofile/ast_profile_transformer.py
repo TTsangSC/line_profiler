@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from functools import partial
 from os import PathLike
 from typing import cast, TypeVar
@@ -17,12 +17,15 @@ def ast_create_profile_node(
     profiler_name: str = 'profile',
     attr: str = 'add_imported_function_or_module',
 ) -> ast.Expr:
-    """Create an abstract syntax tree node that adds an object to the profiler to be profiled.
+    """
+    Create an abstract syntax tree node that adds an object to the
+    profiler to be profiled, by calling the ``attr`` method of
+    ``profile`` and passing ``modname`` to it.
 
-    An abstract syntax tree node is created which calls the attr method from profile and
-    passes modname to it.
-    At runtime, this adds the object to the profiler so it can be profiled.
-    This node must be added after the first instance of modname in the AST and before it is used.
+    At runtime, this adds the object to the profiler so it can be
+    profiled. This node must be added after the first instance of
+    ``modname`` in the AST and before it is used.
+
     The node will look like:
         >>> # xdoctest: +SKIP
         >>> import foo.bar
@@ -33,14 +36,15 @@ def ast_create_profile_node(
             name of the imported module.
 
         profiler_name (str):
-            name of the LineProfiler object.
+            name of the :py:class:`line_profiler.LineProfiler` object.
 
         attr (str):
-            name of the method of the LineProfiler object to call on the imported module.
+            name of the method of the :py:class:`LineProfiler` object to
+            call on the imported module.
 
     Returns:
         (_ast.Expr): expr
-            AST node that adds modname to profiler.
+            AST node that adds ``modname`` to profiler.
     """
     func = ast.Attribute(
         value=ast.Name(id=profiler_name, ctx=ast.Load()),
@@ -55,6 +59,83 @@ def ast_create_profile_node(
     return expr
 
 
+def ast_create_star_import_node(
+    modname: str,
+    targets: Collection[str] | None,
+    profiler_name: str = 'profile',
+    attr: str = 'add_star_import',
+) -> ast.Expr:
+    """
+    AST node similar to that created by
+    :py:func:`.ast_create_profile_node`, except that it handles
+    star-imports (``from ... import *``), like:
+
+    >>> # doctest: +SKIP
+    >>> from foo.bar import *
+    >>> profile.add_star_import(
+    ...     'foo.bar', ['foo.bar', 'spam.ham'], locals(),
+    ... )
+
+    Args:
+        modname (str):
+            name of the imported module.
+
+        targets (Collection[str] | None):
+            profile-on-import module targets; if :py:const:`None`, all
+            the names imported by the star-import will be added to the
+            profiler.
+
+        profiler_name (str):
+            name of the :py:class:`line_profiler.LineProfiler` object.
+
+        attr (str):
+            name of the method of the
+            :py:class:`line_profiler.LineProfiler` object to call on the
+            imported module.
+
+    Returns:
+        (_ast.Expr): expr
+            AST node that adds ``modname`` to profiler.
+    """
+    func_node = ast.Attribute(
+        value=ast.Name(id=profiler_name, ctx=ast.Load()),
+        attr=attr,
+        ctx=ast.Load(),
+    )
+    modname_node = ast.Constant(value=modname)
+    if targets is None:
+        targets_node: ast.Constant | ast.List = ast.Constant(value=None)
+    else:
+        targets_node = ast.List(
+            elts=[ast.Constant(value=t) for t in targets],
+            ctx=ast.Load(),
+        )
+    namespace_node = ast.Call(
+        func=ast.Name(id='locals', ctx=ast.Load()), args=[], keywords=[],
+    )
+    expr = ast.Expr(value=ast.Call(
+        func=func_node,
+        args=[modname_node, targets_node, namespace_node],
+        keywords=[],
+    ))
+    return expr
+
+
+def _ast_create_node_from_import_target(
+    target: ImportTarget,
+    modnames_to_profile: Collection[str] | None = None,
+    profile_star_imports: bool = False,
+) -> ast.Expr | None:
+    if target.resolved_name is None:  # Star-imports
+        if not profile_star_imports:
+            return None
+        assert target.name.endswith('.*')
+        return ast_create_star_import_node(
+            target.name[:-2], modnames_to_profile,
+        )
+    return ast_create_profile_node(target.resolved_name)
+
+
 class AstProfileTransformer(ast.NodeTransformer):
     """Transform an abstract syntax tree adding profiling to all of its objects.
 
@@ -67,27 +148,31 @@ class AstProfileTransformer(ast.NodeTransformer):
     def __init__(
         self,
         profile_imports: bool = False,
-        profiled_imports: list[str] | None = None,
+        profiled_imports: Collection[str] | None = None,
         profiler_name: str = 'profile',
+        profile_star_imports: bool = False,
     ) -> None:
         """Initializes the AST transformer with the profiler name.
 
         Args:
             profile_imports (bool):
-                If True, profile all imports.
+                if True, profile all concrete (non-star) imports.
 
-            profiled_imports (List[str]):
+            profiled_imports (Collection[str]):
                 list of dotted paths of imports to skip that have already been added to profiler.
 
             profiler_name (str):
                 the profiler name used as decorator and for the method call to add to the object
                 to the profiler.
+
+            profile_star_imports (bool):
+                if this and ``profile_imports`` are True, also profile
+                star-imports.
         """
         self._profile_imports = bool(profile_imports)
-        self._profiled_imports = (
-            profiled_imports if profiled_imports is not None else []
-        )
+        self._profiled_imports = set(profiled_imports or ())
         self._profiler_name = profiler_name
+        self._profile_star_imports = profile_star_imports
         self._dropped_star_imports: set[ImportTarget] = set()
 
     def _visit_func_def(
@@ -101,11 +186,11 @@ class AstProfileTransformer(ast.NodeTransformer):
         e.g. @staticmethod.
 
         Args:
-            node (Union[_ast.FunctionDef, _ast.AsyncFunctionDef]):
+            node (_ast.FunctionDef | _ast.AsyncFunctionDef):
                 function/method in the AST
 
         Returns:
-            (Union[_ast.FunctionDef, _ast.AsyncFunctionDef]): node
+            node (_ast.FunctionDef | _ast.AsyncFunctionDef):
                 function/method with profiling decorator
         """
         decor_ids = set()
@@ -126,58 +211,65 @@ class AstProfileTransformer(ast.NodeTransformer):
         node: _Import,
         get_import_targets: Callable[[_Import], Sequence[ImportTarget]],
     ) -> _Import | list[_Import | ast.Expr]:
-        """Add a node that profiles an import
-
-        If profile_imports is True and the import is not in profiled_imports,
-        a node which calls the profiler method, which adds the object to the profiler,
-        is added immediately after the import.
+        """
+        Add a node that profiles an import. If ``profile_imports`` is
+        true and an import target is not in ``profiled_imports``, a node
+        which calls the profiler method adding the object to the
+        profiler is added immediately after the import.
 
         Args:
-            node (Union[_ast.Import,_ast.ImportFrom]):
-                import in the AST
+            node (_Import):
+                import[-from] node in the AST
+            get_import_targets \
+(Callable[[_Import], Sequence[ImportTarget]]):
+                helper callable for analyzing the node
 
         Returns:
-            (Union[Union[_ast.Import,_ast.ImportFrom],List[Union[_ast.Import,_ast.ImportFrom,_ast.Expr]]]): node
-                if profile_imports is False:
-                    returns the import node
-                if profile_imports is True:
-                    returns list containing the import node and the profiling node
+            node (_Import | list[_Import | _ast.Expr]):
+                if ``profile_imports`` is False:
+                    the import node
+                if ``profile_imports`` is True:
+                    a list containing the import node and the profiling
+                    node(s)
         """
         if not self._profile_imports:
             self.generic_visit(node)
             return node
+
         this_visit = cast(_Import, self.generic_visit(node))
         visited: list[_Import | ast.Expr] = [this_visit]
-        for name, target in zip(
-            node.names, get_import_targets(node), strict=True,
-        ):
-            node_name = name.name if name.asname is None else name.asname
-            if target.resolved_name is None:
-                # TODO: handle starred imports
+        for target in get_import_targets(node):
+            name = target.name
+            if name in self._profiled_imports:
+                continue
+            expr = _ast_create_node_from_import_target(
+                target, profile_star_imports=self._profile_star_imports,
+            )
+            if expr is None:  # Bookkeeping
                 self._dropped_star_imports.add(target)
-                continue
-            if node_name in self._profiled_imports:
-                continue
-            self._profiled_imports.append(node_name)
-            expr = ast_create_profile_node(node_name)
-            visited.append(expr)
+            else:
+                self._profiled_imports.add(name)
+                visited.append(expr)
         return visited
 
     def visit_Import(
-        self, node: ast.Import
+        self, node: ast.Import,
     ) -> ast.Import | list[ast.Import | ast.Expr]:
-        """Add a node that profiles an object imported using the "import foo" sytanx
+        """
+        Add nodes that profile objects imported using the
+        ``import foo`` syntax.
 
         Args:
             node (_ast.Import):
                 import in the AST
 
         Returns:
-            (Union[_ast.Import,List[Union[_ast.Import,_ast.Expr]]]): node
-                if profile_imports is False:
-                    returns the import node
-                if profile_imports is True:
-                    returns list containing the import node and the profiling node
+            node (_ast.Import | list[_ast.Import | _ast.Expr]):
+                if ``profile_imports`` is False:
+                    the import node
+                if ``profile_imports`` is True:
+                    a list containing the import node and the
+                    profiling node(s)
         """
         # Note: we don't actually care about the `ImportTarget.index`
         # here; in fact, we're just reusing the name-resolution
@@ -188,18 +280,21 @@ class AstProfileTransformer(ast.NodeTransformer):
     def visit_ImportFrom(
         self, node: ast.ImportFrom
     ) -> ast.ImportFrom | list[ast.ImportFrom | ast.Expr]:
-        """Add a node that profiles an object imported using the "from foo import bar" syntax
+        """
+        Add nodes that profile objects imported using the
+        ``from foo import bar`` syntax.
 
         Args:
             node (_ast.ImportFrom):
                 import in the AST
 
         Returns:
-            (Union[_ast.ImportFrom,List[Union[_ast.ImportFrom,_ast.Expr]]]): node
-                if profile_imports is False:
-                    returns the import node
-                if profile_imports is True:
-                    returns list containing the import node and the profiling node
+            node (_ast.Import | list[_ast.Import | _ast.Expr]):
+                if ``profile_imports`` is False:
+                    the import node
+                if ``profile_imports`` is True:
+                    a list containing the import node and the
+                    profiling node(s)
         """
         get_targets = partial(ImportTarget._from_import_from_node, 0)
         return self._visit_import(node, get_targets)

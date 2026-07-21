@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import operator
+from collections.abc import Callable, Collection, MutableMapping
 from functools import cached_property, partial, partialmethod
+from importlib import import_module
 from types import FunctionType, MethodType, ModuleType
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
+
+from .profmod_extractor import _should_profile
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..profiler_mixin import CLevelCallable, CythonCallable
@@ -112,4 +117,84 @@ def add_imported_function_or_module(
         # individual callables to enable/disable the profiler when
         # they're called
         self.enable_by_count()
+    return 1 if count else 0
+
+
+def add_star_import(
+    self,
+    import_from: str,
+    targets: Collection[str] | None,
+    namespace: MutableMapping[str, Any],
+    **kwargs
+) -> Literal[0, 1]:
+    """
+    Helper method for a :py:class:`~.line_profiler.LineProfiler` to
+    handle star-imports (``from <module> import *``).
+
+    Args:
+        import_from (str):
+            Module name to star-import from.
+        targets (Collection[str] | None):
+            Profile-on-import module targets; if :py:const:`None`, all
+            the names imported by the star-import will be added to the
+            profiler.
+        namespace (MutableMapping[str, Any])
+            Namespace into which the names from ``import_from`` should
+            be imported.
+        **kwargs
+            Passed to :py:func:`.add_imported_function_or_module`.
+
+    Returns:
+        1 if any function is added to the profiler, 0 otherwise.
+    """
+    # Dynamically inspect the module to see which names would've been
+    # inserted by a star-import
+    module = import_module(import_from)  # TODO
+    try:
+        all_names: set[str] | None = set(cast(
+            Collection[str], getattr(module, '__all__', None),
+        ))
+    except Exception:
+        # Could be for whatever reason, there's no guarantee that a
+        # module declares the `.__all__` CORRECTLY
+        all_names = None
+
+    check_attr: Callable[[str], bool]
+    if all_names is None:  # Default behavior: take all public names
+        check_attr = lambda attr: (  # noqa: E731
+            not attr.startswith('_')
+        )
+    else:  # If we have a valid `.__all__`, take names therefrom
+        check_attr = partial(operator.contains, all_names)
+    imported_names: dict[str, Any] = {
+        attr: value
+        for attr, value in inspect.getmembers(module)
+        if check_attr(attr)
+    }
+
+    # Decide on which of the names to pass to the profiler
+    # Note: :the name shoul've already been inserted into the namespace
+    # by the import statement itself, so this is just post-hoc
+    # bookkeeping
+    add: Callable[[Any], int]
+    if hasattr(self, 'add_imported_function_or_module'):
+        # Pseudo-method inserted by `.autoprofile.run()`
+        add = partial(self.add_imported_function_or_module, **kwargs)
+    else:
+        add = partial(add_imported_function_or_module, self, **kwargs)
+    count = 0
+    sentinel = object()
+    for name, value in imported_names.items():
+        if not (
+            targets is None
+            or _should_profile(targets, f'{import_from}.{name}')
+        ):
+            # Check that the name should be profiled (if we have
+            # constrained `targets`)
+            continue
+        if namespace.get(name, sentinel) is not value:
+            # Check that the actual object in the namespace is
+            # consistent with what is imported
+            continue
+        count += add(value)
     return 1 if count else 0
