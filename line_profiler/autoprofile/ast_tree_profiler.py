@@ -5,11 +5,12 @@ import os
 from collections.abc import MutableSequence, Sequence
 from typing import Any
 
+from ._import_targets import ImportTarget
 from .ast_profile_transformer import (
     AstProfileTransformer,
     ast_create_profile_node,
 )
-from .profmod_extractor import ImportTarget, ProfmodExtractor
+from .profmod_extractor import ProfmodExtractor
 
 __docstubs__ = """
 from .ast_profile_transformer import AstProfileTransformer

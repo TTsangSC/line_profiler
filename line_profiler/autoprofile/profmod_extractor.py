@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import ast
-import dataclasses
 import os
 import sys
-from collections.abc import Iterable, Sequence
-from typing import Any, Literal, cast
-from typing_extensions import Self
+from typing import cast
 from warnings import warn
 
 from .util_static import (
@@ -15,140 +12,7 @@ from .util_static import (
     package_modpaths,
 )
 from .. import _diagnostics as diagnostics
-
-
-_ImportTargetField = Literal['name', 'index', 'alias', 'resolved_name']
-
-
-@dataclasses.dataclass(eq=True, frozen=True)
-class ImportTarget:
-    """
-    An import target.
-
-    Init attrs:
-        name (str):
-            The real name of the import. e.g. ``import foo as bar``
-            -> ``'foo'``
-
-        index (int):
-            The index of the import as found in the AST body
-
-        alias (str | None):
-            The alias of an import if applicable. e.g.:
-
-            - ``import foo as bar`` -> ``'bar'``
-            - ``import foo`` -> ``None``
-
-        lineno (int | None):
-            Optional (1-indexed) line number on which the import occurs.
-
-    Other attrs:
-        resolved_name (str | None):
-            Name under which the import can be found, e.g.:
-
-            - ``import foo as bar`` -> ``'bar'``
-            - ``import foo`` -> ``'foo'``
-            - ``from foo import *`` -> ``None``
-
-    Note:
-        Other than the above attributes, the remaining attributes and
-        methods of this object should be considered private.
-    """
-    name: str
-    index: int
-    alias: str | None = None
-    lineno: int | None = None
-
-    def __post_init__(self) -> None:
-        """
-        Type verifications.
-        """
-        if not isinstance(self.name, str):
-            raise TypeError(f'.name = {self.name!r}: expected a str')
-        if not isinstance(self.index, int):
-            raise TypeError(
-                f'.index = {self.index!r}: expected an int',
-            )
-        if not (self.alias is None or isinstance(self.alias, str)):
-            raise TypeError(f'.alias = {self.alias!r}: expected a str or None')
-        if not (self.lineno is None or isinstance(self.lineno, int)):
-            raise TypeError(
-                f'.lineno = {self.lineno!r}: expected an int or None',
-            )
-
-    @classmethod
-    def _from_ast_nodes(cls, nodes: Sequence[ast.AST]) -> list[Self]:
-        """
-        Get all imports in the body of an AST node.
-
-        Args:
-            nodes (Sequence[ast.AST]):
-                AST nodes to scan for imports;
-                examples: :py:attr:`ast.Module.body`,
-                :py:attr:`ast.If.orelse`.
-
-        Returns:
-            import_targets (list[Self]):
-                List of all imports amond the nodes.
-
-        Notes:
-            Imports nested inside the ``nodes`` are not as yet
-            handled, e.g. in
-
-            >>> # doctest: +SKIP
-            >>> from spam import ham
-            >>> try:
-            ...     from some_foo import bar
-            ... except ImportError:
-            ...     from other_foo import ersatz_bar as bar
-
-            Only ``ham`` is extracted but not ``bar``.
-        """
-        targets: list[Self] = []
-        modnames: set[str] = set()
-        for index, node in enumerate(nodes):
-            if isinstance(node, ast.Import):
-                new_targets: list[Self] = cls._from_import_node(index, node)
-            elif isinstance(node, ast.ImportFrom):
-                new_targets = cls._from_import_from_node(index, node)
-            else:  # TODO: descend into other bodied nodes
-                new_targets = []
-            for target in new_targets:
-                if target.name not in modnames:
-                    targets.append(target)
-                    modnames.add(target.name)
-        return targets
-
-    @classmethod
-    def _from_import_node(cls, index: int, node: ast.Import) -> list[Self]:
-        return [
-            cls(name.name, index, name.asname, name.lineno)
-            for name in node.names
-        ]
-
-    @classmethod
-    def _from_import_from_node(
-        cls, index: int, node: ast.ImportFrom,
-    ) -> list[Self]:
-        if node.module is None:  # `from . import ...`
-            return []
-        return [
-            cls(
-                f'{node.module}.{name.name}',
-                index,
-                name.asname or name.name,
-                name.lineno,
-            )
-            for name in node.names
-        ]
-
-    @property
-    def resolved_name(self) -> str | None:
-        # Note: star-imports are parsed into
-        # `ImportTarget('module.name.*', index, '*', lineno)`
-        if self.alias == '*':
-            return None
-        return self.alias or self.name
+from ._import_targets import ImportTarget
 
 
 class ProfmodExtractor:
@@ -403,8 +267,7 @@ class ProfmodExtractor:
             ).items()
         }
         filtered: dict[tuple[str | int, ...], list[ImportTarget]] = {}
-        star_imports: dict[int | None, set[ImportTarget]] = {}
-        imports: Iterable[ImportTarget]
+        star_imports: set[ImportTarget] = set()
         for loc, imports in raw.items():
             # TODO: runtime introspection of imports to handle
             # star-imports
@@ -425,29 +288,15 @@ class ProfmodExtractor:
             ]
             for i in reversed(indices_to_drop):
                 imp = imports.pop(i)
-                try:
-                    star_imports[imp.lineno].add(imp)
-                except KeyError:
-                    star_imports[imp.lineno] = {imp}
+                star_imports.add(imp)
             if imports:
                 filtered[loc] = imports
-        if star_imports:
-            msg_chunks: list[str] = [
-                (
-                    '{}: {} would-be profiling target(s) dropped because the '
-                    "we don't currently handle `from ... import *` statements:"
-                ).format(self._script_file, len(star_imports)),
-            ]
-            for lineno, imports in sorted(
-                star_imports.items(), key=_import_dict_item_sort_key,
-            ):
-                lineno_repr = '???' if lineno is None else str(lineno)
-                targets = ', '.join(sorted(imp.name for imp in imports))
-                msg_chunks.append(f'- line {lineno_repr}: {targets}')
-            sep = ' ' if len(msg_chunks) < 3 else '\n'
-            # Attribute the warning to the caller of `.run()` or
-            # `.extract_all()`
-            _issue_warning(sep.join(msg_chunks), stacklevel=3)
+        ImportTarget._check_and_warn_dropped_imports(
+            star_imports,
+            "we don't currently handle `from ... import *` statements",
+            self._script_file,
+            stacklevel=2,  # Attribute warning to caller
+        )
         return filtered
 
     def run(self) -> dict[int, str]:
@@ -487,10 +336,10 @@ class ProfmodExtractor:
             'correctly resolve multi-target import statements; '
             'use `ProfmodExtractor.extract_all()` instead.'
         )
-        _issue_warning(msg, DeprecationWarning, stacklevel=2)
+        diagnostics.log.warning(f'DeprecationWarning: {msg}')
+        warn(msg, DeprecationWarning, stacklevel=2)  # Caller
         result: dict[int, str] = {}
         dropped: set[ImportTarget] = set()
-        imports: Iterable[ImportTarget]
         for index, imports in self.extract_all().items():
             if not (
                 len(index) == 2
@@ -507,52 +356,10 @@ class ProfmodExtractor:
                 # but once we fix star-imports...
                 continue
             result[index[1]] = name
-        if dropped:
-            dropped_grouped: dict[int | None, set[ImportTarget]] = {}
-            for imp in dropped:
-                try:
-                    dropped_grouped[imp.lineno].add(imp)
-                except KeyError:
-                    dropped_grouped[imp.lineno] = {imp}
-            msg_chunks: list[str] = [
-                (
-                    '{}: {} would-be profiling target(s) dropped because the '
-                    'import statement(s) are multi-target:'
-                ).format(self._script_file, len(dropped)),
-            ]
-            for lineno, imports in sorted(
-                dropped_grouped.items(), key=_import_dict_item_sort_key,
-            ):
-                lineno_repr = '???' if lineno is None else str(lineno)
-                targets = ', '.join(sorted(
-                    imp.name
-                    if imp.alias is None else
-                    f'{imp.alias} (= {imp.name})'
-                    for imp in imports
-                ))
-                msg_chunks.append(f'- line {lineno_repr}: {targets}')
-            sep = ' ' if len(msg_chunks) < 3 else '\n'
-            _issue_warning(sep.join(msg_chunks), stacklevel=2)
+        ImportTarget._check_and_warn_dropped_imports(
+            dropped,
+            'the import statement(s) is/are multi-target',
+            self._script_file,
+            stacklevel=2,  # Attribute warning to caller
+        )
         return result
-
-
-def _import_dict_item_sort_key(item: tuple[int | None, Any]) -> float:
-    lineno, _ = item
-    if lineno is None:
-        return float('inf')
-    return lineno
-
-
-def _issue_warning(
-    msg: str,
-    category: type[Warning] | None = None,
-    stacklevel: int = 1,
-    *args,
-    **kwargs,
-) -> None:
-    if category is None:
-        log_msg = msg
-    else:
-        log_msg = f'{category.__name__}: {msg}'
-    diagnostics.log.warning(log_msg)
-    warn(msg, category, stacklevel + 1, *args, **kwargs)
