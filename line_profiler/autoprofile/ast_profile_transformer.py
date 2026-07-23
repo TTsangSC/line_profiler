@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from functools import partial
 from os import PathLike
-from typing import cast, TypeVar
+from types import MappingProxyType
+from typing import TypeVar, cast, get_args
 
+from ..toml_config import ConfigSource
 from ._import_targets import ImportTarget
+from .profmod_extractor import _CompoundNodeType, _ImportFinder
 
 
 _Import = TypeVar('_Import', ast.Import, ast.ImportFrom)
+
+_PROFILE_IMPORTS_IN_DEFAULT: MappingProxyType[_CompoundNodeType, bool]
+_PROFILE_IMPORTS_IN_DEFAULT = MappingProxyType(dict.fromkeys(
+    get_args(_CompoundNodeType), True,
+))
 
 
 def ast_create_profile_node(
@@ -137,12 +145,19 @@ def _ast_create_node_from_import_target(
 
 
 class AstProfileTransformer(ast.NodeTransformer):
-    """Transform an abstract syntax tree adding profiling to all of its objects.
+    """
+    Transform an abstract syntax tree adding profiling to all of its
+    objects, by:
 
-    Adds profiler decorators on all functions & methods that are not already decorated with
-    the profiler.
-    If profile_imports is True, a profiler method call to profile is added to all imports
-    immediately after the import.
+    - Adding profiler decorators on all functions & methods that are not
+      already decorated with the profiler.
+    - If ``profile_imports`` is True, a profiler method call (see
+      :py:func:`line_profiler.autoprofile.line_profiler_utils\
+.add_imported_function_or_module`
+      and
+      :py:func:`line_profiler.autoprofile.line_profiler_utils\
+.add_star_import`)
+      is added to all imports immediately after the import.
     """
 
     def __init__(
@@ -150,7 +165,11 @@ class AstProfileTransformer(ast.NodeTransformer):
         profile_imports: bool = False,
         profiled_imports: Collection[str] | None = None,
         profiler_name: str = 'profile',
+        *,
         profile_star_imports: bool = False,
+        profile_imports_in: Mapping[
+            _CompoundNodeType, bool
+        ] = _PROFILE_IMPORTS_IN_DEFAULT,
     ) -> None:
         """Initializes the AST transformer with the profiler name.
 
@@ -168,12 +187,22 @@ class AstProfileTransformer(ast.NodeTransformer):
             profile_star_imports (bool):
                 if this and ``profile_imports`` are True, also profile
                 star-imports.
+
+            profile_imports_in \
+(Mapping[Literal['Module', 'Interactive', \
+'FunctionDef', 'AsyncFunctionDef', 'ClassDef', \
+'For', `AsyncFor`, `While`, 'If', 'match_case', \
+'With', 'AsyncWith'. 'Try', 'TryStar', 'ExceptHandler'], bool]):
+                for each of the compound-statemnt node type, whether to
+                profile import statements residing therein.
         """
         self._profile_imports = bool(profile_imports)
         self._profiled_imports = set(profiled_imports or ())
         self._profiler_name = profiler_name
         self._profile_star_imports = profile_star_imports
+        self._should_visit_imports = dict(profile_imports_in)
         self._dropped_star_imports: set[ImportTarget] = set()
+        self._current_loc: list[str] = []
 
     def _visit_func_def(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -212,9 +241,16 @@ class AstProfileTransformer(ast.NodeTransformer):
         get_import_targets: Callable[[_Import], Sequence[ImportTarget]],
     ) -> _Import | list[_Import | ast.Expr]:
         """
-        Add a node that profiles an import. If ``profile_imports`` is
-        true and an import target is not in ``profiled_imports``, a node
-        which calls the profiler method adding the object to the
+        Add a node that profiles an import. If:
+
+        - ``profile_imports`` is true,
+
+        - The import statement isn't nested in a compound-statement node
+          type explicitly excluded via ``profile_imports_in``, and
+
+        - The import target is not in ``profiled_imports``,
+
+        a node which calls the profiler method adding the object to the
         profiler is added immediately after the import.
 
         Args:
@@ -233,6 +269,18 @@ class AstProfileTransformer(ast.NodeTransformer):
                     node(s)
         """
         if not self._profile_imports:
+            should_profile = False
+        else:
+            # Check if this node is nested inside compound statements
+            # that we shouldn't look for imports in
+            *ancestry, _ = self._current_loc
+            svi = self._should_visit_imports
+            should_profile = all(
+                svi.get(cast(_CompoundNodeType, a_type), True)
+                for a_type in ancestry
+            )
+
+        if not should_profile:
             self.generic_visit(node)
             return node
 
@@ -277,6 +325,15 @@ class AstProfileTransformer(ast.NodeTransformer):
         get_targets = partial(ImportTarget._from_import_node, 0)
         return self._visit_import(node, get_targets)
 
+    def visit(self, node: ast.AST) -> ast.AST | list[ast.AST]:
+        # Bookkeeping
+        loc = self._current_loc
+        loc.append(type(node).__name__)
+        try:
+            return super().visit(node)
+        finally:
+            loc.pop()
+
     def visit_ImportFrom(
         self, node: ast.ImportFrom
     ) -> ast.ImportFrom | list[ast.ImportFrom | ast.Expr]:
@@ -299,11 +356,23 @@ class AstProfileTransformer(ast.NodeTransformer):
         get_targets = partial(ImportTarget._from_import_from_node, 0)
         return self._visit_import(node, get_targets)
 
+    @staticmethod
+    def _get_profile_imports_in(
+        config: ConfigSource | None = None,
+    ) -> dict[_CompoundNodeType, bool]:
+        if config is None:
+            config = ConfigSource.from_default()
+        return _ImportFinder.filter_node_types(
+            **_ImportFinder._get_filter_args(config),
+        )
+
     @classmethod
     def _transform(
         cls,
         node: ast.Module,
         filename: PathLike[str] | str | None = None,
+        *,
+        config: ConfigSource | None = None,
         **kwargs,
     ) -> ast.Module:
         """
@@ -314,6 +383,9 @@ class AstProfileTransformer(ast.NodeTransformer):
                 AST module node
             filename (PathLike[str] | str | None):
                 Optional filename to be used in error/warning messages
+            config (ConfigSource | None):
+                Optional :py:class:`.ConfigSource` to load options from,
+                controlling whether an import should be profiled
             **kwargs
                 Passed to the initializer
 
@@ -321,12 +393,15 @@ class AstProfileTransformer(ast.NodeTransformer):
             node (ast.Module):
                 Input module node
         """
+        kwargs.setdefault(
+            'profile_imports_in', cls._get_profile_imports_in(config),
+        )
         transformer = cls(**kwargs)
         dropped_star_imports = transformer._dropped_star_imports
         if filename is None:
             filename = '???'
         try:
-            return transformer.visit(node)
+            return cast(ast.Module, transformer.visit(node))
         finally:
             ImportTarget._check_and_warn_dropped_imports(
                 dropped_star_imports,

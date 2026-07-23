@@ -40,6 +40,7 @@ class AstTreeProfiler:
         profmod_extractor_class_handler: (
             type[ProfmodExtractor]
         ) = ProfmodExtractor,
+        *,
         config: ConfigSource | None = None,
     ) -> None:
         """Initializes the AST tree profiler instance with the script file path
@@ -204,6 +205,7 @@ list[ImportTarget]]):
                 profile_imports=profile_imports,
                 profiled_imports=profiled_imports,
                 profile_star_imports=profile_star_imports,
+                config=self._config,
             )
         ast.fix_missing_locations(tree)
         return tree
@@ -255,7 +257,7 @@ list[ImportTarget]]):
         #   `profile_full_script=True` and `profile_imports=True`
         # So take care to enture that we don't have duplicate warnings
         extractor = self._profmod_extractor_class_handler(
-            tree, self._script_file, self._prof_mod, self._config,
+            tree, self._script_file, self._prof_mod, config=self._config,
         )
         if profile_star_imports:
             # Star imports recovered -> nothing to warn either way

@@ -16,6 +16,9 @@ from warnings import catch_warnings, WarningMessage
 import pytest
 import ubelt as ub
 from line_profiler.toml_config import ConfigSource
+from line_profiler.autoprofile.ast_profile_transformer import (
+    AstProfileTransformer,
+)
 from line_profiler.autoprofile.ast_tree_profiler import AstTreeProfiler
 from line_profiler.autoprofile.profmod_extractor import ProfmodExtractor
 
@@ -1431,6 +1434,9 @@ class _RecordingProfiler:
     def __init__(self) -> None:
         self.profiled_objects: list[Any] = []
 
+    def __call__(self, x: Any) -> Any:
+        return x
+
     def add_imported_function_or_module(self, obj) -> None:
         self.profiled_objects.append(obj)
 
@@ -1712,6 +1718,8 @@ def test_nested_import_discovery(
     assert set(_grep_profiled_names(output_module)) == expected
 
 
+@pytest.mark.parametrize('use_component',
+                         ['ast_tree_profiler', 'ast_profile_transformer'])
 @pytest.mark.parametrize(
     ('compound_statement', 'options', 'should_be_profiled'),
     [('function-def', set(), False),
@@ -1741,6 +1749,7 @@ def test_nested_import_discovery(
 def test_import_discovery_in_all_compound_statements(
     compound_statement: _CompoundStatement,
     options: set[_ImportDiscoveryOption],
+    use_component: Literal['ast_tree_profiler', 'ast_profile_transformer'],
     should_be_profiled: bool,
 ) -> None:
     """
@@ -1884,10 +1893,23 @@ def test_import_discovery_in_all_compound_statements(
             print(_get_toml_import_discovery_section(options), file=fobj)
 
         config = ConfigSource.from_config(cfg_fname)
-        atp = AstTreeProfiler(
-            case_fname, list(all_names), False, config=config,
-        )
-        output = ast.unparse(atp.profile())
+        if use_component == 'ast_tree_profiler':
+            atp = AstTreeProfiler(
+                # `profile_imports=False` prevents
+                # `AstProfileTransformer` from rewriting the imports, so
+                # we're really testing `ProfmodExtractor` here
+                case_fname, list(all_names), False, config=config,
+            )
+            module_ast = atp.profile()
+        else:
+            module_ast = AstProfileTransformer._transform(
+                ast.parse(test_case),
+                case_fname,
+                profile_imports=True,
+                profiled_imports=[],
+                config=config,
+            )
+        output = ast.unparse(module_ast)
 
     for label, module_text in [
         ('input', test_case), ('output', output),
@@ -1898,9 +1920,25 @@ def test_import_discovery_in_all_compound_statements(
     assert set(_grep_profiled_names(output)) == expected
 
 
-@pytest.mark.parametrize('call', ['first', 'second', 'third'])
+@pytest.mark.parametrize(
+    ('call', 'use_component', 'expected_profiled_objects'),
+    [
+        # Nothing special happens when calling `first()` and `second()`,
+        # there's only a single import target (`textwrap.indent`) inside
+        # the function
+        ('first', 'ast_tree_profiler', ['indent']),
+        ('first', 'ast_profile_transformer', ['indent']),
+        ('second', 'ast_tree_profiler', ['indent']),
+        ('second', 'ast_profile_transformer', ['indent']),
+        # With `third()`, because `textwrap.dedent()` is also imported,
+        # it is also profiled when using `AstProfileTransformer`
+        ('third', 'ast_tree_profiler', ['indent']),
+        ('third', 'ast_profile_transformer', ['indent', 'dedent']),
+    ])
 def test_nested_imports_correct_deduplication_across_scopes(
     call: Literal['first', 'second', 'third'],
+    use_component: Literal['ast_tree_profiler', 'ast_profile_transformer'],
+    expected_profiled_objects: Sequence[Literal['indent', 'dedent']],
 ) -> None:
     """
     Test that there is no aliasing in the check we have against
@@ -1922,8 +1960,6 @@ def test_nested_imports_correct_deduplication_across_scopes(
           bodies. For this reason, import discovery in function bodies
           is off by default.
     """
-    from textwrap import indent
-
     test_module = ub.codeblock("""
     def first() -> str:
         from textwrap import indent
@@ -1954,10 +1990,23 @@ def test_nested_imports_correct_deduplication_across_scopes(
         with open(cfg_fname, 'w') as fobj:
             print(_get_toml_import_discovery_section(), file=fobj)
 
-        mod_ast = AstTreeProfiler(
-            mod_fname, ['textwrap.indent'], False,
-            config=ConfigSource.from_config(cfg_fname),
-        ).profile()
+        config = ConfigSource.from_config(cfg_fname)
+        if use_component == 'ast_tree_profiler':
+            # Ditto comment in
+            # `test_import_discovery_in_all_compound_statements()`
+            mod_ast = AstTreeProfiler(
+                mod_fname, ['textwrap.indent'], False,
+                config=config,
+            ).profile()
+        else:
+            mod_ast = AstProfileTransformer._transform(
+                ast.parse(test_module),
+                mod_fname,
+                profile_imports=True,
+                profiled_imports=[],
+                config=config,
+            )
+            mod_ast = ast.fix_missing_locations(mod_ast)
         print(ast.unparse(mod_ast))
 
         namespace: dict[str, Any] = {'profile': mock_prof}
@@ -1968,4 +2017,5 @@ def test_nested_imports_correct_deduplication_across_scopes(
     # `textwrap.indent()` should be presented to the profiler exactly
     # once
     assert namespace[call]() == '  ' + call
-    assert mock_prof.profiled_objects == [indent]
+    profiled_objects = [func.__name__ for func in mock_prof.profiled_objects]
+    assert profiled_objects == list(expected_profiled_objects)

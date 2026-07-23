@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import sys
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, Literal, cast, get_args
 from warnings import warn
@@ -48,7 +48,7 @@ class _ImportFinder(ast.NodeVisitor):
 
     def __init__(
         self,
-        node_types: dict[_CompoundNodeType, bool],
+        node_types: Mapping[_CompoundNodeType, bool],
         found_imports: (
             dict[tuple[str | int, ...], list[ImportTarget]] | None
         ) = None,
@@ -227,6 +227,7 @@ class ProfmodExtractor:
         tree: ast.Module,
         script_file: str,
         prof_mod: Sequence[str],
+        *,
         config: ConfigSource | None = None,
     ) -> None:
         """

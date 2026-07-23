@@ -57,27 +57,39 @@ from ..toml_config import ConfigSource
 from ..line_profiler_utils import restore
 from .ast_tree_profiler import AstTreeProfiler
 from .run_module import AstTreeModuleProfiler
-from .line_profiler_utils import add_imported_function_or_module
+from .line_profiler_utils import (
+    add_imported_function_or_module, add_star_import,
+)
 from .util_static import modpath_to_modname
 
 PROFILER_LOCALS_NAME = 'prof'
 
 
 def _extend_line_profiler_for_profiling_imports(prof: Any) -> None:
-    """Allow profiler to handle functions/methods, classes & modules with a single call.
+    """
+    Allow profiler to handle imported functions/methods, classes and
+    modules, and also star-import targets, with a single call. This
+    adds to a :py:class:`line_profiler.LineProfiler` instance:
 
-    Add a method to LineProfiler that can identify whether the object is a
-    function/method, class or module and handle it's profiling accordingly.
+    - A method that can identify whether the object is a
+      function/method, class, or module, and handle it's profiling
+      accordingly; and
+
+    - A method that can retrieve the names imported via a star-import
+      and use the above handling to profile them.
+
     Mainly used for profiling objects that are imported.
-    (Workaround to keep changes needed by autoprofile separate from base LineProfiler)
 
     Args:
         prof (LineProfiler):
-            instance of LineProfiler.
+            instance of :py:class:`line_profiler.LineProfiler`.
+
+    Notes:
+        This is a workaround to keep changes needed by autoprofile
+        separate from the base :py:class:`line_profiler.LineProfiler`.
     """
-    prof.add_imported_function_or_module = types.MethodType(
-        add_imported_function_or_module, prof
-    )
+    for func in add_imported_function_or_module, add_star_import:
+        setattr(prof, func.__name__, types.MethodType(func, prof))
 
 
 def run(
@@ -86,6 +98,7 @@ def run(
     prof_mod: list[str],
     profile_imports: bool = False,
     as_module: bool = False,
+    *,
     config: os.PathLike[str] | str | None = None,
 ) -> None:
     """Automatically profile a script and run it.
