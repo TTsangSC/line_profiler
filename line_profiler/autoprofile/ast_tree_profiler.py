@@ -177,10 +177,11 @@ list[str]]):
                 body.insert(tree_index + 1, expr)
                 profiled_imports.append(name)
         if profile_full_script:
-            tree = self._ast_transformer_class_handler(
+            tree = self._ast_transformer_class_handler._transform(
+                tree, self._script_file,
                 profile_imports=profile_imports,
                 profiled_imports=profiled_imports,
-            ).visit(tree)
+            )
         ast.fix_missing_locations(tree)
         return tree
 
