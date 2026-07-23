@@ -8,7 +8,8 @@ import subprocess
 import sys
 import shlex
 import tempfile
-from typing import Any, ClassVar, Literal
+from collections.abc import Collection, Sequence
+from typing import Any, Literal
 from warnings import catch_warnings, WarningMessage
 
 import pytest
@@ -1271,7 +1272,7 @@ def test_multitarget_import_resolution(
      # a warning
      (['qux', 'quux'], {3: ['ham']}, 'extract_all',
       r'1 .* target.* dropped .* import \*.*'
-      r'- line 5: quux.*'),
+      r'- line 5: \* \(from quux\)'),
      # This doesn't result in a `UserWarning` for dropped targets,
      # because there is only one selected target on the multi-target
      # import line
@@ -1293,7 +1294,7 @@ def test_multitarget_import_resolution(
      # Same warning for `quux.*` as above for `.extract_all()`
      (['qux', 'quux'], {3: 'ham'}, 'run',
       r'1 .* target.* dropped .* import \*.*'
-      r'- line 5: quux.*')])
+      r'- line 5: \* \(from quux\)')])
 def test_profmod_extractor_multitarget_behavior(
     prof_mod: list[str],
     expected: dict[int, str] | dict[int, list[str]],
@@ -1381,6 +1382,22 @@ def test_profmod_extractor_multitarget_behavior(
                 result[loc[1]] = [imp.resolved_name for imp in imports]
             assert result == expected
 
+    _check_warnings(warnings, checks)
+
+
+def _check_warnings(
+    warnings: Sequence[WarningMessage],
+    checks: Collection[tuple[bool, str, type[Warning]]],
+) -> None:
+    """
+    With each tuple of ``warning_expected, msg, WarningType``, check
+    ``warnings`` that:
+
+    - If ``warning_expected = True``, there is at least 1 matching
+      warning.
+
+    - If ``warning_expected = False``, thers is no matching warning.
+    """
     for warning_expected, pattern, WarningType in checks:
         regex = re.compile(pattern)
         matches = [
@@ -1464,3 +1481,68 @@ def test_multitarget_import_transformation_executes() -> None:
     assert namespace['Element'] is Element
     assert namespace['xml_dump'] is dump
     assert namespace['Parser'] is XMLParser
+
+
+@pytest.mark.parametrize(
+    ('prof_mod', 'expected_targets', 'profile_imports', 'profile_whole_file',
+     'expect_warnings'),
+    [([], [], False, False, False),  # No-op case
+     # Whole-file rewriting, with and without import rewriting
+     ([], ['bar', 'baz'], True, True, True),
+     ([], [], False, True, False),
+     # No whole-file rewriting, bu we explicitly ask to profile the
+     # `spam.ham.*` import (which can't be done)
+     (['spam.ham'], [], False, False, True)])
+def test_handle_star_imports(
+    prof_mod: list[str],
+    expected_targets: Collection[Literal['bar', 'baz']],
+    profile_imports: bool,
+    profile_whole_file: bool,
+    expect_warnings: bool,
+) -> None:
+    """
+    Test that star-imports (``from ... import *``) don't cause
+    :py:meth:`AstTreeProfiler.profile` to choke, instead just issuing
+    warnings about ignoring them.
+
+    TODO: actually handle star-imports
+    """
+    code = ub.codeblock(
+        """
+        from foo import bar
+        from spam.ham import *
+        from foobar import baz
+
+
+        def func() -> None:
+            pass
+        """,
+    ).strip('\n')
+
+    targets_warning_pattern = 'profiling target.* dropped.*'
+    warning_checks = [(expect_warnings, targets_warning_pattern, UserWarning)]
+
+    re_checks: list[tuple[str, bool]] = []
+    re_checks.append((r'@profile\ndef func', profile_whole_file))
+    for target in 'bar', 'baz':
+        pattern = rf'add_imported_function_or_module\({target}\)'
+        re_checks.append((pattern, target in expected_targets))
+
+    with contextlib.ExitStack() as stack:
+        tmpdir = stack.enter_context(tempfile.TemporaryDirectory())
+        fpath = ub.Path(tmpdir) / 'script.py'
+        fpath.write_text(code)
+        if profile_whole_file:
+            prof_mod = [*prof_mod, str(fpath)]
+
+        warnings = stack.enter_context(catch_warnings(record=True))
+        rewriter = AstTreeProfiler(str(fpath), prof_mod, profile_imports)
+        module_ast = rewriter.profile()
+
+    # Check the issuance of warnings related to star-imports
+    _check_warnings(warnings, warning_checks)
+
+    # Check the profiling of other targets
+    output_module = ast.unparse(module_ast)
+    for pattern, expected in re_checks:
+        assert bool(re.search(pattern, output_module)) == expected
