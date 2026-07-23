@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Collection, Mapping, Sequence
-from functools import partial
+from collections.abc import (
+    Callable, Collection, Mapping, MutableSequence, Sequence,
+)
 from os import PathLike
 from types import MappingProxyType
-from typing import TypeVar, cast, get_args
+from typing import Any, Protocol, TypeVar, cast, get_args
+from warnings import warn
 
+from .. import _diagnostics as diagnostics
 from ..toml_config import ConfigSource
 from ._import_targets import ImportTarget
 from .profmod_extractor import _CompoundNodeType, _ImportFinder
@@ -144,6 +147,132 @@ def _ast_create_node_from_import_target(
     return ast_create_profile_node(target.resolved_name)
 
 
+class _DuplicateChecker(Protocol):
+    """
+    Protocol for objects which helps with deduplication.
+    """
+    def should_profile_import(
+        self, target: ImportTarget, context: Sequence[str | int], /,
+    ) -> bool:
+        ...
+
+    def record_profiled_import(
+        self, target: ImportTarget, context: Sequence[str | int], /,
+    ) -> Any:
+        ...
+
+
+class _ContextAwareDuplicateChecker:
+    """
+    This checker is context-aware and only deduplicates imports of the
+    same object in the same scope.
+    """
+    def __init__(
+        self,
+        profiled_imports: (
+            Mapping[Sequence[str | int], Sequence[ImportTarget]] | None
+        ) = None,
+    ) -> None:
+        pi: dict[
+            tuple[str | int, ...], dict[int, list[ImportTarget]]
+        ]
+        self._profiled_imports = pi = {}
+        for context, imports in (profiled_imports or {}).items():
+            ctx, index = self._check_context(context)
+            pi.setdefault(ctx, {})[index] = list(imports)
+
+    def should_profile_import(
+        self, target: ImportTarget, context: Sequence[str | int],
+    ) -> bool:
+        # Note: the `index` shouldn't be needed since we're already
+        # going through the import targets in order
+        ctx, _ = self._check_context(context)
+        if ctx not in self._profiled_imports:
+            return True
+        ctx_profiled_names = {
+            imp.name
+            for imports in self._profiled_imports[ctx].values()
+            for imp in imports
+        }
+        return target.name not in ctx_profiled_names
+
+    def record_profiled_import(
+        self, target: ImportTarget, context: Sequence[str | int],
+    ) -> None:
+        ctx, index = self._check_context(context)
+        (
+            self._profiled_imports
+            .setdefault(ctx, {})
+            .setdefault(index, [])
+            .append(target)
+        )
+
+    @staticmethod
+    def _check_context(
+        context: Sequence[str | int],
+    ) -> tuple[tuple[str | int, ...], int]:
+        *ctx, index = context
+        if not isinstance(index, int):
+            raise TypeError(
+                f'context[-1] = {context[-1]!r}: expected an integer',
+            )
+        return tuple(ctx), index
+
+
+class _LegacyDuplicateChecker:
+    """
+    This checker replicates legacy behavior: all imports in the same
+    module are treated on equal footing regardless of scoping, and each
+    import target is only passed once to the profiler.
+
+    Notes:
+        Using this results in a :py:class:`DeprecationWarning`. This is
+        because such deduplication can result in the profiler never
+        getting passed an intended target. Consider the following
+        example:
+
+        >>> # doctest: +SKIP
+        >>>
+        >>>
+        >>> def foo():
+        ...     from spam import ham
+        ...
+        ...     return ham()
+        ...
+        >>>
+        >>> def bar():
+        ...     from spam import ham
+        ...
+        ...     return ham()
+        ...
+        >>>
+        >>> if __name__ == '__main__':
+        ...     bar()
+
+        In the above example, ``spam.ham()`` is never profiled even
+        after AST rewrite, because only the import in ``foo()`` has a
+        post-import profiling statement inserted.
+    """
+    def __init__(self, profiled_imports: Collection[str]) -> None:
+        msg = (
+            'AstProfileTransformer(profiled_imports=<Collection[str]>) '
+            'is deprecated because of erroneous resolution of duplicate '
+            'imports; future code should use either '
+            '`Mapping[Sequence[str | int], ImportTarget]` '
+            '(e.g. the return value of `ProfmodExtractor.extract_all()`) '
+            'or `None`'
+        )
+        diagnostics.log.warning(f'DeprecationWarning: {msg}')
+        warn(msg, category=DeprecationWarning, stacklevel=2)  # Caller
+        self._profiled_imports = set(profiled_imports)
+
+    def should_profile_import(self, target: ImportTarget, _) -> bool:
+        return target.name not in self._profiled_imports
+
+    def record_profiled_import(self, target: ImportTarget, _) -> None:
+        self._profiled_imports.add(target.name)
+
+
 class AstProfileTransformer(ast.NodeTransformer):
     """
     Transform an abstract syntax tree adding profiling to all of its
@@ -163,7 +292,11 @@ class AstProfileTransformer(ast.NodeTransformer):
     def __init__(
         self,
         profile_imports: bool = False,
-        profiled_imports: Collection[str] | None = None,
+        profiled_imports: (
+            Mapping[Sequence[str | int], Sequence[ImportTarget]]
+            | Collection[str]
+            | None
+        ) = None,
         profiler_name: str = 'profile',
         *,
         profile_star_imports: bool = False,
@@ -171,18 +304,32 @@ class AstProfileTransformer(ast.NodeTransformer):
             _CompoundNodeType, bool
         ] = _PROFILE_IMPORTS_IN_DEFAULT,
     ) -> None:
-        """Initializes the AST transformer with the profiler name.
+        """
+        Initializes the AST transformer.
 
         Args:
             profile_imports (bool):
                 if True, profile all concrete (non-star) imports.
 
-            profiled_imports (Collection[str]):
-                list of dotted paths of imports to skip that have already been added to profiler.
+            profiled_imports \
+(Mapping[Sequence[str | int], Sequence[ImportTarget]] \
+| Collection[str] | None):
+                ``Mapping[Sequence[str | int], Sequence[ImportTarget]]``
+                    mapping from the locations of already-profiled
+                    import targets to those import targets themselves,
+                    in the same format as the return value of
+                    :py:meth:`line_profiler.autoprofile\
+.ProfmodExtractor.extract_all`.
+                ``Collection[str]``
+                    DEPRECATED; dotted paths of imports to skip that
+                    have already been added to profiler.
+                :py:const:`None`
+                    equivalent to ``{}``, i.e. no prior profiled
+                    imports.
 
             profiler_name (str):
-                the profiler name used as decorator and for the method call to add to the object
-                to the profiler.
+                the profiler name used as decorator and for the method
+                call to add to the object to the profiler.
 
             profile_star_imports (bool):
                 if this and ``profile_imports`` are True, also profile
@@ -197,12 +344,39 @@ class AstProfileTransformer(ast.NodeTransformer):
                 profile import statements residing therein.
         """
         self._profile_imports = bool(profile_imports)
-        self._profiled_imports = set(profiled_imports or ())
+        if profiled_imports is None:
+            self._duplicate_checker: _DuplicateChecker
+            self._duplicate_checker = _ContextAwareDuplicateChecker()
+        elif (
+            isinstance(profiled_imports, Mapping)
+            and all(
+                isinstance(imports, Sequence)
+                for imports in profiled_imports.values()
+            )
+        ):
+            self._duplicate_checker = _ContextAwareDuplicateChecker(cast(
+                Mapping[Sequence[str | int], Sequence[ImportTarget]],
+                profiled_imports,
+            ))
+        elif (
+            isinstance(profiled_imports, Collection)
+            and all(isinstance(imp, str) for imp in profiled_imports)
+        ):
+            profiled_imports = cast(Collection[str], profiled_imports)
+            self._duplicate_checker = _LegacyDuplicateChecker(profiled_imports)
+        else:  # nocover
+            raise TypeError(
+                f'profiled_imports = {profiled_imports!r}: '
+                'expected `Collection[str]`, '
+                '`Mapping[Sequence[str | int], Sequence[ImportTarget]]`, '
+                'or `None`',
+            )
         self._profiler_name = profiler_name
         self._profile_star_imports = profile_star_imports
         self._should_visit_imports = dict(profile_imports_in)
         self._dropped_star_imports: set[ImportTarget] = set()
-        self._current_loc: list[str] = []
+        self._current_loc: list[str | int] = []
+        self._current_node_ancestry: list[str] = []
 
     def _visit_func_def(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -238,7 +412,7 @@ class AstProfileTransformer(ast.NodeTransformer):
     def _visit_import(
         self,
         node: _Import,
-        get_import_targets: Callable[[_Import], Sequence[ImportTarget]],
+        get_import_targets: Callable[[int, _Import], Sequence[ImportTarget]],
     ) -> _Import | list[_Import | ast.Expr]:
         """
         Add a node that profiles an import. If:
@@ -257,7 +431,7 @@ class AstProfileTransformer(ast.NodeTransformer):
             node (_Import):
                 import[-from] node in the AST
             get_import_targets \
-(Callable[[_Import], Sequence[ImportTarget]]):
+(Callable[[int, _Import], Sequence[ImportTarget]]):
                 helper callable for analyzing the node
 
         Returns:
@@ -273,7 +447,7 @@ class AstProfileTransformer(ast.NodeTransformer):
         else:
             # Check if this node is nested inside compound statements
             # that we shouldn't look for imports in
-            *ancestry, _ = self._current_loc
+            *ancestry, _ = self._current_node_ancestry
             svi = self._should_visit_imports
             should_profile = all(
                 svi.get(cast(_CompoundNodeType, a_type), True)
@@ -281,14 +455,19 @@ class AstProfileTransformer(ast.NodeTransformer):
             )
 
         if not should_profile:
-            self.generic_visit(node)
+            # No need for further descent, no other node of interest can
+            # reside import[-from] nodes
             return node
 
-        this_visit = cast(_Import, self.generic_visit(node))
-        visited: list[_Import | ast.Expr] = [this_visit]
-        for target in get_import_targets(node):
-            name = target.name
-            if name in self._profiled_imports:
+        result: list[_Import | ast.Expr] = [node]
+        *_, index = self._current_loc
+        assert isinstance(index, int)
+        duplicate_checker = self._duplicate_checker
+
+        for target in get_import_targets(index, node):
+            if not duplicate_checker.should_profile_import(
+                target, self._current_loc,
+            ):
                 continue
             expr = _ast_create_node_from_import_target(
                 target, profile_star_imports=self._profile_star_imports,
@@ -296,9 +475,11 @@ class AstProfileTransformer(ast.NodeTransformer):
             if expr is None:  # Bookkeeping
                 self._dropped_star_imports.add(target)
             else:
-                self._profiled_imports.add(name)
-                visited.append(expr)
-        return visited
+                duplicate_checker.record_profiled_import(
+                    target, self._current_loc,
+                )
+                result.append(expr)
+        return result
 
     def visit_Import(
         self, node: ast.Import,
@@ -319,20 +500,7 @@ class AstProfileTransformer(ast.NodeTransformer):
                     a list containing the import node and the
                     profiling node(s)
         """
-        # Note: we don't actually care about the `ImportTarget.index`
-        # here; in fact, we're just reusing the name-resolution
-        # machinery in `ImportTarget`
-        get_targets = partial(ImportTarget._from_import_node, 0)
-        return self._visit_import(node, get_targets)
-
-    def visit(self, node: ast.AST) -> ast.AST | list[ast.AST]:
-        # Bookkeeping
-        loc = self._current_loc
-        loc.append(type(node).__name__)
-        try:
-            return super().visit(node)
-        finally:
-            loc.pop()
+        return self._visit_import(node, ImportTarget._from_import_node)
 
     def visit_ImportFrom(
         self, node: ast.ImportFrom
@@ -353,8 +521,70 @@ class AstProfileTransformer(ast.NodeTransformer):
                     a list containing the import node and the
                     profiling node(s)
         """
-        get_targets = partial(ImportTarget._from_import_from_node, 0)
-        return self._visit_import(node, get_targets)
+        return self._visit_import(node, ImportTarget._from_import_from_node)
+
+    def visit(self, node: ast.AST) -> ast.AST | list[ast.AST]:
+        """
+        :py:meth:`ast.NodeTransformer.visit` with extra bookkeeping.
+        """
+        anc = self._current_node_ancestry
+        anc.append(type(node).__name__)
+        try:
+            return super().visit(node)
+        finally:
+            anc.pop()
+
+    def generic_visit(self, node: ast.AST) -> ast.AST:
+        """
+        :py:meth:`ast.NodeTransformer.generic_visit` with extra
+        bookkeeping.
+        """
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                self._visit_generic_child(node, field, value)
+            elif isinstance(value, MutableSequence):  # Compound node
+                if not all(isinstance(item, ast.AST) for item in value):
+                    continue
+                self._visit_generic_children(
+                    node, field, cast(MutableSequence[ast.AST], value),
+                )
+        return node
+
+    def _visit_generic_child(
+        self, node: ast.AST, field: str, child: ast.AST,
+    ) -> None:
+        self._current_loc.append(field)
+        try:
+            replacement: ast.AST | list[ast.AST] = self.visit(child)
+            if isinstance(replacement, ast.AST):
+                setattr(node, field, replacement)
+            else:
+                raise RuntimeError(
+                    f'node = {node!r}: invalid field `.{field}` replacement '
+                    f'({child!r} -> {replacement!r})'
+                )
+        finally:
+            self._current_loc.pop()
+
+    def _visit_generic_children(
+        self, node: ast.AST, field: str, children: MutableSequence[ast.AST],
+    ) -> None:
+        self._current_loc.append(field)
+        try:
+            new_children: list[ast.AST] = []
+            for i, item in enumerate(children):
+                self._current_loc.append(i)
+                try:
+                    replacement = self.visit(item)
+                    if isinstance(replacement, ast.AST):
+                        new_children.append(replacement)
+                    else:
+                        new_children.extend(replacement)
+                finally:
+                    self._current_loc.pop()
+            children[:] = new_children
+        finally:
+            self._current_loc.pop()
 
     @staticmethod
     def _get_profile_imports_in(

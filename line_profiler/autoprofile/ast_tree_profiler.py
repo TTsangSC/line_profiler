@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import os
-from collections.abc import Collection, MutableSequence, Sequence
+from collections.abc import Collection, Mapping, MutableSequence, Sequence
 from typing import Any, cast
 
 from ._import_targets import ImportTarget
@@ -122,8 +123,8 @@ class AstTreeProfiler:
     def _profile_ast_tree(
         self,
         tree: ast.Module,
-        tree_imports_to_profile_dict: dict[
-            tuple[str | int, ...], list[ImportTarget]
+        tree_imports_to_profile_dict: Mapping[
+            tuple[str | int, ...], Sequence[ImportTarget]
         ],
         profile_full_script: bool = False,
         profile_imports: bool = False,
@@ -146,14 +147,14 @@ class AstTreeProfiler:
             tree (_ast.Module):
                 abstract syntax tree to be profiled.
 
-            tree_imports_to_profile_dict (dict[tuple[str | int, ...], \
-list[ImportTarget]]):
+            tree_imports_to_profile_dict \
+(Mapping[tuple[str | int, ...], Sequence[ImportTarget]]):
                 dict of imports to profile
                     key (tuple[str | int, ...]):
                         Location of import in AST, e.g. ``('body', 0)``
                         for the case where it is the first statement in
                         the :py:attr:`ast.Module.body`
-                    value (list[ImportTarget]):
+                    value (Sequence[ImportTarget]):
                         list of import targets (see the documentation of
                         :py:class:`line_profiler.autoprofile\
 .profmod_extractor.ImportTarget`)
@@ -180,12 +181,14 @@ list[ImportTarget]]):
             (_ast.Module): tree
                 abstract syntax tree with profiling.
         """
-        profiled_imports = []
+        profiled_imports: dict[tuple[str | int, ...], list[ImportTarget]] = {}
         argsort_tree_indexes = sorted(
-            list(tree_imports_to_profile_dict), reverse=True
+            tree_imports_to_profile_dict, reverse=True,
         )
         for tree_loc in argsort_tree_indexes:
             imports = tree_imports_to_profile_dict[tree_loc]
+            # Also handle bookkeeping tasks
+            updated_imports = profiled_imports[tree_loc] = []
             *loc, tree_index = tree_loc
             assert isinstance(tree_index, int)
             body = cast(MutableSequence[ast.AST], self._descend(tree, loc))
@@ -196,9 +199,16 @@ list[ImportTarget]]):
                 expr = _ast_create_node_from_import_target(
                     imp, modnames_to_profile, profile_star_imports,
                 )
-                if expr is not None:
-                    body.insert(tree_index + 1, expr)
-                    profiled_imports.append(imp.name)
+                if expr is None:
+                    continue
+                body.insert(tree_index + 1, expr)
+                # Bookkeeping: make sure that we're keeping track of
+                # the updated locations of the import targets
+                updated_imports[:] = [
+                    dataclasses.replace(imp, index=imp.index + 1)
+                    for imp in updated_imports
+                ]
+                updated_imports.insert(0, imp)
         if profile_full_script:
             tree = self._ast_transformer_class_handler._transform(
                 tree, self._script_file,

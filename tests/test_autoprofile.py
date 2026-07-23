@@ -1906,7 +1906,6 @@ def test_import_discovery_in_all_compound_statements(
                 ast.parse(test_case),
                 case_fname,
                 profile_imports=True,
-                profiled_imports=[],
                 config=config,
             )
         output = ast.unparse(module_ast)
@@ -1926,18 +1925,30 @@ def test_import_discovery_in_all_compound_statements(
         # Nothing special happens when calling `first()` and `second()`,
         # there's only a single import target (`textwrap.indent`) inside
         # the function
+        ('first', 'profmod_extractor', ['indent']),
         ('first', 'ast_tree_profiler', ['indent']),
         ('first', 'ast_profile_transformer', ['indent']),
+        ('second', 'profmod_extractor', ['indent']),
         ('second', 'ast_tree_profiler', ['indent']),
         ('second', 'ast_profile_transformer', ['indent']),
-        # With `third()`, because `textwrap.dedent()` is also imported,
-        # it is also profiled when using `AstProfileTransformer`
-        ('third', 'ast_tree_profiler', ['indent']),
+        # With `third()`, because `textwrap.dedent()` is also imported:
+        ('third', 'profmod_extractor', ['indent']),
+        # - When using `AstTreeProfiler`, `ProfmodExtractor` first
+        #   inserts a profiling node for `indent()`, then followed by
+        #   another for `dedent()` inserted by `AstProfileTransformer`;
+        #   since the profiling node for `dedent()` is created later, it
+        #   is inserted bewteen the import statement and the profiling
+        #   node for `indent()`, and is hence executed first
+        ('third', 'ast_tree_profiler', ['dedent', 'indent']),
+        # - When using `AstProfileTransformer`, profiling nodes are
+        #   inserted for both `indent()` and `dedent()` in one go
         ('third', 'ast_profile_transformer', ['indent', 'dedent']),
     ])
 def test_nested_imports_correct_deduplication_across_scopes(
     call: Literal['first', 'second', 'third'],
-    use_component: Literal['ast_tree_profiler', 'ast_profile_transformer'],
+    use_component: Literal[
+        'profmod_extractor', 'ast_tree_profiler', 'ast_profile_transformer',
+    ],
     expected_profiled_objects: Sequence[Literal['indent', 'dedent']],
 ) -> None:
     """
@@ -1991,21 +2002,27 @@ def test_nested_imports_correct_deduplication_across_scopes(
             print(_get_toml_import_discovery_section(), file=fobj)
 
         config = ConfigSource.from_config(cfg_fname)
-        if use_component == 'ast_tree_profiler':
+        if use_component == 'profmod_extractor':
             # Ditto comment in
             # `test_import_discovery_in_all_compound_statements()`
             mod_ast = AstTreeProfiler(
                 mod_fname, ['textwrap.indent'], False,
                 config=config,
             ).profile()
-        else:
+        elif use_component == 'ast_tree_profiler':
+            # Integration of both
+            mod_ast = AstTreeProfiler(
+                mod_fname, ['textwrap.indent', str(mod_fname)], True,
+                config=config,
+            ).profile()
+        else:  # `ast_profile_transformer`
             mod_ast = AstProfileTransformer._transform(
                 ast.parse(test_module),
                 mod_fname,
                 profile_imports=True,
-                profiled_imports=[],
                 config=config,
             )
+            # We need this to actually compile and exec the code
             mod_ast = ast.fix_missing_locations(mod_ast)
         print(ast.unparse(mod_ast))
 
@@ -2019,3 +2036,88 @@ def test_nested_imports_correct_deduplication_across_scopes(
     assert namespace[call]() == '  ' + call
     profiled_objects = [func.__name__ for func in mock_prof.profiled_objects]
     assert profiled_objects == list(expected_profiled_objects)
+
+
+@pytest.mark.parametrize(
+    ('definitions', 'expected'),
+    [
+        # The profiling statement is always inserted into the first
+        # function body where the import occurs...
+        (['foo'], {'indent'}), (['bar'], {'ind'}),
+        # ... but only the first
+        (['foo', 'bar'], {'indent'}), (['bar', 'foo'], {'ind'}),
+    ])
+def test_ast_profile_transformer_deprecated_profiled_imports(
+    definitions: Sequence[Literal['foo', 'bar']],
+    expected: Collection[Literal['indent', 'ind']],
+) -> None:
+    """
+    Test that the legacy invocation of
+    :py:class:`.AstProfileTransformer` with
+    ``profiled_imports: Collection[str]`` works "as expected":
+
+    - :py:class:`DeprecationWarning` is issued, instructing users to
+      switch to the mapping form of the argument.
+
+    - Deduplication of imports happens without regard of scopes.
+
+    See also:
+        :py:func:\
+`test_nested_imports_correct_deduplication_across_scopes`
+    """
+    defs = {
+        'foo': """
+        def foo() -> str:
+            from textwrap import indent
+
+            return indent('foo', '  ')
+        """,
+        'bar': """
+        def bar() -> str:
+            from textwrap import indent as ind
+
+            return ind('bar', '  ')
+        """,
+    }
+    test_module = '\n\n'.join(
+        ub.codeblock(defs[func]).strip('\n') for func in definitions
+    )
+
+    with contextlib.ExitStack() as stack:
+        tmp = stack.enter_context(tempfile.TemporaryDirectory())
+
+        mod_fname = os.path.join(tmp, 'test_module.py')
+        with open(mod_fname, 'w') as fobj:
+            print(test_module, file=fobj)
+
+        cfg_fname = os.path.join(tmp, 'config.toml')
+        with open(cfg_fname, 'w') as fobj:
+            print(_get_toml_import_discovery_section(), file=fobj)
+
+        stack.enter_context(pytest.warns(
+            DeprecationWarning,
+            match='.*'.join(
+                '{}{}{}'.format(
+                    r'\b' if chunk[0].isalnum() else '',
+                    chunk,
+                    r'\b' if chunk[-1].isalnum() else '',
+                )
+                for chunk in [
+                    'profiled_imports=', r'Collection\[str\]', 'deprecated',
+                    'use', r'Mapping\[.+, .+\]', 'or', 'None',
+                ]
+            )
+        ))
+
+        config = ConfigSource.from_config(cfg_fname)
+        mod_ast = AstProfileTransformer._transform(
+            ast.parse(test_module),
+            mod_fname,
+            profile_imports=True,
+            profiled_imports=[],  # This triggers legacy behavior
+            config=config,
+        )
+        output = ast.unparse(mod_ast)
+        print(output)
+
+    assert set(_grep_profiled_names(output)) == set(expected)
