@@ -6,6 +6,7 @@ from collections.abc import MutableSequence, Sequence
 from typing import Any
 
 from ._import_targets import ImportTarget
+from ..toml_config import ConfigSource
 from .ast_profile_transformer import (
     AstProfileTransformer,
     ast_create_profile_node,
@@ -29,7 +30,7 @@ class AstTreeProfiler:
     def __init__(
         self,
         script_file: str,
-        prof_mod: list[str],
+        prof_mod: Sequence[str],
         profile_imports: bool,
         ast_transformer_class_handler: (
             type[AstProfileTransformer]
@@ -37,6 +38,7 @@ class AstTreeProfiler:
         profmod_extractor_class_handler: (
             type[ProfmodExtractor]
         ) = ProfmodExtractor,
+        config: ConfigSource | None = None,
     ) -> None:
         """Initializes the AST tree profiler instance with the script file path
 
@@ -57,16 +59,21 @@ class AstTreeProfiler:
 
             profmod_extractor_class_handler (type[ProfmodExtractor]):
                 the ProfmodExtractor class that handles mapping prof_mod to objects in the script.
+
+            config (ConfigSource | None):
+                optional :py:class:`.ConfigSource` to load additional
+                configurations from.
         """
         self._script_file = script_file
         self._prof_mod = prof_mod
         self._profile_imports = profile_imports
         self._ast_transformer_class_handler = ast_transformer_class_handler
         self._profmod_extractor_class_handler = profmod_extractor_class_handler
+        self._config = config
 
     @staticmethod
     def _check_profile_full_script(
-        script_file: str, prof_mod: list[str]
+        script_file: str, prof_mod: Sequence[str],
     ) -> bool:
         """Check whether whole script should be profiled.
 
@@ -77,13 +84,13 @@ class AstTreeProfiler:
             script_file (str):
                 path to script being profiled.
 
-            prof_mod (List[str]):
+            prof_mod (Sequence[str]):
                 list of imports to profile in script.
                 passing the path to script will profile the whole script.
                 the objects can be specified using its dotted path or full path (if applicable).
 
         Returns:
-            (bool): profile_full_script
+            profile_full_script (bool):
                 if True, profile whole script.
         """
         script_file_realpath = os.path.realpath(script_file)
@@ -207,7 +214,7 @@ list[ImportTarget]]):
         tree = self._get_script_ast_tree(self._script_file)
 
         tree_imports_to_profile_dict = self._profmod_extractor_class_handler(
-            tree, self._script_file, self._prof_mod
+            tree, self._script_file, self._prof_mod, self._config,
         ).extract_all()
         tree_profiled = self._profile_ast_tree(
             tree,

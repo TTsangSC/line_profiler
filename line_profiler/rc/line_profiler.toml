@@ -206,3 +206,38 @@ hits = 9
 time = 12
 perhit = 8
 percent = 8
+
+# `line_profiler.autoprofile.profmod_extractor.ProfmodExtractor`
+# selective import-profiling options
+
+# Note:
+# - When using `preimports = true`, the `prof-mod` names are always
+#   profiled.
+# - Otherwise, if the file-/module-path of the profiled code is itself
+#   among the `prof-mod` names, its imports are ALWAYS profiled.
+# - Else, imports are selectively discovered from the AST of the
+#   profiled code, and import targets specifically matching the
+#   `prof-mod` names are profiled. Import discovery is dictated by the
+#   following options:
+#   - If the option corresponding to a language construction is `false`,
+#     we won't descend therein to look for imports.
+#   - If all these options are set to false, only raw (from-)import
+#     statements on the top level of the profiled code will be checked.
+
+[tool.line_profiler.prof_mod_import_discovery]
+
+# - `conditionals` (bool):
+#   Whether to look into `if-elif-else` and `match-case` statements.
+conditionals = true
+# - `try_except` (bool):
+#   Whether to look into `try-except-else-finally` statements.
+try_except = true
+# - `contexts` (bool):
+#   Whether to look into `[async] with` statements.
+contexts = true
+# - `loops` (bool):
+#   Whether to look into `[async] for-else` and `while-else` statements.
+loops = true
+# - `definitions` (bool):
+#   Whether to look into `[async] def` and `class` statements.
+definitions = false

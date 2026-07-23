@@ -4,9 +4,10 @@ import ast
 import contextlib
 import os
 import re
+import shlex
 import subprocess
 import sys
-import shlex
+import textwrap
 import tempfile
 from collections.abc import Collection, Sequence
 from typing import Any, ClassVar, Literal
@@ -14,6 +15,7 @@ from warnings import catch_warnings, WarningMessage
 
 import pytest
 import ubelt as ub
+from line_profiler.toml_config import ConfigSource
 from line_profiler.autoprofile.ast_tree_profiler import AstTreeProfiler
 from line_profiler.autoprofile.profmod_extractor import ProfmodExtractor
 
@@ -1550,3 +1552,117 @@ def test_handle_star_imports(
     output_module = ast.unparse(module_ast)
     for pattern, expected in re_checks:
         assert bool(re.search(pattern, output_module)) == expected
+
+
+@pytest.mark.parametrize(
+    ('prof_mod', 'expected', 'options'),
+    [(['qux', 'quux'], {'qux.jam', 'spam', 'ham', 'eggs'}, {'conditionals'}),
+     (['os', 'qux'], {'qux.jam'}, {'conditionals'}),
+     (['os', 'qux'], {'fork', 'register_at_fork'}, {'try_except'}),
+     (['foobar'], {'baz'}, {'try_except', 'contexts'}),
+     (['ersatz_foobar.my_baz'], {'baz'}, {'try_except', 'contexts'}),
+     (['os.fork', 'foobar.bar'], {'fork'}, {'try_except', 'contexts'}),
+     (['backup_fred', 'operator'], {'methodcaller', 'setitem'},
+      {'definitions'}),
+     (['backup_fred', 'operator'], {'fred'}, {'loops'})],
+)
+def test_nested_import_discovery(
+    prof_mod: list[str],
+    expected: set[str],
+    options: set[Literal[
+        'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
+    ]],
+) -> None:
+    """
+    Check the source code transformed by :py:class:`.AstTreeProfiler` to
+    see if the import-discovery selection options in the TOML file
+    (``[tool.line_profiler.prof_mod_import_discovery]``) are handled
+    correctly.
+    """
+    test_module = ub.codeblock("""
+    from collections.abc import Generator
+    from contextlib import contextmanager
+    from functools import partial
+    from importlib import import_module
+    from sys import path, version_info
+
+    notify_fork = partial(print, 'Forking...')
+    try:
+        from os import fork
+    except Exception:  # Windows
+        pass
+    else:
+        from os import register_at_fork
+
+        register_at_fork(before=notify_fork)
+
+    import foo, bar
+
+    if version_info > (3, 14):
+        import qux.jam
+        from quux import spam, ham, eggs
+    else:
+        qux = ham = spam = eggs = None
+
+
+    @contextmanager
+    def _restore_sys_path() -> Generator[None, None, None]:
+        from operator import methodcaller, setitem
+
+        old = methodcaller('copy')(path)
+        try:
+            yield
+        finally:
+            setitem(path, slice(None), old)
+
+
+    with _restore_sys_path():
+        try:
+            from foobar import baz
+        except ImportError:
+            from ersatz_foobar import my_baz as baz
+
+
+    for _fred in 'fred', 'some_fred', 'other_fred':
+        try:
+            fred = import_module(_fred)
+        except ImportError:
+            continue
+        else:
+            del _fred
+            break
+    else:  # Fallback
+        import backup_fred as fred
+    """).strip('\n')
+
+    config_file_lines = ['[tool.line_profiler.prof_mod_import_discovery]']
+    for option in [
+        'conditionals', 'try_except', 'contexts', 'loops', 'definitions',
+    ]:
+        line = f'{option} = {str(option in options).lower()}'
+        config_file_lines.append(line)
+    config_file = '\n'.join(config_file_lines)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mod_fname = os.path.join(tmp, 'test_module.py')
+        with open(mod_fname, 'w') as fobj:
+            print(test_module, file=fobj)
+
+        cfg_fname = os.path.join(tmp, 'config.toml')
+        with open(cfg_fname, 'w') as fobj:
+            print(config_file, file=fobj)
+
+        config = ConfigSource.from_config(cfg_fname)
+        atp = AstTreeProfiler(mod_fname, prof_mod, False, config=config)
+        output_module = ast.unparse(atp.profile())
+
+    for label, module_text in [
+        ('input', test_module), ('output', output_module),
+    ]:
+        print(f'{label.capitalize()}:\n{textwrap.indent(module_text, "  ")}\n')
+
+    prof_pattern = (
+        r'\badd_imported_function_or_module\((\w+(?:\.\w+)*)\)'
+    )
+    profiled_names = re.findall(prof_pattern, output_module)
+    assert set(profiled_names) == expected

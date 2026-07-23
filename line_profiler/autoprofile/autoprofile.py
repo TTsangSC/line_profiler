@@ -47,11 +47,13 @@ profiles it with autoprofile.
 
 from __future__ import annotations
 import importlib.util
+import os
 import sys
 import types
 from collections.abc import MutableMapping
-from typing import Any, cast, Dict, Mapping
-from typing import ContextManager
+from typing import Any, cast
+
+from ..toml_config import ConfigSource
 from ..line_profiler_utils import restore
 from .ast_tree_profiler import AstTreeProfiler
 from .run_module import AstTreeModuleProfiler
@@ -84,6 +86,7 @@ def run(
     prof_mod: list[str],
     profile_imports: bool = False,
     as_module: bool = False,
+    config: os.PathLike[str] | str | None = None,
 ) -> None:
     """Automatically profile a script and run it.
 
@@ -106,7 +109,10 @@ def run(
             if True, when auto-profiling whole script, profile all imports aswell.
 
         as_module (bool):
-            Whether we're running script_file as a module
+            whether we're running script_file as a module
+
+        config (os.PathLike[str] | str | None):
+            optional path to load the session config from
     """
     Profiler: type[AstTreeModuleProfiler] | type[AstTreeProfiler]
 
@@ -128,7 +134,10 @@ def run(
     namespace: MutableMapping[str, Any] = vars(module_obj)
     namespace.update(ns)
 
-    profiler = Profiler(script_file, prof_mod, profile_imports)
+    profiler = Profiler(
+        script_file, prof_mod, profile_imports,
+        config=ConfigSource.from_config(config),
+    )
     tree_profiled = profiler.profile()
 
     _extend_line_profiler_for_profiling_imports(ns[PROFILER_LOCALS_NAME])
@@ -138,4 +147,8 @@ def run(
         # then restore it via the context manager, so that the executed
         # code is run as `__main__`
         sys.modules['__main__'] = module_obj
-        exec(code_obj, cast(Dict[str, Any], namespace), namespace)  # type: ignore[redundant-cast]
+        exec(
+            code_obj,
+            cast('dict[str, Any]', namespace),  # type: ignore[ty:redundant-cast]
+            namespace,
+        )

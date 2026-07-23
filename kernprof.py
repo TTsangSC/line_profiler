@@ -1242,6 +1242,7 @@ def _main_profile(options, module=False, exit_on_error=True):
                 prof_mod=options.prof_mod,
                 profile_imports=options.prof_imports,
                 as_module=module is not None,
+                config=options.config,
             )
         else:
             # Note: to reduce complications (e.g. whenever something
