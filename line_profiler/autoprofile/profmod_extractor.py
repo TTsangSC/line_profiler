@@ -163,7 +163,7 @@ class _ImportFinder(ast.NodeVisitor):
     def _get_filter_args(config: ConfigSource) -> dict[str, bool]:
         cfg = (
             config
-            .get_subconfig('prof_mod_import_discovery')
+            .get_subconfig('autoprofile', 'import_discovery')
             .conf_dict
         )
         return {
@@ -411,7 +411,7 @@ class ProfmodExtractor:
         return filtered_imports
 
     def extract_all(
-        self, filter_star_imports: bool = True,
+        self, filter_star_imports: bool | None = None,
     ) -> dict[tuple[str | int, ...], list[ImportTarget]]:
         """
         Map ``prof_mod`` to imports in an abstract syntax tree.
@@ -420,9 +420,11 @@ class ProfmodExtractor:
         aliases and the location they appear in the AST.
 
         Args:
-            filter_star_imports (bool):
+            filter_star_imports (bool | None):
                 If true, filter out star imports
-                (``from <module> import *``) with a warning.
+                (``from <module> import *``) with a warning;
+                if :py:const:`None`, it is loaded from the ``config``
+                (as the negation of `autoprofile.prof_star_imports`).
 
         Returns:
             tree_imports_to_profile_dict \
@@ -452,6 +454,10 @@ class ProfmodExtractor:
                             the namespace (should never be
                             :py:const`None` for non-star-imports)
         """
+        if filter_star_imports is None:
+            filter_star_imports = not _should_profile_star_imports(
+                self._config,
+            )
         import_targets = self._ast_get_imports_from_tree(
             self._tree, self._config,
         )
@@ -573,3 +579,10 @@ def _should_profile(targets: Collection[str], modname: str) -> bool:
     """
     names = {modname, modname.rsplit('.', 1)[0]}
     return bool(names.intersection(targets))
+
+
+def _should_profile_star_imports(config: ConfigSource | None) -> bool:
+    if config is None:
+        config = ConfigSource.from_default()
+    kvps = config.get_subconfig('autoprofile').conf_dict
+    return bool(kvps['prof_star_imports'])

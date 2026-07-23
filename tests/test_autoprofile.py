@@ -1513,7 +1513,7 @@ def _get_toml_import_discovery_section(
     all_options = set(get_args(_ImportDiscoveryOption))
     if options is None:
         options = all_options
-    config_file_lines = ['[tool.line_profiler.prof_mod_import_discovery]']
+    config_file_lines = ['[tool.line_profiler.autoprofile.import_discovery]']
     for option in all_options:
         line = f'{option} = {str(option in options).lower()}'
         config_file_lines.append(line)
@@ -1617,7 +1617,7 @@ def test_nested_import_discovery(
     """
     Check the source code transformed by :py:class:`.AstTreeProfiler` to
     see if the import-discovery selection options in the TOML file
-    (``[tool.line_profiler.prof_mod_import_discovery]``) are handled
+    (``[tool.line_profiler.autoprofile.import_discovery]``) are handled
     correctly in a real-ish script, with some of the compound statements
     hosting the import statements nested inside other coumpound
     statements.

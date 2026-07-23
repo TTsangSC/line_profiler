@@ -13,7 +13,7 @@ from .ast_profile_transformer import (  # noqa: F401
     # Keep import below for compatibility
     ast_create_profile_node,
 )
-from .profmod_extractor import ProfmodExtractor
+from .profmod_extractor import ProfmodExtractor, _should_profile_star_imports
 
 __docstubs__ = """
 from .ast_profile_transformer import AstProfileTransformer
@@ -208,7 +208,7 @@ list[ImportTarget]]):
         ast.fix_missing_locations(tree)
         return tree
 
-    def profile(self, profile_star_imports: bool = False) -> ast.Module:
+    def profile(self, profile_star_imports: bool | None = None) -> ast.Module:
         """
         Create an abstract syntax tree of a script and add profiling to
         it:
@@ -229,14 +229,19 @@ list[ImportTarget]]):
           profiler.
 
         Args:
-            profile_star_imports (bool):
+            profile_star_imports (bool | None):
                 if True, add targets imported by ``from ... import *``
-                statements to the profiler.
+                statements to the profiler;
+                if :py:const:`None`, it is loaded from the ``config``
+                (from `autoprofile.prof_star_imports`).
 
         Returns:
             (_ast.Module): tree
                 abstract syntax tree with profiling.
         """
+        if profile_star_imports is None:
+            profile_star_imports = _should_profile_star_imports(self._config)
+
         profile_full_script = self._check_profile_full_script(
             self._script_file, self._prof_mod
         )
