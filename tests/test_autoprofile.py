@@ -9,7 +9,7 @@ import sys
 import shlex
 import tempfile
 from collections.abc import Collection, Sequence
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from warnings import catch_warnings, WarningMessage
 
 import pytest
@@ -1538,6 +1538,10 @@ def test_handle_star_imports(
         warnings = stack.enter_context(catch_warnings(record=True))
         rewriter = AstTreeProfiler(str(fpath), prof_mod, profile_imports)
         module_ast = rewriter.profile()
+
+    # Check that we no longer get a `SyntaxError` from
+    # `add_imported_function_or_module(*)`
+    compile(module_ast, str(fpath), 'exec')
 
     # Check the issuance of warnings related to star-imports
     _check_warnings(warnings, warning_checks)
