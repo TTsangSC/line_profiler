@@ -94,6 +94,9 @@ preimports = true
 #   - `prof-imports` (bool):
 #     `--prof-imports` (true) or `--no-prof-imports` (false)
 prof-imports = false
+#   - `prof-star-imports` (bool):
+#     `--prof-star-imports` (true) or `--no-prof-star-imports` (false)
+prof-star-imports = false
 
 # - Misc flags
 #   - `verbose` (count):
@@ -123,6 +126,13 @@ output-interval = 0
 #     functions, or classes) to be profiled if imported in the profiled
 #     script/module
 prof-mod = []
+#   - `prof-nested-imports`
+#     (list[Literal['conditionals', 'try_except', 'contexts', 'loops',
+#                   'func_defs', 'class_defs']]):
+#     `--prof-nested-imports`: categories of compound statements in
+#     which to search for and profile imports; see also
+#     `[tool.line_profiler.autoprofile.import_discovery]`
+prof-nested-imports = ['conditionals', 'try_except', 'contexts', 'class_defs']
 
 # `python -m line_profiler` options
 
