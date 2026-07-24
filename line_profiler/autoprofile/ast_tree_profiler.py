@@ -6,7 +6,7 @@ import os
 from collections.abc import Collection, Mapping, MutableSequence, Sequence
 from typing import Any, cast
 
-from ._import_targets import ImportTarget
+from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ..toml_config import ConfigSource
 from .ast_profile_transformer import (  # noqa: F401
     AstProfileTransformer,
@@ -193,6 +193,7 @@ class AstTreeProfiler:
                 abstract syntax tree with profiling.
         """
         profiled_imports: dict[tuple[str | int, ...], list[ImportTarget]] = {}
+        dropped_star_imports: set[ImportTarget] = set()
         argsort_tree_indexes = sorted(
             tree_imports_to_profile_dict, reverse=True,
         )
@@ -204,6 +205,7 @@ class AstTreeProfiler:
             assert isinstance(tree_index, int)
             body = cast(MutableSequence[ast.AST], self._descend(tree, loc))
             assert isinstance(body, MutableSequence)
+            local_dropped_star_imports: set[ImportTarget] = set()
             for imp in reversed(imports):
                 # Reversing keeps the order of the inserted nodes
                 # consistent with the imports
@@ -211,6 +213,7 @@ class AstTreeProfiler:
                     imp, modnames_to_profile, profile_star_imports,
                 )
                 if expr is None:
+                    local_dropped_star_imports.add(imp)
                     continue
                 body.insert(tree_index + 1, expr)
                 # Bookkeeping: make sure that we're keeping track of
@@ -219,7 +222,21 @@ class AstTreeProfiler:
                     dataclasses.replace(imp, index=imp.index + 1)
                     for imp in updated_imports
                 ]
+                local_dropped_star_imports = {
+                    dataclasses.replace(imp, index=imp.index + 1)
+                    for imp in local_dropped_star_imports
+                }
                 updated_imports.insert(0, imp)
+            dropped_star_imports.update(local_dropped_star_imports)
+        ImportTarget._check_and_warn_dropped_imports(
+            dropped_star_imports,
+            _DROPPED_STAR_IMPORTS_MSG_TEMPLATE.format(
+                action='profiled',
+                argname='profile_star_imports',
+            ),
+            self._script_file,
+            stacklevel=2,  # Attribute warning to the caller
+        )
         if profile_full_script:
             tree = self._ast_transformer_class_handler._transform(
                 tree, self._script_file,
@@ -227,6 +244,9 @@ class AstTreeProfiler:
                 profiled_imports=profiled_imports,
                 profile_star_imports=profile_star_imports,
                 profile_nested_imports=profile_nested_imports,
+                # Don't double-warn on import targets that we already
+                # know should be dropped
+                _known_dropped_star_imports=dropped_star_imports,
                 config=self._config,
             )
         ast.fix_missing_locations(tree)
@@ -285,24 +305,14 @@ class AstTreeProfiler:
 
         tree = self._get_script_ast_tree(self._script_file)
 
-        # Note: warnings about dropped star-imports can be issued from 2
-        # places:
-        # - `ProfmodExtractor.extract_all(filter_star_imports=True)`
-        # - `._profile_ast_tree(...), where both
-        #   `profile_full_script=True` and `profile_imports=True`
-        # So take care to enture that we don't have duplicate warnings
+        # Note: we always call `ProfmodExtractor.extract_all()` with
+        # `filter_star_imports` so as not to issue a warning there;
+        # `._profile_ast_tree()` will handle those
         extractor = self._profmod_extractor_class_handler(
             tree, self._script_file, self._prof_mod, config=self._config,
         )
-        if profile_star_imports:
-            # Star imports recovered -> nothing to warn either way
-            filter_star_imports_in_extract_all = False
-        else:
-            filter_star_imports_in_extract_all = not (
-                profile_full_script and self._profile_imports
-            )
         tree_imports_to_profile_dict = extractor.extract_all(
-            filter_star_imports=filter_star_imports_in_extract_all,
+            filter_star_imports=False,
             find_nested_imports=profile_nested_imports,
         )
 

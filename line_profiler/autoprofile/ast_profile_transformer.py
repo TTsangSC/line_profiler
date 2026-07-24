@@ -11,7 +11,7 @@ from warnings import warn
 
 from .. import _diagnostics as diagnostics
 from ..toml_config import ConfigSource
-from ._import_targets import ImportTarget
+from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from .profmod_extractor import (
     _CompoundNodeType, _CompoundStatement, _ImportFinder,
     _should_profile_star_imports,
@@ -609,6 +609,7 @@ class AstProfileTransformer(ast.NodeTransformer):
         config: ConfigSource | None = None,
         profile_star_imports: bool | None = None,
         profile_nested_imports: Collection[_CompoundStatement] | None = None,
+        _known_dropped_star_imports: Collection[ImportTarget] | None = None,
         **kwargs,
     ) -> ast.Module:
         """
@@ -661,9 +662,18 @@ class AstProfileTransformer(ast.NodeTransformer):
         try:
             return cast(ast.Module, transformer.visit(node))
         finally:
+            if _known_dropped_star_imports:
+                # Don't double-warn on import targets that we already
+                # know should be dropped
+                dropped_star_imports.difference_update(
+                    _known_dropped_star_imports,
+                )
             ImportTarget._check_and_warn_dropped_imports(
                 dropped_star_imports,
-                "we don't currently handle `from ... import *` statements",
+                _DROPPED_STAR_IMPORTS_MSG_TEMPLATE.format(
+                    action='profiled',
+                    argname='profile_star_imports',
+                ),
                 filename,
                 stacklevel=2,  # Attribute warning to the caller
             )

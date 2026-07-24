@@ -24,6 +24,7 @@ from line_profiler.autoprofile.ast_profile_transformer import (
 from line_profiler.autoprofile.ast_tree_profiler import AstTreeProfiler
 from line_profiler.autoprofile.line_profiler_utils import add_star_import
 from line_profiler.autoprofile.profmod_extractor import ProfmodExtractor
+from line_profiler.line_profiler import LineStats
 
 
 def test_single_function_autoprofile():
@@ -1216,6 +1217,159 @@ def test_autoprofile_callable_wrapper_objects(prof_mod, profiled_funcs):
 
 
 @pytest.mark.parametrize(
+    ('prof_mod', 'prof_imports',
+     'expected_profiled_funcs', 'expected_output', 'expect_warning',
+     'script_args'),
+    [
+        # When no `--prof-mod` targets are supplied, the imported module
+        # is profiled iff `--prof-imports` and `--prof-star-imports`,
+        # and the profiling hook is inserted by `AstProfileTransformer`
+        ([], True, ['make_unnumbered_list', 'make_numbered_list'],
+         '* 1\n* 2\n* 3', True, ['1', '2', '3']),
+        ([], False, [], '* 1\n* 2\n* 3', False, ['1', '2', '3']),
+        # With an appropriate `--prof-mod`, the target is profiled if
+        # `--prof-star-imports`; the profiling hook is inserted by
+        # `AstTreeProfiler` using `ProfmodExtractor.extract_all()`
+        (['__module__.make_numbered_list', '__module__.bad_target'], False,
+         ['make_numbered_list'], '1. a\n2. b\n3. c', True,
+         ['-n', 'a', 'b', 'c']),
+        (['__module__', 'bad_module'], False,
+         ['make_unnumbered_list', 'make_numbered_list'],
+         '1. a\n2. b\n3. c', True, ['-n', 'a', 'b', 'c']),
+        (['bad_module'], False, [],
+         '1. a\n2. b\n3. c', False, ['-n', 'a', 'b', 'c']),
+    ])
+def test_autoprofile_star_imports(
+    prof_mod: Sequence[str],
+    prof_imports: bool,
+    expected_profiled_funcs: Collection[
+        Literal['make_unnumbered_list', 'make_numbered_list']
+    ],
+    expected_output: str,
+    expect_warning: bool,
+    script_args: Sequence[str],
+) -> None:
+    """
+    Test that the ``--prof-star-imports`` CLI flag in :py:mod:`kernprof`
+    works as intended.
+    """
+    module_name = next(_propose_module_names())
+    imported_module = ub.codeblock(r"""
+    from __future__ import annotations
+
+    from collections.abc import Sequence
+    from textwrap import indent
+    from typing import Any
+
+
+    __all__ = ('make_unnumbered_list', 'make_numbered_list')
+
+
+    def make_unnumbered_list(items: Sequence[Any], bullet: str = '*') -> str:
+        return indent('\n'.join(str(item) for item in items), bullet + ' ')
+
+
+    def make_numbered_list(items: Sequence[Any]) -> str:
+        width = len(str(len(items)))
+        return '\n'.join(
+            f'{index:>{width}}. {item}' for index, item in enumerate(items, 1)
+        )
+    """).strip('\n')
+    test_code = ub.codeblock(f"""
+    from __future__ import annotations
+
+    from argparse import ArgumentParser
+    from collections.abc import Callable, Sequence
+    from typing import Any
+
+    from {module_name} import *
+
+
+    def main(args: Sequence[str] | None = None) -> None:
+        parser = ArgumentParser()
+        parser.add_argument('-n', '--numbered', action='store_true')
+        parser.add_argument('args', nargs='+')
+        arguments = parser.parse_args(args)
+        if arguments.numbered:
+            func: Callable[[Sequence[Any]], str] = make_numbered_list
+        else:
+            func = make_unnumbered_list
+        print(func(arguments.args))
+
+
+    if __name__ == '__main__':
+        main()
+    """).strip('\n')
+
+    cmd = [sys.executable, '-m', 'kernprof']
+    kernprof_options = ['-lzv', '--no-preimports']
+    script_options = ['-c', test_code, *script_args]
+    if prof_imports:
+        kernprof_options.append('--prof-imports')
+    if prof_mod:
+        prof_mod = [
+            target.replace('__module__', module_name) for target in prof_mod
+        ]
+        kernprof_options.extend(['--prof-mod', ','.join(prof_mod)])
+
+    with contextlib.ExitStack() as stack:
+        tmp = ub.Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        python_path = tmp / 'python-path'
+        python_path.mkdir()
+        (python_path / (module_name + '.py')).write_text(imported_module)
+        stats_path = tmp / 'out.lprof'
+
+        kernprof_options.extend(['--outfile', str(stats_path)])
+
+        mp = stack.enter_context(pytest.MonkeyPatch.context())
+        mp.syspath_prepend(str(python_path))
+        mp.setenv('PYTHONPATH', str(python_path), prepend=os.pathsep)
+
+        # For convenience, instead of using parametrization for the
+        # presence of the `--prof-star-imports` flag, just test both
+        # cases in a loop;
+        # the supplied `expected_profiled_funcs` is an upper bound, and
+        # those two functions are never profiled if the option is false
+        for prof_star_imports, expected_funcs in [
+            (True, expected_profiled_funcs), (False, []),
+        ]:
+            kp_options = kernprof_options.copy()
+            if prof_star_imports:
+                kp_options.append('--prof-star-imports')
+            else:
+                kp_options.append('--no-prof-star-imports')
+            proc = ub.cmd(
+                cmd + kp_options + script_options, check=True, verbose=2,
+            )
+            assert isinstance(proc.stdout, str)
+            # `-c` code always profiled
+            assert expected_output in proc.stdout
+            assert 'def main' in proc.stdout
+
+            if not prof_star_imports:  # Warning may be issued
+                streams = [proc.stdout]
+                if isinstance(proc.stderr, str):
+                    streams.append(proc.stderr)
+
+                warning = (
+                    'UserWarning:.* 1 .* target.* dropped.* '
+                    r'star-imports .*\bnot profiled'
+                )
+                assert (
+                    any(re.search(warning, stream) for stream in streams)
+                    == expect_warning
+                )
+
+            assert stats_path.exists()
+            stats = LineStats.from_files(stats_path)
+            stats_path.unlink()
+
+            func_names = {func for *_, func in stats.timings}
+            for func in 'make_unnumbered_list', 'make_numbered_list':
+                assert (func in func_names) == (func in expected_funcs)
+
+
+@pytest.mark.parametrize(
     ('prof_mod', 'prof_os', 'prof_minidom', 'prof_pulldom',
      'prof_elem', 'prof_etree', 'prof_parser'),
     # Trivial cases
@@ -1537,6 +1691,18 @@ def _grep_profiled_names(module_text: str) -> list[str]:
     return re.findall(prof_pattern, module_text)
 
 
+def _propose_module_names(
+    prefix: str = 'my_module',
+) -> Generator[str, None, None]:
+    while True:
+        random = str(uuid.uuid4()).replace('-', '_')
+        name = f'{prefix}_{random}'
+        if not name.isidentifier():
+            continue
+        if name not in sys.modules:
+            yield name
+
+
 @pytest.mark.parametrize(
     ('prof_mod', 'expected_targets', 'profile_imports', 'profile_whole_file',
      'expect_warnings'),
@@ -1667,6 +1833,7 @@ def test_nested_import_discovery(
         finally:
             setitem(path, slice(None), old)
 
+
     class MyMapping(Mapping[str, Any]):
         from operator import getitem as __getattr__
 
@@ -1685,7 +1852,6 @@ def test_nested_import_discovery(
             from foobar import baz
         except ImportError:
             from ersatz_foobar import my_baz as baz
-
 
     for _fred in 'fred', 'some_fred', 'other_fred':
         try:
@@ -2163,17 +2329,6 @@ def test_add_star_import(
     Test that :py:func:`.add_star_import` works as expected, retriving
     the correct names from the namespace and profiling them.
     """
-    def propose_module_names(
-        prefix: str = 'my_module'
-    ) -> Generator[str, None, None]:
-        while True:
-            random = str(uuid.uuid4()).replace('-', '_')
-            name = f'{prefix}_{random}'
-            if not name.isidentifier():
-                continue
-            if name not in sys.modules:
-                yield name
-
     test_module = ub.codeblock("""
     from textwrap import indent, dedent as _dedent
 
@@ -2194,7 +2349,7 @@ def test_add_star_import(
         assert ast.literal_eval(all_repr) == dunder_all
         test_module = f'{test_module}\n\n__all__ = {all_repr}'
 
-    module_name = next(propose_module_names())
+    module_name = next(_propose_module_names())
     if targets is not None:
         targets = [
             t.replace('__module__', module_name) for t in targets

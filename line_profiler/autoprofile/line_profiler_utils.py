@@ -8,7 +8,7 @@ from importlib import import_module
 from types import FunctionType, MethodType, ModuleType
 from typing import TYPE_CHECKING, Any, Literal, overload
 
-from .profmod_extractor import _should_profile
+from .profmod_extractor import _should_profile_regular_import
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..profiler_mixin import CLevelCallable, CythonCallable
@@ -191,7 +191,9 @@ def add_star_import(
     for name, value in sort_items(imported_names.items()):
         if not (
             targets is None
-            or _should_profile(targets, f'{import_from}.{name}')
+            or _should_profile_regular_import(
+                targets, f'{import_from}.{name}',
+            )
         ):
             # Check that the name should be profiled (if we have
             # constrained `targets`)

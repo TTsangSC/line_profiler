@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import sys
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, Literal, cast, get_args
 from warnings import warn
@@ -15,7 +15,7 @@ from .util_static import (
     package_modpaths,
 )
 from .. import _diagnostics as diagnostics
-from ._import_targets import ImportTarget
+from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 
 
 # Node types where code blocks can be found
@@ -419,7 +419,12 @@ class ProfmodExtractor:
             modname = import_target.name
             if modname in modname_added_list:
                 continue
-            if not _should_profile(modnames_to_profile, modname):
+            should_profile: Callable[[Collection[str], str], bool]
+            if modname.endswith('.*'):
+                should_profile = _should_profile_star_import
+            else:
+                should_profile = _should_profile_regular_import
+            if not should_profile(modnames_to_profile, modname):
                 continue
             modname_added_list.append(modname)
             try:
@@ -520,12 +525,14 @@ class ProfmodExtractor:
                     star_imports.add(imports.pop(i))
             if imports:
                 filtered[loc] = imports
-        # Attribute the warning to the caller
         ImportTarget._check_and_warn_dropped_imports(
             star_imports,
-            "we don't currently handle `from ... import *` statements",
+            _DROPPED_STAR_IMPORTS_MSG_TEMPLATE.format(
+                action='extracted',
+                argname='filter_star_imports',
+            ),
             self._script_file,
-            stacklevel=2,  # Attribute warning to caller
+            stacklevel=2,  # Attribute warning to the caller
         )
         return filtered
 
@@ -601,13 +608,32 @@ class ProfmodExtractor:
         ))
 
 
-def _should_profile(targets: Collection[str], modname: str) -> bool:
+def _should_profile_regular_import(
+    targets: Collection[str], modname: str,
+) -> bool:
     """
     Check if either the parent module or submodule are in
-    `targets`
+    ``targets``
     """
     names = {modname, modname.rsplit('.', 1)[0]}
     return bool(names.intersection(targets))
+
+
+def _should_profile_star_import(
+    targets: Collection[str], star_modname: str,
+) -> bool:
+    """
+    Check if ``star_modname`` (should end in '.*') would match any of
+    ``targets`` (should they actually exist)
+    """
+    assert star_modname.endswith('.*')
+    modname = star_modname[:-2]
+    if modname in targets:
+        return True
+    return any(
+        target.rpartition('.')[0] == modname
+        for target in targets if '.' in target
+    )
 
 
 def _should_profile_star_imports(config: ConfigSource | None) -> bool:
