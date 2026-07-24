@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import inspect
 import operator
-from collections.abc import Callable, Collection, MutableMapping
+from collections.abc import Callable, Collection, Iterable, MutableMapping
 from functools import cached_property, partial, partialmethod
 from importlib import import_module
 from types import FunctionType, MethodType, ModuleType
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from .profmod_extractor import _should_profile
 
@@ -149,23 +149,27 @@ def add_star_import(
     """
     # Dynamically inspect the module to see which names would've been
     # inserted by a star-import
-    module = import_module(import_from)  # TODO
+    module = import_module(import_from)
     try:
-        all_names: set[str] | None = set(cast(
-            Collection[str], getattr(module, '__all__', None),
-        ))
-    except Exception:
-        # Could be for whatever reason, there's no guarantee that a
-        # module declares the `.__all__` CORRECTLY
+        all_names: list[str] | None = list(module.__all__)
+    except AttributeError:
+        # Note: we don't expect any other errors; the language standard
+        # dictates that `__all__` has to be `Sequence[str]`, and any
+        # other value would be an error upon star-import anyway
         all_names = None
 
     check_attr: Callable[[str], bool]
+    sort_items: Callable[[Iterable[tuple[str, Any]]], list[tuple[str, Any]]]
     if all_names is None:  # Default behavior: take all public names
         check_attr = lambda attr: (  # noqa: E731
             not attr.startswith('_')
         )
+        sort_items = list
     else:  # If we have a valid `.__all__`, take names therefrom
-        check_attr = partial(operator.contains, all_names)
+        check_attr = partial(operator.contains, set(all_names))
+        sort_items = partial(
+            sorted, key=lambda kv: all_names.index(kv[0]),
+        )
     imported_names: dict[str, Any] = {
         attr: value
         for attr, value in inspect.getmembers(module)
@@ -173,7 +177,7 @@ def add_star_import(
     }
 
     # Decide on which of the names to pass to the profiler
-    # Note: :the name shoul've already been inserted into the namespace
+    # Note: the names should've already been inserted into the namespace
     # by the import statement itself, so this is just post-hoc
     # bookkeeping
     add: Callable[[Any], int]
@@ -184,7 +188,7 @@ def add_star_import(
         add = partial(add_imported_function_or_module, self, **kwargs)
     count = 0
     sentinel = object()
-    for name, value in imported_names.items():
+    for name, value in sort_items(imported_names.items()):
         if not (
             targets is None
             or _should_profile(targets, f'{import_from}.{name}')
@@ -192,7 +196,7 @@ def add_star_import(
             # Check that the name should be profiled (if we have
             # constrained `targets`)
             continue
-        if namespace.get(name, sentinel) is not value:
+        if namespace.get(name, sentinel) is not value:  # nocover
             # Check that the actual object in the namespace is
             # consistent with what is imported
             continue

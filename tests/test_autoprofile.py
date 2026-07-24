@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
 import os
 import re
@@ -9,7 +10,8 @@ import subprocess
 import sys
 import textwrap
 import tempfile
-from collections.abc import Collection, Sequence
+import uuid
+from collections.abc import Collection, Generator, Sequence
 from typing import Any, Literal, get_args
 from warnings import catch_warnings, WarningMessage
 
@@ -20,6 +22,7 @@ from line_profiler.autoprofile.ast_profile_transformer import (
     AstProfileTransformer,
 )
 from line_profiler.autoprofile.ast_tree_profiler import AstTreeProfiler
+from line_profiler.autoprofile.line_profiler_utils import add_star_import
 from line_profiler.autoprofile.profmod_extractor import ProfmodExtractor
 
 
@@ -1437,8 +1440,9 @@ class _RecordingProfiler:
     def __call__(self, x: Any) -> Any:
         return x
 
-    def add_imported_function_or_module(self, obj) -> None:
+    def add_imported_function_or_module(self, obj) -> Literal[1]:
         self.profiled_objects.append(obj)
+        return 1
 
 
 def test_multitarget_import_transformation_executes() -> None:
@@ -1543,7 +1547,7 @@ def _grep_profiled_names(module_text: str) -> list[str]:
      # No whole-file rewriting, bu we explicitly ask to profile the
      # `spam.ham.*` import (which can't be done)
      (['spam.ham'], [], False, False, True)])
-def test_handle_star_imports(
+def test_drop_and_warn_against_star_imports(
     prof_mod: list[str],
     expected_targets: Collection[Literal['bar', 'baz']],
     profile_imports: bool,
@@ -1551,11 +1555,9 @@ def test_handle_star_imports(
     expect_warnings: bool,
 ) -> None:
     """
-    Test that star-imports (``from ... import *``) don't cause
-    :py:meth:`AstTreeProfiler.profile` to choke, instead just issuing
-    warnings about ignoring them.
-
-    TODO: actually handle star-imports
+    Test the default behavior of :py:meth:`AstTreeProfiler.profile`:
+    that star-imports (``from ... import *``) don't cause it to choke,
+    instead just issuing warnings about ignoring them.
     """
     code = ub.codeblock(
         """
@@ -2121,3 +2123,89 @@ def test_ast_profile_transformer_deprecated_profiled_imports(
         print(output)
 
     assert set(_grep_profiled_names(output)) == set(expected)
+
+
+@pytest.mark.parametrize(
+    ('targets', 'dunder_all', 'expected_imports', 'expected_profiled'),
+    [
+        # No `__all__` -> all the public names included
+        (None, None, {'indent', 'foo', 'bar'}, {'indent', 'foo', 'bar'}),
+        # `_baz` specified as a target, but is never imported to begin
+        # with
+        ({'__module__.bar', '__module__._baz'}, None,
+         {'indent', 'foo', 'bar'}, {'bar'}),
+        # With a valid `__all__`, only names inside will be imported
+        (None, ['foo', '_baz', '_dedent'],
+         {'foo', '_dedent', '_baz'}, {'foo', 'dedent', '_baz'}),
+        ({'__module__._baz', '__module__._dedent'}, ['foo', '_baz', '_dedent'],
+         {'foo', '_dedent', '_baz'}, {'dedent', '_baz'}),
+    ])
+def test_add_star_import(
+    targets: Collection[str] | None,
+    dunder_all: Sequence[str] | None,
+    expected_imports: Collection[str],
+    expected_profiled: Collection[str],
+) -> None:
+    """
+    Test that :py:func:`.add_star_import` works as expected, retriving
+    the correct names from the namespace and profiling them.
+    """
+    def propose_module_names(
+        prefix: str = 'my_module'
+    ) -> Generator[str, None, None]:
+        while True:
+            random = str(uuid.uuid4()).replace('-', '_')
+            name = f'{prefix}_{random}'
+            if not name.isidentifier():
+                continue
+            if name not in sys.modules:
+                yield name
+
+    test_module = ub.codeblock("""
+    from textwrap import indent, dedent as _dedent
+
+
+    def foo() -> None:
+        ...
+
+
+    def bar() -> None:
+        ...
+
+
+    def _baz() -> None:
+        ...
+    """).strip('\n')
+    if dunder_all is not None:
+        all_repr = repr(dunder_all)
+        assert ast.literal_eval(all_repr) == dunder_all
+        test_module = f'{test_module}\n\n__all__ = {all_repr}'
+
+    module_name = next(propose_module_names())
+    if targets is not None:
+        targets = [
+            t.replace('__module__', module_name) for t in targets
+        ]
+    mock_prof = _RecordingProfiler()
+    with contextlib.ExitStack() as stack:
+        tmp = stack.enter_context(tempfile.TemporaryDirectory())
+        mp = stack.enter_context(pytest.MonkeyPatch.context())
+        mp.syspath_prepend(tmp)
+
+        mod_fname = os.path.join(tmp, module_name + '.py')
+        with open(mod_fname, 'w') as fobj:
+            print(test_module, file=fobj)
+
+        # Check that the correct names are imported by the star-import
+        namespace: dict[str, Any] = {'baz': None, '__builtins__': builtins}
+        preexisting = set(namespace)
+        exec(f'from {module_name} import *', namespace)
+        assert set(namespace) == set(expected_imports) | preexisting
+
+        # Check that the same names are passed to the profiler by
+        # `add_star_import()`
+        add_star_import(mock_prof, module_name, targets, namespace)
+        profiled_objects = {
+            func.__name__ for func in mock_prof.profiled_objects
+        }
+        assert profiled_objects == set(expected_profiled)
