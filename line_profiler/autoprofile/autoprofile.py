@@ -46,16 +46,17 @@ profiles it with autoprofile.
 """
 
 from __future__ import annotations
+
 import importlib.util
 import os
 import sys
 import types
-from collections.abc import MutableMapping
+from collections.abc import Collection, MutableMapping
 from typing import Any, cast
 
 from ..toml_config import ConfigSource
 from ..line_profiler_utils import restore
-from .ast_tree_profiler import AstTreeProfiler
+from .ast_tree_profiler import AstTreeProfiler, _CompoundStatement
 from .run_module import AstTreeModuleProfiler
 from .line_profiler_utils import (
     add_imported_function_or_module, add_star_import,
@@ -100,32 +101,50 @@ def run(
     as_module: bool = False,
     *,
     config: os.PathLike[str] | str | None = None,
+    profile_star_imports: bool | None = None,
+    profile_nested_imports: Collection[_CompoundStatement] | None = None,
 ) -> None:
-    """Automatically profile a script and run it.
-
-    Profile functions, classes & modules specified in prof_mod without needing to add
-    @profile decorators.
+    """
+    Automatically profile a script and run it, profiling functions,
+    classes & modules specified in ``prof_mod`` without needing to add
+    ``@profile`` decorators.
 
     Args:
         script_file (str):
-            path to script being profiled.
+            path to the script being profiled.
 
         ns (dict):
-            "locals" from kernprof scope.
+            local names to injected into the namespace where
+            ``script_file``'s code is executed.
 
         prof_mod (List[str]):
-            list of imports to profile in script.
-            passing the path to script will profile the whole script.
-            the objects can be specified using its dotted path or full path (if applicable).
+            list of imports to profile in ``script_file``;
+            passing the path ``script_file``  will profile the whole
+            script via AST rewriting;
+            the objects can be specified using its dotted path or
+            file-system path (if applicable).
 
         profile_imports (bool):
-            if True, when auto-profiling whole script, profile all imports aswell.
+            if :py:const:`True`, when rewriting the AST, profile all its
+            imports aswell.
 
         as_module (bool):
-            whether we're running script_file as a module
+            whether we're running ``script_file`` as a module.
 
         config (os.PathLike[str] | str | None):
-            optional path to load the session config from
+            optional path to load the session config from.
+
+        profile_star_imports (bool | None):
+            whether to profile star-imports (``from ... import *``);
+            if :py:const:`None`, the value is taken from ``config``.
+
+        profile_nested_imports \
+(Collection[Literal['func_defs', 'class_defs', \
+'loops', 'conditionals', 'contexts', 'try_except']] | None):
+            Which of the compound-statement types to look for nested
+            imports in;
+            if :py:const:`None`, it is loaded from the ``config`` (from
+            ``autoprofile.import_discovery``)
     """
     Profiler: type[AstTreeModuleProfiler] | type[AstTreeProfiler]
 
@@ -134,7 +153,8 @@ def run(
         module_name = modpath_to_modname(script_file)
         if not module_name:
             raise ModuleNotFoundError(
-                f'script_file = {script_file!r}: cannot find corresponding module'
+                f'script_file = {script_file!r}: '
+                'cannot find corresponding module'
             )
 
         module_obj = types.ModuleType(module_name)
@@ -151,7 +171,10 @@ def run(
         script_file, prof_mod, profile_imports,
         config=ConfigSource.from_config(config),
     )
-    tree_profiled = profiler.profile()
+    tree_profiled = profiler.profile(
+        profile_star_imports=profile_star_imports,
+        profile_nested_imports=profile_nested_imports,
+    )
 
     _extend_line_profiler_for_profiling_imports(ns[PROFILER_LOCALS_NAME])
     code_obj = compile(tree_profiled, script_file, 'exec')

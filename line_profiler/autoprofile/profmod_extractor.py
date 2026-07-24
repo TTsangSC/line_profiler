@@ -35,6 +35,10 @@ _CompoundNodeType = Literal[
     # `try-except` nodes
     'Try', 'TryStar', 'ExceptHandler',
 ]
+_CompoundStatement = Literal[
+    'func_defs', 'class_defs',
+    'loops', 'conditionals', 'contexts', 'try_except',
+]
 
 
 class _ImportFinder(ast.NodeVisitor):
@@ -160,12 +164,23 @@ class _ImportFinder(ast.NodeVisitor):
         }
 
     @staticmethod
-    def _get_filter_args(config: ConfigSource) -> dict[str, bool]:
-        cfg = (
-            config
-            .get_subconfig('autoprofile', 'import_discovery')
-            .conf_dict
-        )
+    def _get_filter_args(
+        config: ConfigSource,
+        find_nested_imports: Collection[_CompoundStatement] | None = None,
+    ) -> dict[str, bool]:
+        if find_nested_imports is None:
+            cfg = cast(
+                dict[_CompoundStatement, bool],
+                config
+                .get_subconfig('autoprofile', 'import_discovery')
+                .conf_dict,
+            )
+        else:
+            cfg = {
+                cast(_CompoundStatement, stmt):
+                stmt in find_nested_imports
+                for stmt in get_args(_CompoundStatement)
+            }
         return {
             'collect_from_conditionals': cfg['conditionals'],
             'collect_from_try_except': cfg['try_except'],
@@ -359,11 +374,13 @@ class ProfmodExtractor:
 
     @staticmethod
     def _ast_get_imports_from_tree(
-        node: ast.AST, config: ConfigSource | None = None,
+        node: ast.AST,
+        config: ConfigSource | None = None,
+        find_nested_imports: Collection[_CompoundStatement] | None = None,
     ) -> dict[tuple[str | int, ...], list[ImportTarget]]:
         if config is None:
             config = ConfigSource.from_default()
-        kwargs = _ImportFinder._get_filter_args(config)
+        kwargs = _ImportFinder._get_filter_args(config, find_nested_imports)
         return _ImportFinder.find(node, **kwargs)
 
     @staticmethod
@@ -412,7 +429,10 @@ class ProfmodExtractor:
         return filtered_imports
 
     def extract_all(
-        self, filter_star_imports: bool | None = None,
+        self,
+        *,
+        filter_star_imports: bool | None = None,
+        find_nested_imports: Collection[_CompoundStatement] | None = None,
     ) -> dict[tuple[str | int, ...], list[ImportTarget]]:
         """
         Map ``prof_mod`` to imports in an abstract syntax tree.
@@ -425,7 +445,15 @@ class ProfmodExtractor:
                 If true, filter out star imports
                 (``from <module> import *``) with a warning;
                 if :py:const:`None`, it is loaded from the ``config``
-                (as the negation of `autoprofile.prof_star_imports`).
+                (as the negation of ``autoprofile.prof_star_imports``).
+
+            find_nested_imports \
+(Collection[Literal['func_defs', 'class_defs', \
+'loops', 'conditionals', 'contexts', 'try_except']] | None):
+                Which of the compound-statement types to look for nested
+                imports in;
+                if :py:const:`None`, it is loaded from the ``config``
+                (from ``autoprofile.import_discovery``).
 
         Returns:
             tree_imports_to_profile_dict \
@@ -460,7 +488,7 @@ class ProfmodExtractor:
                 self._config,
             )
         import_targets = self._ast_get_imports_from_tree(
-            self._tree, self._config,
+            self._tree, self._config, find_nested_imports,
         )
         raw: dict[tuple[str | int, ...], list[ImportTarget]] = {
             (*loc, index): filtered_imports

@@ -1720,6 +1720,7 @@ def test_nested_import_discovery(
     assert set(_grep_profiled_names(output_module)) == expected
 
 
+@pytest.mark.parametrize('inject_options_with', ['config', 'args'])
 @pytest.mark.parametrize('use_component',
                          ['ast_tree_profiler', 'ast_profile_transformer'])
 @pytest.mark.parametrize(
@@ -1752,6 +1753,7 @@ def test_import_discovery_in_all_compound_statements(
     compound_statement: _CompoundStatement,
     options: set[_ImportDiscoveryOption],
     use_component: Literal['ast_tree_profiler', 'ast_profile_transformer'],
+    inject_options_with: Literal['config', 'args'],
     should_be_profiled: bool,
 ) -> None:
     """
@@ -1881,34 +1883,45 @@ def test_import_discovery_in_all_compound_statements(
     test_case = ub.codeblock(test_cases[compound_statement]).strip('\n')
     version_bound: tuple[int, ...] = version_bounds.get(compound_statement, ())
     if sys.version_info < version_bound:
-        pytest.skip(
-            reason=f'cannot test {compound_statement} on {sys.version_info}',
-        )
+        version = '.'.join(str(v) for v in sys.version_info[:3])
+        pytest.skip(reason=f'cannot test {compound_statement} on {version}')
 
     with tempfile.TemporaryDirectory() as tmp:
         case_fname = os.path.join(tmp, 'test_case.py')
         with open(case_fname, 'w') as fobj:
             print(test_case, file=fobj)
 
-        cfg_fname = os.path.join(tmp, 'config.toml')
-        with open(cfg_fname, 'w') as fobj:
-            print(_get_toml_import_discovery_section(options), file=fobj)
+        if inject_options_with == 'config':
+            cfg_fname = os.path.join(tmp, 'config.toml')
+            with open(cfg_fname, 'w') as fobj:
+                print(_get_toml_import_discovery_section(options), file=fobj)
 
-        config = ConfigSource.from_config(cfg_fname)
+            config: ConfigSource | None
+            profile_nested_imports: Collection[_ImportDiscoveryOption] | None
+
+            config = ConfigSource.from_config(cfg_fname)
+            profile_nested_imports = None
+        else:  # Explicitly passed via args
+            config, profile_nested_imports = None, options
+
         if use_component == 'ast_tree_profiler':
             atp = AstTreeProfiler(
                 # `profile_imports=False` prevents
                 # `AstProfileTransformer` from rewriting the imports, so
                 # we're really testing `ProfmodExtractor` here
-                case_fname, list(all_names), False, config=config,
+                case_fname, list(all_names), False,
+                config=config,
             )
-            module_ast = atp.profile()
+            module_ast = atp.profile(
+                profile_nested_imports=profile_nested_imports,
+            )
         else:
             module_ast = AstProfileTransformer._transform(
                 ast.parse(test_case),
                 case_fname,
                 profile_imports=True,
                 config=config,
+                profile_nested_imports=profile_nested_imports,
             )
         output = ast.unparse(module_ast)
 

@@ -14,7 +14,9 @@ from .ast_profile_transformer import (  # noqa: F401
     # Keep import below for compatibility
     ast_create_profile_node,
 )
-from .profmod_extractor import ProfmodExtractor, _should_profile_star_imports
+from .profmod_extractor import (
+    _CompoundStatement, ProfmodExtractor, _should_profile_star_imports,
+)
 
 __docstubs__ = """
 from .ast_profile_transformer import AstProfileTransformer
@@ -130,6 +132,7 @@ class AstTreeProfiler:
         profile_imports: bool = False,
         modnames_to_profile: Collection[str] = (),
         profile_star_imports: bool = False,
+        profile_nested_imports: Collection[_CompoundStatement] | None = None,
     ) -> ast.Module:
         """
         Add profiling to an abstract syntax tree by adding nodes to the
@@ -177,8 +180,16 @@ class AstTreeProfiler:
                 ``profile_full_script`` and ``profile_imports`` are
                 true)
 
+            profile_nested_imports \
+(Collection[Literal['func_defs', 'class_defs', \
+'loops', 'conditionals', 'contexts', 'try_except']] | None):
+                Which of the compound-statement types to look for nested
+                imports in;
+                if :py:const:`None`, it is loaded from the ``config``
+                (from ``autoprofile.import_discovery``).
+
         Returns:
-            (_ast.Module): tree
+            tree (_ast.Module):
                 abstract syntax tree with profiling.
         """
         profiled_imports: dict[tuple[str | int, ...], list[ImportTarget]] = {}
@@ -215,12 +226,18 @@ class AstTreeProfiler:
                 profile_imports=profile_imports,
                 profiled_imports=profiled_imports,
                 profile_star_imports=profile_star_imports,
+                profile_nested_imports=profile_nested_imports,
                 config=self._config,
             )
         ast.fix_missing_locations(tree)
         return tree
 
-    def profile(self, profile_star_imports: bool | None = None) -> ast.Module:
+    def profile(
+        self,
+        *,
+        profile_star_imports: bool | None = None,
+        profile_nested_imports: Collection[_CompoundStatement] | None = None,
+    ) -> ast.Module:
         """
         Create an abstract syntax tree of a script and add profiling to
         it:
@@ -245,10 +262,18 @@ class AstTreeProfiler:
                 if True, add targets imported by ``from ... import *``
                 statements to the profiler;
                 if :py:const:`None`, it is loaded from the ``config``
-                (from `autoprofile.prof_star_imports`).
+                (from ``autoprofile.prof_star_imports``).
+
+            profile_nested_imports \
+(Collection[Literal['func_defs', 'class_defs', \
+'loops', 'conditionals', 'contexts', 'try_except']] | None):
+                Which of the compound-statement types to look for nested
+                imports in;
+                if :py:const:`None`, it is loaded from the ``config``
+                (from ``autoprofile.import_discovery``).
 
         Returns:
-            (_ast.Module): tree
+            tree (_ast.Module):
                 abstract syntax tree with profiling.
         """
         if profile_star_imports is None:
@@ -278,6 +303,7 @@ class AstTreeProfiler:
             )
         tree_imports_to_profile_dict = extractor.extract_all(
             filter_star_imports=filter_star_imports_in_extract_all,
+            find_nested_imports=profile_nested_imports,
         )
 
         tree_profiled = self._profile_ast_tree(
@@ -287,6 +313,7 @@ class AstTreeProfiler:
             profile_imports=self._profile_imports,
             modnames_to_profile=extractor._modnames_to_profile,
             profile_star_imports=profile_star_imports,
+            profile_nested_imports=profile_nested_imports,
         )
         return tree_profiled
 

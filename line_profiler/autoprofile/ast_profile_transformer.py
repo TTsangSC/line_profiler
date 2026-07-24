@@ -12,7 +12,10 @@ from warnings import warn
 from .. import _diagnostics as diagnostics
 from ..toml_config import ConfigSource
 from ._import_targets import ImportTarget
-from .profmod_extractor import _CompoundNodeType, _ImportFinder
+from .profmod_extractor import (
+    _CompoundNodeType, _CompoundStatement, _ImportFinder,
+    _should_profile_star_imports,
+)
 
 
 _Import = TypeVar('_Import', ast.Import, ast.ImportFrom)
@@ -340,7 +343,7 @@ class AstProfileTransformer(ast.NodeTransformer):
 'FunctionDef', 'AsyncFunctionDef', 'ClassDef', \
 'For', `AsyncFor`, `While`, 'If', 'match_case', \
 'With', 'AsyncWith'. 'Try', 'TryStar', 'ExceptHandler'], bool]):
-                for each of the compound-statemnt node type, whether to
+                for each of the compound-statement node type, whether to
                 profile import statements residing therein.
         """
         self._profile_imports = bool(profile_imports)
@@ -589,11 +592,12 @@ class AstProfileTransformer(ast.NodeTransformer):
     @staticmethod
     def _get_profile_imports_in(
         config: ConfigSource | None = None,
+        profile_nested_imports: Collection[_CompoundStatement] | None = None,
     ) -> dict[_CompoundNodeType, bool]:
         if config is None:
             config = ConfigSource.from_default()
         return _ImportFinder.filter_node_types(
-            **_ImportFinder._get_filter_args(config),
+            **_ImportFinder._get_filter_args(config, profile_nested_imports),
         )
 
     @classmethod
@@ -603,19 +607,38 @@ class AstProfileTransformer(ast.NodeTransformer):
         filename: PathLike[str] | str | None = None,
         *,
         config: ConfigSource | None = None,
+        profile_star_imports: bool | None = None,
+        profile_nested_imports: Collection[_CompoundStatement] | None = None,
         **kwargs,
     ) -> ast.Module:
         """
-        Wrapper around ``<instance>.visit()`` with extra bookkeeping.
+        Wrapper around ``<instance>.visit()`` with extra bookkeeping and
+        convenience args.
 
         Args:
             node (ast.Module):
                 AST module node
+
             filename (PathLike[str] | str | None):
                 Optional filename to be used in error/warning messages
+
             config (ConfigSource | None):
                 Optional :py:class:`.ConfigSource` to load options from,
                 controlling whether an import should be profiled
+
+            profile_star_imports (bool | None):
+                Whether to profile star-imports (``from ... import *``);
+                if :py:const:`None`, it is loaded from the ``config``
+                (from ``autoprofile.prof_star_imports``)
+
+            profile_nested_imports \
+(Collection[Literal['func_defs', 'class_defs', \
+'loops', 'conditionals', 'contexts', 'try_except']] | None):
+                Which of the compound-statement types to look for nested
+                imports in;
+                if :py:const:`None`, it is loaded from the ``config``
+                (from ``autoprofile.import_discovery``)
+
             **kwargs
                 Passed to the initializer
 
@@ -623,10 +646,15 @@ class AstProfileTransformer(ast.NodeTransformer):
             node (ast.Module):
                 Input module node
         """
+        if profile_star_imports is None:
+            profile_star_imports = _should_profile_star_imports(config)
         kwargs.setdefault(
-            'profile_imports_in', cls._get_profile_imports_in(config),
+            'profile_imports_in',
+            cls._get_profile_imports_in(config, profile_nested_imports),
         )
-        transformer = cls(**kwargs)
+        transformer = cls(
+            profile_star_imports=profile_star_imports, **kwargs,
+        )
         dropped_star_imports = transformer._dropped_star_imports
         if filename is None:
             filename = '???'
