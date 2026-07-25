@@ -144,15 +144,17 @@ which displays:
                             import *`) and profile the imported names as one would the
                             explicit imports. Only works with line profiling (`-l`/`--line-
                             by-line`). (Default: False)
-      --prof-nested-imports {conditional | loops | contexts | try-except | func-defs | class-defs}[,...]
-                            List of compound-statement constructs in which to look for and
-                            profile nested import statements. They can be supplied both as
-                            comma-separated items, or separately with multiple copies of
-                            this flag. Only works with line profiling (`-l`/
-                            `--line-by-line`). (Default: ['conditionals', 'try_except',
-                            'contexts', 'class_defs']; pass an empty string to clear the
-                            defaults (or any `--prof-nested-imports` target specified
-                            earlier))
+      --prof-nested-imports {CONSTRUCT[, ...] | 'all'}
+                            List of compound-statement constructs (valid values:
+                            'conditionals', 'loops', 'contexts', 'try-except', 'func-defs',
+                            'class-defs'; or 'all' as a shorthand for all of the above) in
+                            which to look for and profile nested import statements. They can
+                            be supplied both as comma-separated items, or separately with
+                            multiple copies of this flag. Only works with line profiling
+                            (`-l`/`--line-by-line`). (Default: ['conditionals',
+                            'try_except', 'contexts', 'class_defs']; pass an empty string to
+                            clear the defaults (or any `--prof-nested-imports` target
+                            specified earlier))
 
     output options:
       -o, --outfile OUTFILE
@@ -217,7 +219,6 @@ import time
 import warnings
 from argparse import ArgumentParser
 from io import StringIO
-from operator import methodcaller
 from runpy import run_module
 from pathlib import Path
 from pprint import pformat
@@ -603,10 +604,12 @@ def _add_core_parser_arguments(parser):
         prof_opts,
         '--prof-nested-imports',
         action='append',
-        metavar='{conditionals | loops | contexts '
-        '| try-except | func-defs | class-defs}[,...]',
-        help='List of compound-statement constructs in which to look for '
-        'and profile nested import statements. '
+        metavar="{CONSTRUCT[, ...] | 'all'}",
+        help='List of compound-statement constructs '
+        "(valid values: 'conditionals', 'loops', 'contexts', 'try-except', "
+        "'func-defs', 'class-defs'; "
+        "or 'all' as a shorthand for all of the above) "
+        'in which to look for and profile nested import statements. '
         'They can be supplied both as comma-separated items, '
         'or separately with multiple copies of this flag. '
         'Only works with line profiling (`-l`/`--line-by-line`). '
@@ -877,14 +880,28 @@ def _normalize_prof_nested_imports(parsed):
     from line_profiler.autoprofile.profmod_extractor import _CompoundStatement
 
     result = set()
-    valid = set(get_args(_CompoundStatement))
+    valid = list(get_args(_CompoundStatement))
+    invalid = set()
     for chunk in parsed:
         if not chunk:
             result.clear()
             continue
-        for subchunk in chunk.lower().replace('-', '_').split(','):
-            result.add(subchunk.strip())
-    return result & valid
+        for subchunk in chunk.split(','):
+            normalized = subchunk.strip().lower().replace('-', '_')
+            if normalized in valid:
+                result.add(normalized)
+            elif normalized == 'all':
+                result.update(valid)
+            else:
+                invalid.add(subchunk)
+    if invalid:
+        msg = (
+            '--prof-nested-imports=...: '
+            f'the following options are invalid: {sorted(invalid)!r}; '
+            f'valid option are: {valid + ["all"]!r}'
+        )
+        warnings.warn(msg, stacklevel=2)  # Attribute to caller
+    return result
 
 
 @restore.sequence(sys.argv)

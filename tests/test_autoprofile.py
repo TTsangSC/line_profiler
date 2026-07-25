@@ -12,6 +12,7 @@ import textwrap
 import tempfile
 import uuid
 from collections.abc import Collection, Generator, Sequence
+from types import CodeType
 from typing import Any, Literal, get_args
 from warnings import catch_warnings, WarningMessage
 
@@ -1322,7 +1323,6 @@ def test_autoprofile_star_imports(
         kernprof_options.extend(['--outfile', str(stats_path)])
 
         mp = stack.enter_context(pytest.MonkeyPatch.context())
-        mp.syspath_prepend(str(python_path))
         mp.setenv('PYTHONPATH', str(python_path), prepend=os.pathsep)
 
         # For convenience, instead of using parametrization for the
@@ -1342,8 +1342,8 @@ def test_autoprofile_star_imports(
                 cmd + kp_options + script_options, check=True, verbose=2,
             )
             assert isinstance(proc.stdout, str)
-            # `-c` code always profiled
             assert expected_output in proc.stdout
+            # `-c` code always profiled
             assert 'def main' in proc.stdout
 
             if not prof_star_imports:  # Warning may be issued
@@ -1367,6 +1367,156 @@ def test_autoprofile_star_imports(
             func_names = {func for *_, func in stats.timings}
             for func in 'make_unnumbered_list', 'make_numbered_list':
                 assert (func in func_names) == (func in expected_funcs)
+
+
+@pytest.mark.parametrize(
+    ('expected_output', 'script_args'),
+    [('foo.jam.qux = True', ['foo', 'jam', 'qux'])])
+@pytest.mark.parametrize(
+    ('prof_mod', 'prof_imports', 'prof_nested_imports',
+     'expected_profiled_funcs', 'expect_warning'),
+    [
+        # By default, we profile imports as long as they aren't inside
+        # function definitions or loops
+        ([], True, [], ['loads', 'parse_args'], None),
+        ([], True, ['all'], ['loads', 'parse_args', 'dedent'], None),
+        # As with `--prof-mod`, `--prof-nested-imports` defaults (and
+        # previously-specified values) can be invalidated by passing an
+        # empty string
+        ([], True, [''], [], None),
+        ([], True, ['func-defs', ''], [], None),
+        # Check that we're warning against bad values
+        ([], True, ['', 'bad-value'], [], r"\binvalid\b.* \['bad-value'\]"),
+        # Also test cases where we use a combination of `--prof-mod`
+        # and `--prof-nested-imports` to narrow down the profiled funcs
+        (['argparse.ArgumentParser', 'textwrap.dedent'], False,
+         [], ['parse_args'], None),
+        (['argparse.ArgumentParser', 'textwrap.dedent'], False,
+         ['all'], ['parse_args', 'dedent'], None),
+        (['argparse.ArgumentParser', 'textwrap.dedent'], False,
+         ['try-except'], [], None),
+    ])
+def test_autoprofile_nested_imports(
+    prof_mod: Sequence[str],
+    prof_imports: bool,
+    prof_nested_imports: Sequence[str],
+    expected_profiled_funcs: Collection[
+        Literal['loads', 'parse_args', 'dedent']
+    ],
+    expected_output: str,
+    expect_warning: str | None,
+    script_args: Sequence[str],
+) -> None:
+    """
+    Test that the ``--prof-nested-imports`` CLI flag in
+    :py:mod:`kernprof` works as intended.
+    """
+    sample_toml = r"""
+    [foo]
+    spam = 1
+    ham = [1, 2, 3]
+
+    [foo.eggs]
+    foobar = 'some string'
+    baz = 'some other string'
+
+    [foo.jam]
+    qux = true
+
+    [bar]
+    foobar = []
+    """
+    test_code_template = ub.codeblock("""
+    from __future__ import annotations
+
+    try:
+        from tomllib import loads as load_toml
+    except ImportError:  # Python < 3.11
+        from tomli import loads as load_toml
+
+    if True:
+        from argparse import ArgumentParser
+        from collections.abc import Callable, Sequence
+
+
+    def main(args: Sequence[str] | None = None) -> None:
+        from textwrap import dedent
+
+        with open({}) as fobj:
+            text = dedent(fobj.read())
+
+        data = load_toml(text)
+
+        parser = ArgumentParser()
+        parser.add_argument('keys', nargs='*')
+        keys = parser.parse_args(args).keys
+
+        for key in keys:
+            data = data[key]
+        print('.'.join(keys), '=', data)
+
+
+    if __name__ == '__main__':
+        main()
+    """).strip('\n')
+
+    cmd = [sys.executable, '-m', 'kernprof']
+    kernprof_options = ['-lzv', '--no-preimports']
+    if prof_imports:
+        kernprof_options.append('--prof-imports')
+    if prof_mod:
+        kernprof_options.extend(['--prof-mod', ','.join(prof_mod)])
+    for pni in prof_nested_imports:
+        kernprof_options.extend(['--prof-nested-imports', pni])
+
+    func_aliases: dict[str, str] = {}
+    if hasattr(CodeType, 'co_qualname'):
+        # Since Python 3.11 we use the qualname of the function in
+        # outputs
+        func_aliases['parse_args'] = 'ArgumentParser.parse_args'
+
+    with tempfile.TemporaryDirectory() as tmp_:
+        tmp = ub.Path(tmp_)
+        toml_path = tmp / 'data.toml'
+        stats_path = tmp / 'out.lprof'
+        toml_path.write_text(sample_toml)
+
+        kernprof_options.extend(['--outfile', str(stats_path)])
+        script_options = [
+            '-c', test_code_template.format(repr(str(toml_path))),
+            *script_args
+        ]
+
+        proc = ub.cmd(
+            cmd + kernprof_options + script_options, check=True, verbose=2,
+        )
+        assert isinstance(proc.stdout, str)
+        assert expected_output in proc.stdout
+        # `-c` code always profiled
+        assert 'def main' in proc.stdout
+
+        streams = [proc.stdout]
+        if isinstance(proc.stderr, str):
+            streams.append(proc.stderr)
+        warning = 'UserWarning:.*--prof-nested-imports'
+        if expect_warning is None:
+            assert not any(re.search(warning, stream) for stream in streams)
+        else:
+            warning = f'{warning}.*{expect_warning}'
+            assert any(re.search(warning, stream) for stream in streams)
+
+        assert stats_path.exists()
+        stats = LineStats.from_files(stats_path)
+        stats_path.unlink()
+
+        func_names = {func for *_, func in stats.timings}
+        for func in [
+            'loads',  # In a try-except block
+            'parse_args',  # In an if block
+            'dedent',  # In a function def (not profiled by default)
+        ]:
+            profiled = func_aliases.get(func, func) in func_names
+            assert profiled == (func in expected_profiled_funcs)
 
 
 @pytest.mark.parametrize(
