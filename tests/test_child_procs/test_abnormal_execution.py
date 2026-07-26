@@ -3,16 +3,15 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Collection
 from contextlib import ExitStack
 from multiprocessing import get_all_start_methods
 from pathlib import Path
-# Note: `S_IWRITE` is said to work on Windows but it seems wonky (see
-# GitHub issue python/cpython#101675), and it doesn't seem to work on
-# Linux either...
-from stat import S_IWUSR, S_IWGRP, S_IWOTH
+from stat import S_IWUSR, S_IWGRP, S_IWOTH, S_IWRITE
+from tempfile import TemporaryDirectory
 from textwrap import indent
 from types import ModuleType
-from typing import Literal
+from typing import ClassVar, Literal
 
 import pytest
 
@@ -41,6 +40,96 @@ class _write_debug_log:
             indent(self.file.read_text(), '  '), end='', file=sys.stderr,
         )
         print('-- End of debug logs --', file=sys.stderr)
+
+
+class _revoke_write_access:
+    def __init__(self, path: os.PathLike[str] | str) -> None:
+        self.path = Path(path)
+
+    def __enter__(self) -> None:
+        self._perms: int | None = None
+        if not self.path.is_dir():
+            return
+        if self.path.stat().st_uid != os.getuid():
+            return
+
+        mode = self.mode
+        for bit in self._writability_bits:
+            self._make_unwritable(self.path, bit)
+        if mode == self.mode:
+            return
+        self._perms = mode
+        if DEBUG:
+            print(
+                f'Updated {str(self.path)!r}:',
+                f'{oct(mode)} -> {oct(self.mode)}',
+                '(disabling write)',
+            )
+
+    def __exit__(self, *_, **__) -> None:
+        if self._perms is None:
+            return
+        mode = self.mode
+        os.chmod(self.path, self._perms)
+        if DEBUG:
+            print(
+                f'Updated {str(self.path)!r}:',
+                f'{oct(mode)} -> {oct(self.mode)}',
+                '(enabling write)',
+            )
+
+    @classmethod
+    def _check_usability(cls, preexisting_handle: bool = False) -> bool:
+        """
+        Sanity check: can we actually make a directory unwritable by
+        tempering with the permission bytes? (Seems to vary by
+        platform... probably has to do already-open handles and stuff.)
+        """
+        with TemporaryDirectory() as tmp_:
+            tmp = Path(tmp_)
+            my_dir = tmp / 'my_dir'
+            my_dir.mkdir()
+            # Write a file in the directory and later get a reading
+            # handle on it; let's see if the preexisting handle prevents
+            # perm changes from taking effect
+            some_file: Path | None = None
+            if preexisting_handle:
+                some_file = my_dir / 'some_time.txt'
+                some_file.write_text('foo bar')
+
+            with ExitStack() as stack:
+                if some_file is not None:
+                    stack.enter_context(some_file.open())
+                # Within the `_revoke_write_access` context, trying to
+                # write a file inside the directory should result in a
+                # `PermissionError`
+                stack.enter_context(cls(my_dir))
+                try:
+                    (my_dir / 'other_file.txt').write_text('Lorem ipsum')
+                except PermissionError:
+                    return True
+                else:
+                    return False
+
+    @staticmethod
+    def _make_unwritable(path: Path, writable_bytes: int) -> None:
+        mode = path.stat().st_mode
+        mask = mode & writable_bytes
+        if mask:
+            os.chmod(path, mode - mask)
+
+    @property
+    def mode(self) -> int:
+        return self.path.stat().st_mode
+
+    # Note: `S_IWRITE` is said to work on Windows but it seems wonky
+    # (see GitHub issue python/cpython#101675), and it doesn't seem
+    # to work on Linux either...
+    _writability_bits: ClassVar[Collection[int]]
+    if sys.platform.startswith('win32'):
+        _writability_bits = S_IWRITE,
+    else:  # POSIX
+        _writability_bits = S_IWUSR, S_IWGRP, S_IWOTH
 
 
 @pytest.mark.parametrize(('trigger_timeout', 'label1'),
@@ -244,7 +333,6 @@ def test_corrupted_child_stats_file(
             )
 
 
-@pytest.mark.skipif(sys.platform.startswith('win32'), reason='POSIX-only test')
 @pytest.mark.parametrize('start_method', ['spawn', 'fork', 'forkserver'])
 @pytest.mark.parametrize(
     ('make_unwritable', 'label'),
@@ -263,57 +351,24 @@ def test_unwritable_purelib_path(
     Check that if we can't write a .pth file, the profiling data of
     child processes are lost, but it doesn't crash the session or cause
     further loss of profiling data.
-
-    Note:
-        Not being able to write a .pth file is an edge case anyway, so
-        it's probably alright to skip the test on Windows.
     """
-    class revoke_write_access:
-        def __init__(self, path: os.PathLike[str] | str) -> None:
-            self.path = Path(path)
-
-        def __enter__(self) -> None:
-            self._perms: int | None = None
-            if not self.path.is_dir():
-                return
-            if self.path.stat().st_uid != os.getuid():
-                return
-
-            mode = self.mode
-            for bit in S_IWUSR, S_IWGRP, S_IWOTH:
-                self._make_unwritable(self.path, bit)
-            if mode == self.mode:
-                return
-            self._perms = mode
-            if DEBUG:
-                print(
-                    f'Updated {str(self.path)!r}:',
-                    f'{oct(mode)} -> {oct(self.mode)}',
-                    '(disabling write)',
-                )
-
-        def __exit__(self, *_, **__) -> None:
-            if self._perms is None:
-                return
-            mode = self.mode
-            os.chmod(self.path, self._perms)
-            if DEBUG:
-                print(
-                    f'Updated {str(self.path)!r}:',
-                    f'{oct(mode)} -> {oct(self.mode)}',
-                    '(enabling write)',
-                )
-
-        @staticmethod
-        def _make_unwritable(path: Path, writable_bytes: int) -> None:
-            mode = path.stat().st_mode
-            mask = mode & writable_bytes
-            if mask:
-                os.chmod(path, mode - mask)
-
-        @property
-        def mode(self) -> int:
-            return self.path.stat().st_mode
+    if make_unwritable:
+        for condition, success_note, preexisting in [
+            ('at all', 'no open child', False),
+            ('when a child is open', 'with open child', True),
+        ]:
+            if _revoke_write_access._check_usability(preexisting):
+                if DEBUG:
+                    print(
+                        f'Writing to a directory ({success_note}) '
+                        'successfully prevented',
+                    )
+                continue
+            pytest.skip(
+                reason=f'Cannot prevent writing to a directory {condition} '
+                'by unsetting the writability bits on this platform '
+                f'({sys.platform})',
+            )
 
     get_pth_locs = LineProfilingCache._enumerate_pth_installation_locations
 
@@ -359,7 +414,7 @@ def test_unwritable_purelib_path(
         with ExitStack() as stack:
             if make_unwritable:
                 for path in get_pth_locs():
-                    stack.enter_context(revoke_write_access(path))
+                    stack.enter_context(_revoke_write_access(path))
             proc = run_subproc(cmd, capture_output=True, text=True, check=True)
         # Check: collection of profiling data is as expected
         for tag, num in nhits.items():
