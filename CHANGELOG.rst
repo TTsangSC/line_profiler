@@ -12,6 +12,8 @@ Changes
   is available (#427)
 * FIX: Bytecodes of profiled functions now always labeled to prevent
   confusion with non-profiled "twins" (#425)
+* FIX: Stop reverting ``sys.modules`` after calling ``kernprof.main()``
+  to avoid edge-case issues with e.g. pickling (#437)
 * FEAT: Experimental support for profiling child processes with
   ``kernprof --prof-child-procs`` (#431)
 
