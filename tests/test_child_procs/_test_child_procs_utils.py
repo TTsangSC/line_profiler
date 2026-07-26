@@ -453,11 +453,13 @@ class VenvFixture:
         return self._executable
 
     def _find_executables(self) -> Generator[Path, None, None]:
-        script_loc = os.path.basename(sysconfig.get_path(
-            'scripts', scheme='venv',
-        ))
+        if 'venv' in sysconfig.get_scheme_names():
+            script_path = sysconfig.get_path('scripts', scheme='venv')
+        else:  # Python < 3.11, unless e.g. installed via Homebrew
+            script_path = sysconfig.get_path('scripts')
+        script_loc = self.path / os.path.basename(script_path)
         for name in 'python', 'python3', 'python.exe':
-            exe = self.path / script_loc / name
+            exe = script_loc / name
             if exe.exists():
                 yield exe
 
