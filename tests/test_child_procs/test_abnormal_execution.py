@@ -50,7 +50,7 @@ class _revoke_write_access:
         self._perms: int | None = None
         if not self.path.is_dir():
             return
-        if self.path.stat().st_uid != os.getuid():
+        if self.path.stat().st_uid != self.pid:
             return
 
         mode = self.mode
@@ -122,6 +122,23 @@ class _revoke_write_access:
     def mode(self) -> int:
         return self.path.stat().st_mode
 
+    @property
+    def pid(self) -> int:
+        try:
+            return self._pid
+        except AttributeError:  # First call
+            pass
+        try:
+            pid = os.getuid()
+        except AttributeError:  # Windows
+            with TemporaryDirectory() as tmp:
+                pid = os.stat(tmp).st_uid
+        # Cache on the class
+        type(self)._pid = pid
+        return pid
+
+    # This will be set when accessing `.pid` (see above)
+    _pid: ClassVar[int]
     # Note: `S_IWRITE` is said to work on Windows but it seems wonky
     # (see GitHub issue python/cpython#101675), and it doesn't seem
     # to work on Linux either...
