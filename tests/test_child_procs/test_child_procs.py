@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import multiprocessing.util
 import operator
 import os
 import re
@@ -567,6 +568,11 @@ def _test_apply_mp_patches_inner(
         else:  # Check correctness of the results
             assert result == n * (n + 1) // 2
 
+    # Note: the `multiprocessing` logging functions aren't reliably
+    # called on the happy path, so do that ourselves
+    mp_debug_msg = 'Lorem ipsum'
+    multiprocessing.util.debug(mp_debug_msg)
+
     # Check that calls in children are traced
     cache.cleanup()
     stats = cache.profiler.get_stats()
@@ -586,9 +592,8 @@ def _test_apply_mp_patches_inner(
     patterns.update({
         pat.format(re.escape(path.name)): True for path in iter_stats
     })
-    logger_pat = '{} {}'.format(
-        re.escape('`multiprocessing` logging'),
-        r'\((sub_)?debug|info|sub_warning|warn\)',
+    logger_pat = (
+        rf'`multiprocessing` logging \(debug\): {re.escape(mp_debug_msg)}'
     )
     patterns[logger_pat] = intercept_logs
     search_cache_logs(cache, True, patterns)

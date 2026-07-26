@@ -11,9 +11,9 @@ from enum import auto
 from itertools import pairwise
 from pathlib import Path
 from string import Formatter as StringParser
-from textwrap import dedent
 from typing import TYPE_CHECKING, NamedTuple, TextIO, overload
 from typing_extensions import Self
+from warnings import warn
 
 from .. import _diagnostics as diagnostics
 from ..line_profiler_utils import block_indent, StringEnum
@@ -304,77 +304,217 @@ multiple lines
 
     @classmethod
     def from_text(cls, text: str) -> list[Self]:
-        def gen_timestamps(text: str) -> Generator[re.Match, None, None]:
-            last_ts_match: re.Match | None = None
-            while True:
-                ts_match = timestamp_regex.search(
-                    text, last_ts_match.end() if last_ts_match else 0,
-                )
-                if ts_match:
-                    yield ts_match
-                    last_ts_match = ts_match
-                else:
-                    return
+        return list(cls._gen_entries_from_text(text))
 
-        def gen_message_blocks(text: str) -> Generator[
-            tuple[datetime, LogLevel, re.Match, str], None, None
-        ]:
-            timestamps = list(gen_timestamps(text))
-            if not timestamps:
-                return
-
-            # Handle all the entries up till the 2nd-to-last one
-            for this_match, next_match in pairwise(timestamps):
-                ts = parse_timestamp(this_match.group('timestamp'))
-                level = LogLevel(this_match.group('level'))
-                text_block = text[this_match.start():next_match.start()]
-                yield (ts, level, this_match, text_block.rstrip('\n'))
-            # Handle the last entry
-            last_match = timestamps[-1]
-            yield (
-                parse_timestamp(last_match.group('timestamp')),
-                LogLevel(last_match.group('level')),
-                last_match,
-                text[last_match.start():].rstrip('\n'),
-            )
-
-        def get_entries(text: str) -> Generator[Self, None, None]:
-            for (
-                timestamp, level, ts_match, text_block,
-            ) in gen_message_blocks(text):
-                # Strip the block indent
-                ts_text = ts_match.group(0)
-                assert text_block.startswith(ts_text), (
-                    f'{text_block=!r}, {ts_text=!r}'
-                )
-                ts_width = len(ts_text)
-                text_block = dedent(' ' * ts_width + text_block[ts_width:])
-                # Strip the header and parse the relevant info from it
-                header_match = header_regex.match(text_block)
-                assert header_match, f'{header_regex=!r}, {text_block=!r}'
-                current_pid = int(header_match.group('current_pid'))
-                main_pid_ = header_match.group('main_pid')
-                if main_pid_ == HEADER_MAIN_INDICATOR:
-                    main_pid = current_pid
-                else:
-                    main_pid = int(main_pid_)
-                cache_id = parse_id(header_match.group('obj_id'))
-                # The rest of the block is the message proper
-                msg = text_block[header_match.end():]
-                yield cls(
-                    timestamp, level, main_pid, current_pid, cache_id, msg,
-                )
-
+    @staticmethod
+    def _gen_timestamps_from_text(
+        text: str,
+    ) -> Generator[re.Match, None, None]:
         timestamp_pattern = fmt_to_regex(
             f'{TIMESTAMP_PATTERN}{TIMESTAMP_SPACING}',
             timestamp='.+?',
-            level='({})'.format('|'.join(LogLevel.__members__)),
+            level='|'.join(LogLevel.__members__),
         )
         timestamp_regex = re.compile('^' + timestamp_pattern, re.MULTILINE)
+        last_ts_match: re.Match | None = None
+        while True:
+            ts_match = timestamp_regex.search(
+                text, last_ts_match.end() if last_ts_match else 0,
+            )
+            if ts_match:
+                yield ts_match
+                last_ts_match = ts_match
+            else:
+                return
+
+    @classmethod
+    def _gen_message_blocks_from_text(
+        cls, text: str,
+    ) -> Generator[tuple[re.Match, str], None, None]:
+        timestamps = list(cls._gen_timestamps_from_text(text))
+        if not timestamps:
+            return
+        # Handle all the entries up till the 2nd-to-last one
+        for this_match, next_match in pairwise(timestamps):
+            text_block = text[this_match.start():next_match.start()]
+            yield (this_match, text_block.rstrip('\n'))
+        # Handle the last entry
+        last_match = timestamps[-1]
+        yield (last_match, text[last_match.start():].rstrip('\n'))
+
+    @classmethod
+    def _gen_entries_from_text(cls, text: str) -> Generator[Self, None, None]:
+        r"""
+        Example:
+            >>> import re
+            >>> from contextlib import AbstractContextManager, ExitStack
+            >>> from functools import partial
+            >>> from warnings import WarningMessage, catch_warnings
+
+            >>> from line_profiler import _diagnostics as diag
+            >>> from line_profiler.line_profiler_utils import restore
+
+            >>> class record_warnings:
+            ...     def __init__(self) -> None:
+            ...         self._stacks = []
+            ...
+            ...     def __enter__(self) -> list[WarningMessage]:
+            ...         stack = ExitStack()
+            ...         enter = stack.enter_context
+            ...         self._stacks.append(stack)
+            ...         warnings = enter(catch_warnings(record=True))
+            ...         # Suppress logger output
+            ...         enter(restore.instance_dict(
+            ...             diag.log, attrs=['_backend'],
+            ...         ))
+            ...         diag.log.configure(verbose=0)
+            ...         return warnings
+            ...
+            ...     def __exit__(self, *_, **__) -> None:
+            ...         self._stacks.pop().close()
+
+            >>> def get_entry(
+            ...     msg: str, **kwargs
+            ... ) -> CacheLoggingEntry:
+            ...     kwargs.setdefault('main_pid', 1234)
+            ...     kwargs.setdefault('cache_id', 0x12345678)
+            ...     entry = CacheLoggingEntry.new(msg=msg, **kwargs)
+            ...     # Note: we only get 3 subsecond digits in the
+            ...     # `.to_text()` output, so round the timestamp
+            ...     # accordingly
+            ...     milliseconds = entry.timestamp.microsecond // 1000
+            ...     adjusted_ts = entry.timestamp.replace(
+            ...         microsecond=milliseconds * 1000,
+            ...     )
+            ...     return entry._replace(timestamp=adjusted_ts)
+
+            >>> get_entries = CacheLoggingEntry._gen_entries_from_text
+            >>> e1 = get_entry('foo bar\n baz')
+            >>> e2 = get_entry('this\nwill\nbe\n truncated')
+            >>> e3 = get_entry('another normal\n   entry')
+            >>> all_entries = [e1, e2, e3]
+
+            Log-entry corruption:
+
+            >>> with record_warnings() as warnings:
+            ...     log = [
+            ...         e1.to_text(),
+            ...         e2.to_text().split('Cache')[0],  # No cache ID
+            ...         e3.to_text()
+            ...     ]
+            ...     parsed = list(get_entries('\n'.join(log)))
+
+            >>> assert (
+            ...     parsed == [e1, e3]
+            ... ), f'{all_entries=!r}, {parsed=!r}'
+            >>> assert len(warnings) == 1
+            >>> assert re.search(
+            ...     'failed to parse .* after parsing 1 entry/-ies',
+            ...     str(warnings[0].message),
+            ... ), warnings
+
+            Timestamp truncation:
+
+            >>> with record_warnings() as warnings:
+            ...     log = [
+            ...         e1.to_text(),
+            ...         e2.to_text().split('DEBUG')[0],  # Bad timestamp
+            ...         e3.to_text()
+            ...     ]
+            ...     parsed = list(get_entries('\n'.join(log)))
+
+            >>> assert (
+            ...     parsed == [e1, e3]
+            ... ), f'{all_entries=!r}, {parsed=!r}'
+            >>> assert len(warnings) == 1
+            >>> assert re.search(
+            ...     'trailing text when parsing entry #1',
+            ...     str(warnings[0].message),
+            ... ), warnings
+        """
         header_regex = re.compile(fmt_to_regex(
             HEADER_PATTERN + HEADER_SEP,
             current_pid=r'\d+',
             main_pid=r'\d+|' + re.escape(HEADER_MAIN_INDICATOR),
             obj_id='.+?',
         ))
-        return list(get_entries(text))
+        for (
+            nentries, (ts_match, text_block),
+        ) in enumerate(cls._gen_message_blocks_from_text(text)):
+            timestamp = parse_timestamp(ts_match.group('timestamp'))
+            level = LogLevel(ts_match.group('level'))
+            # Strip the block indent
+            ts_text = ts_match.group(0)
+            assert text_block.startswith(ts_text), (
+                # Note: this is purely an internal-consistency thing,
+                # and this assertion should never fail
+                f'{text_block=!r}, {ts_text=!r}'
+            )
+            dedented, trailing = cls._dedent_block(text_block, ts_text)
+            # Strip the header and parse the relevant info from it
+            header_match = header_regex.match(dedented)
+            if not header_match:
+                # This can happen for whatever reason, e.g. the text of
+                # THIS entry is truncated and thus the header can't be
+                # matched
+                msg = (
+                    'failed to parse the following text block after parsing '
+                    f'{nentries} entry/-ies: {text_block!r}'
+                )
+                diagnostics.log.warning('UserWarning: ' + msg)
+                warn(msg, stacklevel=3)  # Caller of `.get_entries()`
+                continue
+            if trailing:
+                # The text of THE NEXT entry can be truncated, and thus
+                # making its timestamp malformed, causing the two
+                # entries to be parsed (squashed) into the same text
+                # block by `._gen_message_blocks_from_text()` and
+                # resulting in trailing text
+                msg = (
+                    'got unexpected trailing text when parsing entry '
+                    f'#{nentries + 1}: {trailing!r}'
+                )
+                diagnostics.log.warning('UserWarning: ' + msg)
+                warn(msg, stacklevel=3)  # Caller of `.get_entries()`
+            current_pid = int(header_match.group('current_pid'))
+            main_pid_ = header_match.group('main_pid')
+            if main_pid_ == HEADER_MAIN_INDICATOR:
+                main_pid = current_pid
+            else:
+                main_pid = int(main_pid_)
+            cache_id = parse_id(header_match.group('obj_id'))
+            # The rest of the block is the message proper
+            msg = dedented[header_match.end():]
+            yield cls(
+                timestamp, level, main_pid, current_pid, cache_id, msg,
+            )
+
+    @staticmethod
+    def _dedent_block(block: str, prefix: str) -> tuple[str, str]:
+        r"""
+        Example:
+            >>> lines = [
+            ...     'foo bar: foo',
+            ...     '          bar',
+            ...     '         baz',
+            ... ]
+            >>> assert (result := CacheLoggingEntry._dedent_block(
+            ...     '\n'.join(lines), 'foo bar: ',
+            ... )) == ('foo\n bar\nbaz', ''), result
+            >>> lines.append('  some trailing text')
+            >>> assert (result := CacheLoggingEntry._dedent_block(
+            ...     '\n'.join(lines), 'foo bar: ',
+            ... )) == ('foo\n bar\nbaz', '  some trailing text'), result
+        """
+        assert block.startswith(prefix)
+        width = len(prefix)
+        block_lines: list[str] = []
+        trailing_lines: list[str] = []
+        raw_lines = (' ' * width + block[width:]).splitlines()
+        for i, line in enumerate(raw_lines):
+            prefix = line[:width]
+            if prefix and not prefix.isspace():
+                trailing_lines.extend(raw_lines[i:])
+                break
+            block_lines.append(line[width:])
+        return '\n'.join(block_lines), '\n'.join(trailing_lines)

@@ -22,7 +22,7 @@ from collections.abc import (
     Callable, Collection, Generator, Iterable, Mapping,
     Sequence, Set,
 )
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from functools import lru_cache, partial, wraps
 from io import BytesIO
 from importlib import import_module, invalidate_caches
@@ -31,6 +31,7 @@ from multiprocessing.pool import (  # type: ignore
 )
 from numbers import Real
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from textwrap import dedent, indent
 from time import monotonic
 from types import MappingProxyType, ModuleType, TracebackType
@@ -271,6 +272,228 @@ def search_cache_logs(
 
 
 # ================ `pytest` stuff: fixtures and markers ================
+
+
+@dataclasses.dataclass
+class VenvFixture:
+    """
+    Convenience wrapper around a virtual environment.
+
+    Example:
+        >>> import sys
+        >>> from collections.abc import Callable
+        >>> from functools import partial
+        >>> from os.path import abspath
+        >>> from shutil import rmtree
+        >>> from subprocess import CompletedProcess
+
+        >>> def get_installed_packages(
+        ...     get_pip_list_output: Callable[
+        ...         [], CompletedProcess[str]
+        ...     ],
+        ... ) -> list[str]:
+        ...     output = get_pip_list_output().stdout
+        ...     return [
+        ...         line.split()[0]
+        ...         for line in output.splitlines()[2:]
+        ...         if line and not line.isspace()
+        ...     ]
+
+        >>> venv: VenvFixture | None = None
+        >>> test_pkg = 'typing_extensions'
+        >>> try:
+        ...     with VenvFixture.context('my_venv') as venv:
+        ...         pip = partial(
+        ...             venv.run_pip,
+        ...             capture_output=True, text=True, check=True,
+        ...         )
+        ...         get_pkgs = partial(
+        ...             get_installed_packages, partial(pip, ['list']),
+        ...         )
+        ...         assert venv.name == 'my_venv'
+        ...         assert venv.path.is_dir()
+        ...         # Isolation of `sys.executable`
+        ...         venv_exe = str(venv.executable.absolute())
+        ...         assert venv_exe != abspath(sys.executable)
+        ...         # Isolation of `site-packages`
+        ...         assert test_pkg not in (pkgs := get_pkgs()), pkgs
+        ...         assert 'line_profiler' not in pkgs, pkgs
+        ...         # Installing a package
+        ...         pip(['install', test_pkg])
+        ...         assert test_pkg in (pkgs := get_pkgs()), pkgs
+        ... finally:
+        ...     if venv is not None:  # Cleanup
+        ...         try:
+        ...             assert not venv.path.exists()
+        ...         finally:
+        ...             rmtree(venv.path, ignore_errors=True)
+    """
+    path: Path
+    python: os.PathLike[str] | str = sys.executable
+    verbose: bool = False
+
+    def _create(self) -> None:
+        self.path.parent.mkdir(exist_ok=True)
+        self._run(
+            [str(self.python), '-m', 'venv', str(self.path)],
+            capture_output=True, text=True, check=True,
+        )
+
+    def _run(
+        self, cmd: Sequence[str], /, verbose: bool | None = None, **kwargs
+    ) -> subprocess.CompletedProcess:
+        if verbose is None:
+            verbose = self.verbose
+        run = run_subproc if verbose else subprocess.run
+        return run(cmd, **kwargs)
+
+    def run(
+        self,
+        cmd: Sequence[str],
+        /,
+        env: Mapping[str, str] | None = None,
+        **kwargs
+    ) -> subprocess.CompletedProcess:
+        self._ensure_executable()
+        env = {**os.environ, **self.environ, **(env or {})}
+        return self._run(cmd, env=env, **kwargs)
+
+    def run_python(
+        self, args: Sequence[str], /, **kwargs
+    ) -> subprocess.CompletedProcess:
+        return self.run([str(self.executable), *args], **kwargs)
+
+    def run_pip(
+        self, args: Sequence[str], /, **kwargs
+    ) -> subprocess.CompletedProcess:
+        return self.run_python(['-m', 'pip', *args], **kwargs)
+
+    def eval(
+        self,
+        expr: str,
+        imports: Mapping[tuple[str, str], str | None] | None = None,
+    ) -> Any:
+        """
+        Example:
+            >>> with VenvFixture.context() as venv:
+            ...     exe_stat_subproc = venv.eval(
+            ...         'MyPath(sys.executable)'
+            ...         '.stat(follow_symlinks=False)',
+            ...         {
+            ...             ('sys', ''): None,
+            ...             ('pathlib', 'Path'): 'MyPath',
+            ...         },
+            ...     )
+            ...     exe_stat_inproc = (
+            ...         venv.executable.stat(follow_symlinks=False)
+            ...     )
+            ...     assert (
+            ...         exe_stat_subproc.st_ino == exe_stat_inproc.st_ino
+            ...     ), (
+            ...         f'expected: {exe_stat_inproc=!r}; '
+            ...         f'actual: {exe_stat_subproc=!r}'
+            ...     )
+        """
+        all_names: set[str] = {'open', 'fobj'}
+        script_lines: list[str] = []
+        imports_dict: Mapping[tuple[str, str], str | None]
+        for imports_dict in [
+            {('pickle', 'dump'): '_pickle_dump'}, (imports or {}),
+        ]:
+            for (loc, obj), alias in imports_dict.items():
+                name = alias or obj or loc
+                assert name not in all_names
+                all_names.add(name)
+                if obj:
+                    import_statement = f'from {loc} import {obj}'
+                else:
+                    import_statement = f'import {loc}'
+                if alias:
+                    import_statement = f'{import_statement} as {alias}'
+                script_lines.append(import_statement)
+
+        with TemporaryDirectory() as tmp:
+            pipe = os.path.join(tmp, 'pipe.pckl')
+            script_lines.append(strip(f"""
+            with open({pipe!r}, mode='wb') as fobj:
+                _pickle_dump({expr}, fobj)
+            """))
+
+            self.run_python(
+                ['-c', '\n'.join(script_lines)],
+                capture_output=True, text=True, check=True,
+            )
+            with open(pipe, mode='rb') as fobj:
+                return pickle.load(fobj)
+
+    @classmethod
+    def _fixture_helper(
+        cls,
+        /,
+        name: str = 'venv',
+        python: os.PathLike[str] | str | None = None,
+        verbose: bool = False,
+    ) -> Generator[Self, None, None]:
+        kwargs: dict[str, Any] = {'verbose': verbose}
+        if python is not None:
+            kwargs['python'] = python
+        with TemporaryDirectory() as tmp:
+            venv = cls(Path(tmp) / name, **kwargs)
+            venv._create()
+            yield venv
+
+    context = classmethod(contextmanager(
+        cast(classmethod, _fixture_helper).__func__,
+    ))
+
+    def _ensure_executable(self) -> Path:
+        if self._executable is None:  # Not initialized yet
+            self._create()
+            assert self._executable is not None
+        return self._executable
+
+    def _find_executables(self) -> Generator[Path, None, None]:
+        script_loc = os.path.basename(sysconfig.get_path(
+            'scripts', scheme='venv',
+        ))
+        for name in 'python', 'python3', 'python.exe':
+            exe = self.path / script_loc / name
+            if exe.exists():
+                yield exe
+
+    @property
+    def environ(self) -> dict[str, str]:
+        try:
+            old_path = os.environ['PATH']
+        except KeyError:
+            path = str(self.path)
+        else:
+            path = f'{self.path}{os.pathsep}{old_path}'
+        return {
+            'VIRTUAL_ENV': str(self.path),
+            'VIRTUAL_ENV_PROMPT': self.name,
+            'PATH': path,
+        }
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def _executable(self) -> Path | None:
+        exe: Path | None = getattr(self, '_exe', None)
+        if exe is not None:
+            return exe
+        try:
+            self._exe = exe = next(self._find_executables())
+        except StopIteration:
+            return None
+        else:
+            return exe
+
+    @property
+    def executable(self) -> Path:
+        return self._ensure_executable()
 
 
 @dataclasses.dataclass

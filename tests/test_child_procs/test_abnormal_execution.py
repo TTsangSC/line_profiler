@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Collection
+from collections.abc import Collection, Generator
 from contextlib import ExitStack
+from functools import partial
 from multiprocessing import get_all_start_methods
 from pathlib import Path
 from stat import S_IWUSR, S_IWGRP, S_IWOTH, S_IWRITE
@@ -18,11 +19,12 @@ import pytest
 from line_profiler._child_process_profiling.cache import LineProfilingCache
 
 from ._test_child_procs_utils import (
-    run_subproc, strip, check_tagged_line_nhits,
+    VenvFixture, run_subproc, strip, check_tagged_line_nhits,
 )
 
 
 DEBUG = True
+_USE_FRESH_VENV = True
 
 
 class _write_debug_log:
@@ -350,12 +352,25 @@ def test_corrupted_child_stats_file(
             )
 
 
+@pytest.fixture(scope='module')
+def venv() -> Generator[VenvFixture, None, None]:
+    """
+    Fresh virtual env with :py:mod:`line_profiler` installed from
+    source.
+    """
+    for venv in VenvFixture._fixture_helper(verbose=True):
+        repo_dir = str(Path(__file__).parent.parent.parent)
+        venv.run_pip(['install', repo_dir], check=True)
+        yield venv
+
+
 @pytest.mark.parametrize('start_method', ['spawn', 'fork', 'forkserver'])
 @pytest.mark.parametrize(
     ('make_unwritable', 'label'),
     [(True, 'cannot-write-pth'), (False, 'can-write-pth')])
 @pytest.mark.parametrize(('n', 'nprocs'), [(100, 1)])
 def test_unwritable_purelib_path(
+    request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
     pool_test_module_object: ModuleType,
     make_unwritable: bool,
@@ -428,11 +443,21 @@ def test_unwritable_purelib_path(
     with _write_debug_log(debug_log):
         # Check: even if we can't write a .pth, it shouldn't cause
         # `kernprof` to error out
+        if _USE_FRESH_VENV:
+            venv: VenvFixture = request.getfixturevalue('venv')
+            pth_locs: list[os.PathLike[str] | str] = venv.eval(
+                f'list({get_pth_locs.__qualname__}())',
+                {(LineProfilingCache.__module__, 'LineProfilingCache'): None},
+            )
+            run_kernprof = partial(venv.run_python, cmd[1:])
+        else:
+            pth_locs = list(get_pth_locs())
+            run_kernprof = partial(run_subproc, cmd)
         with ExitStack() as stack:
             if make_unwritable:
-                for path in get_pth_locs():
+                for path in pth_locs:
                     stack.enter_context(_revoke_write_access(path))
-            proc = run_subproc(cmd, capture_output=True, text=True, check=True)
+            proc = run_kernprof(capture_output=True, text=True, check=True)
         # Check: collection of profiling data is as expected
         for tag, num in nhits.items():
             check_tagged_line_nhits(proc.stdout, tag, num)
