@@ -135,7 +135,7 @@ class AstTreeProfiler:
                 abstract syntax tree to be profiled.
 
             tree_imports_to_profile_dict (dict[tuple[str | int, ...], \
-list[str]]):
+list[ImportTarget]]):
                 dict of imports to profile
                     key (tuple[str | int, ...]):
                         Location of import in AST, e.g. ``('body', 0)``
