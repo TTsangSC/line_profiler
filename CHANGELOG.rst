@@ -16,6 +16,10 @@ Changes
   to avoid edge-case issues with e.g. pickling (#437)
 * FEAT: Experimental support for profiling child processes with
   ``kernprof --prof-child-procs`` (#431)
+* FIX: Fixed bugs where ``kernprof -l`` (1) misses ``--prof-mod``
+  targets if multiple thereof are imported in the same (from-)import
+  statement, and (2) crashes when profiling modules containing
+  ``from ... import *`` statements (#434)
 
 
 5.0.2
