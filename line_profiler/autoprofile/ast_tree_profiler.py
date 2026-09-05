@@ -6,17 +6,16 @@ import os
 from collections.abc import Collection, Mapping, MutableSequence, Sequence
 from typing import Any, cast
 
-from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ..toml_config import ConfigSource
+from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
+from ._single_pass_transformer import CompoundStatement
 from .ast_profile_transformer import (  # noqa: F401
     AstProfileTransformer,
     _ast_create_node_from_import_target,
     # Keep import below for compatibility
     ast_create_profile_node,
 )
-from .profmod_extractor import (
-    _CompoundStatement, ProfmodExtractor, _should_profile_star_imports,
-)
+from .profmod_extractor import ProfmodExtractor, _should_profile_star_imports
 
 __docstubs__ = """
 from .ast_profile_transformer import AstProfileTransformer
@@ -132,7 +131,7 @@ class AstTreeProfiler:
         profile_imports: bool = False,
         modnames_to_profile: Collection[str] = (),
         profile_star_imports: bool = False,
-        profile_nested_imports: Collection[_CompoundStatement] | None = None,
+        profile_nested_imports: Collection[CompoundStatement] | None = None,
     ) -> ast.Module:
         """
         Add profiling to an abstract syntax tree by adding nodes to the
@@ -256,7 +255,7 @@ class AstTreeProfiler:
         self,
         *,
         profile_star_imports: bool | None = None,
-        profile_nested_imports: Collection[_CompoundStatement] | None = None,
+        profile_nested_imports: Collection[CompoundStatement] | None = None,
     ) -> ast.Module:
         """
         Create an abstract syntax tree of a script and add profiling to

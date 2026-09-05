@@ -56,7 +56,8 @@ from typing import Any, cast
 
 from ..toml_config import ConfigSource
 from ..line_profiler_utils import restore
-from .ast_tree_profiler import AstTreeProfiler, _CompoundStatement
+from ._single_pass_transformer import CompoundStatement
+from .ast_tree_profiler import AstTreeProfiler
 from .run_module import AstTreeModuleProfiler
 from .line_profiler_utils import (
     add_imported_function_or_module, add_star_import,
@@ -102,7 +103,7 @@ def run(
     *,
     config: os.PathLike[str] | str | None = None,
     profile_star_imports: bool | None = None,
-    profile_nested_imports: Collection[_CompoundStatement] | None = None,
+    profile_nested_imports: Collection[CompoundStatement] | None = None,
 ) -> None:
     """
     Automatically profile a script and run it, profiling functions,

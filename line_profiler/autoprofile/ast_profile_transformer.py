@@ -12,127 +12,24 @@ from warnings import warn
 from .. import _diagnostics as diagnostics
 from ..toml_config import ConfigSource
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
-from .profmod_extractor import (
-    _CompoundNodeType, _CompoundStatement, _ImportFinder,
-    _should_profile_star_imports,
+from ._single_pass_transformer import (
+    _CompoundNodeChecker, CompoundNodeType, CompoundStatement,
+    ast_create_profile_node, ast_create_star_import_node,
 )
+from .profmod_extractor import _should_profile_star_imports
 
+
+__all__ = (
+    'AstProfileTransformer',
+    'ast_create_profile_node', 'ast_create_star_import_node',
+)
 
 _Import = TypeVar('_Import', ast.Import, ast.ImportFrom)
 
-_PROFILE_IMPORTS_IN_DEFAULT: MappingProxyType[_CompoundNodeType, bool]
+_PROFILE_IMPORTS_IN_DEFAULT: MappingProxyType[CompoundNodeType, bool]
 _PROFILE_IMPORTS_IN_DEFAULT = MappingProxyType(dict.fromkeys(
-    get_args(_CompoundNodeType), True,
+    get_args(CompoundNodeType), True,
 ))
-
-
-def ast_create_profile_node(
-    modname: str,
-    profiler_name: str = 'profile',
-    attr: str = 'add_imported_function_or_module',
-) -> ast.Expr:
-    """
-    Create an abstract syntax tree node that adds an object to the
-    profiler to be profiled, by calling the ``attr`` method of
-    ``profile`` and passing ``modname`` to it.
-
-    At runtime, this adds the object to the profiler so it can be
-    profiled. This node must be added after the first instance of
-    ``modname`` in the AST and before it is used.
-
-    The node will look like:
-        >>> # xdoctest: +SKIP
-        >>> import foo.bar
-        >>> profile.add_imported_function_or_module(foo.bar)
-
-    Args:
-        modname (str):
-            name of the imported module.
-
-        profiler_name (str):
-            name of the :py:class:`line_profiler.LineProfiler` object.
-
-        attr (str):
-            name of the method of the :py:class:`LineProfiler` object to
-            call on the imported module.
-
-    Returns:
-        (_ast.Expr): expr
-            AST node that adds ``modname`` to profiler.
-    """
-    func = ast.Attribute(
-        value=ast.Name(id=profiler_name, ctx=ast.Load()),
-        attr=attr,
-        ctx=ast.Load(),
-    )
-    names = modname.split('.')
-    value: ast.expr = ast.Name(id=names[0], ctx=ast.Load())
-    for name in names[1:]:
-        value = ast.Attribute(attr=name, ctx=ast.Load(), value=value)
-    expr = ast.Expr(value=ast.Call(func=func, args=[value], keywords=[]))
-    return expr
-
-
-def ast_create_star_import_node(
-    modname: str,
-    targets: Collection[str] | None,
-    profiler_name: str = 'profile',
-    attr: str = 'add_star_import',
-) -> ast.Expr:
-    """
-    AST node similar to that created by
-    :py:func:`.ast_create_profile_node`, except that it handles
-    star-imports (``from ... import *``), like:
-
-    >>> # doctest: +SKIP
-    >>> from foo.bar import *
-    >>> profile.add_star_import(
-    ...     'foo.bar', ['foo.bar', 'spam.ham'], locals(),
-    ... )
-
-    Args:
-        modname (str):
-            name of the imported module.
-
-        targets (Collection[str] | None):
-            profile-on-import module targets; if :py:const:`None`, all
-            the names imported by the star-import will be added to the
-            profiler.
-
-        profiler_name (str):
-            name of the :py:class:`line_profiler.LineProfiler` object.
-
-        attr (str):
-            name of the method of the
-            :py:class:`line_profiler.LineProfiler` object to call on the
-            imported module.
-
-    Returns:
-        (_ast.Expr): expr
-            AST node that adds ``modname`` to profiler.
-    """
-    func_node = ast.Attribute(
-        value=ast.Name(id=profiler_name, ctx=ast.Load()),
-        attr=attr,
-        ctx=ast.Load(),
-    )
-    modname_node = ast.Constant(value=modname)
-    if targets is None:
-        targets_node: ast.Constant | ast.List = ast.Constant(value=None)
-    else:
-        targets_node = ast.List(
-            elts=[ast.Constant(value=t) for t in targets],
-            ctx=ast.Load(),
-        )
-    namespace_node = ast.Call(
-        func=ast.Name(id='locals', ctx=ast.Load()), args=[], keywords=[],
-    )
-    expr = ast.Expr(value=ast.Call(
-        func=func_node,
-        args=[modname_node, targets_node, namespace_node],
-        keywords=[],
-    ))
-    return expr
 
 
 def _ast_create_node_from_import_target(
@@ -304,7 +201,7 @@ class AstProfileTransformer(ast.NodeTransformer):
         *,
         profile_star_imports: bool = False,
         profile_imports_in: Mapping[
-            _CompoundNodeType, bool
+            CompoundNodeType, bool
         ] = _PROFILE_IMPORTS_IN_DEFAULT,
     ) -> None:
         """
@@ -453,7 +350,7 @@ class AstProfileTransformer(ast.NodeTransformer):
             *ancestry, _ = self._current_node_ancestry
             svi = self._should_visit_imports
             should_profile = all(
-                svi.get(cast(_CompoundNodeType, a_type), True)
+                svi.get(cast(CompoundNodeType, a_type), True)
                 for a_type in ancestry
             )
 
@@ -592,13 +489,12 @@ class AstProfileTransformer(ast.NodeTransformer):
     @staticmethod
     def _get_profile_imports_in(
         config: ConfigSource | None = None,
-        profile_nested_imports: Collection[_CompoundStatement] | None = None,
-    ) -> dict[_CompoundNodeType, bool]:
-        if config is None:
-            config = ConfigSource.from_default()
-        return _ImportFinder.filter_node_types(
-            **_ImportFinder._get_filter_args(config, profile_nested_imports),
+        profile_nested_imports: Collection[CompoundStatement] | None = None,
+    ) -> dict[CompoundNodeType, bool]:
+        checker = _CompoundNodeChecker.from_config(
+            config, profile_nested_imports,
         )
+        return dict(checker.allowed)
 
     @classmethod
     def _transform(
@@ -608,7 +504,7 @@ class AstProfileTransformer(ast.NodeTransformer):
         *,
         config: ConfigSource | None = None,
         profile_star_imports: bool | None = None,
-        profile_nested_imports: Collection[_CompoundStatement] | None = None,
+        profile_nested_imports: Collection[CompoundStatement] | None = None,
         _known_dropped_star_imports: Collection[ImportTarget] | None = None,
         **kwargs,
     ) -> ast.Module:
