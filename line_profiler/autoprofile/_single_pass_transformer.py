@@ -258,6 +258,21 @@ class ContextAwareVisitor(ast.NodeVisitor):
     root node and (2) attribute and item accesses leading to the current
     one.
 
+    The :py:meth:`._pre_visit_hook` (resp. :py:meth:`._post_visit_hook`)
+    methods can be overridden to perform e.g. bookkeeping tasks before
+    (resp. after) visiting a node and possibly transforming it.
+
+    Node-type-specific visitor methods can make use of the following
+    attributes:
+
+    :py:attr:`._current_loc` (Sequence[int | str]):
+        List of attribute/item accesses needed to reach the current node
+        from the root node.
+
+    :py:attr:`._node_stack` (Sequence[ast.AST]):
+        Lineage of AST nodes starting from the root node and ending on
+        the current node.
+
     Notes:
         Can be used as a mixin if transformation is required (see
         Examples).
@@ -299,10 +314,23 @@ class ContextAwareVisitor(ast.NodeVisitor):
         ...         self.records.append(record)
 
         >>> class PreRecorder(BaseRecorder):
-        ...     pre_visit_hook = BaseRecorder._visit_hook
+        ...     _pre_visit_hook = BaseRecorder._visit_hook
 
         >>> class PostRecorder(BaseRecorder):
-        ...     post_visit_hook = BaseRecorder._visit_hook
+        ...     _post_visit_hook = BaseRecorder._visit_hook
+
+        >>> class OnVisitRecorder(BaseRecorder):
+        ...     def __init__(self) -> None:
+        ...         super().__init__((ast.Import, ast.Return))
+        ...
+        ...     def _visit_handled(
+        ...         self, node: ast.Import | ast.Return,
+        ...     ) -> None:
+        ...         self._visit_hook(
+        ...             node, self._node_stack, self._current_loc,
+        ...         )
+        ...
+        ...     visit_Import = visit_Return = _visit_handled
 
         >>> tree = ast.parse('''
         ... import foo
@@ -314,6 +342,7 @@ class ContextAwareVisitor(ast.NodeVisitor):
 
         >>> pre = PreRecorder((ast.Import, ast.Return))
         >>> post = PostRecorder((ast.Import, ast.Return))
+        >>> on_visit = OnVisitRecorder()
         >>> expected_records = [
         ...     Record(ast.Import, ['Module', 'Import'], ['body', 0]),
         ...     Record(
@@ -324,8 +353,12 @@ class ContextAwareVisitor(ast.NodeVisitor):
         ... ]
         >>> pre.visit(tree)
         >>> post.visit(tree)
+        >>> on_visit.visit(tree)
         >>> assert pre.records == expected_records, pre.records
         >>> assert post.records == expected_records, post.records
+        >>> assert on_visit.records == expected_records, (
+        ...     on_visit.records
+        ... )
 
         Generic transforming:
 
@@ -405,7 +438,7 @@ class ContextAwareVisitor(ast.NodeVisitor):
         ...         )
         ...         records.append(record)
         ...
-        ...     def pre_visit_hook(
+        ...     def _pre_visit_hook(
         ...         self,
         ...         node: ast.AST,
         ...         ancestry: Sequence[ast.AST],
@@ -413,7 +446,7 @@ class ContextAwareVisitor(ast.NodeVisitor):
         ...     ) -> None:
         ...         self._visit_hook(node, ancestry, loc, self.before)
         ...
-        ...     def post_visit_hook(
+        ...     def _post_visit_hook(
         ...         self,
         ...         node: ast.AST,
         ...         ancestry: Sequence[ast.AST],
@@ -500,7 +533,7 @@ class ContextAwareVisitor(ast.NodeVisitor):
         self._current_loc: list[str | int] = []
         self._is_transformer = isinstance(self, ast.NodeTransformer)
 
-    def pre_visit_hook(
+    def _pre_visit_hook(
         self,
         node: ast.AST,
         /,
@@ -532,7 +565,7 @@ class ContextAwareVisitor(ast.NodeVisitor):
               original node and NOT the new replacement nodes.
         """
 
-    def post_visit_hook(
+    def _post_visit_hook(
         self,
         node: ast.AST,
         /,
@@ -565,52 +598,57 @@ class ContextAwareVisitor(ast.NodeVisitor):
         """
 
     def generic_visit(self, node: ast.AST) -> Any:
-        self._node_stack.append(node)
-        try:
-            for field, value in ast.iter_fields(node):
-                if isinstance(value, ast.AST):
-                    self._visit_generic_child(node, field, value)
-                elif isinstance(value, MutableSequence):
-                    if not all(isinstance(item, ast.AST) for item in value):
-                        continue
-                    # Compound node
-                    self._visit_generic_children(
-                        node, field, cast(MutableSequence[ast.AST], value),
-                    )
-        finally:
-            self._node_stack.pop()
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                self._visit_generic_child(node, field, value)
+            elif isinstance(value, MutableSequence):
+                if not all(isinstance(item, ast.AST) for item in value):
+                    continue
+                # Compound node
+                self._visit_generic_children(
+                    node, field, cast(MutableSequence[ast.AST], value),
+                )
         return node if self._is_transformer else None
 
     def visit(self, node: ast.AST) -> Any:
-        self.pre_visit_hook(node, self._node_stack + [node], self._current_loc)
-        result = super().visit(node)
-        if self._is_transformer:
-            body = self._current_loc and isinstance(self._current_loc[-1], int)
-            result = cast(ast.AST | Sequence[ast.AST] | None, result)
-            if body:  # Calculate new locations
-                if result is None:
-                    replacements: Sequence[ast.AST] = []
-                elif isinstance(result, ast.AST):
-                    replacements = [result]
-                else:
-                    replacements = result
-                *loc, index = self._current_loc
-                for offset, node in enumerate(replacements):
-                    self.post_visit_hook(
-                        node,
-                        self._node_stack + [node],
-                        loc + [cast(int, index) + offset],
-                    )
-            elif result is not None:
-                self.post_visit_hook(
-                    cast(ast.AST, result),
-                    self._node_stack + [node],
-                    self._current_loc,
-                )
-        else:
-            self.post_visit_hook(
-                node, self._node_stack + [node], self._current_loc,
+        self._node_stack.append(node)
+        try:
+            self._pre_visit_hook(
+                node, self._node_stack, self._current_loc,
             )
+            result = super().visit(node)
+            if self._is_transformer:
+                body = (
+                    self._current_loc
+                    and isinstance(self._current_loc[-1], int)
+                )
+                *ancestors, _ = self._node_stack
+                result = cast(ast.AST | Sequence[ast.AST] | None, result)
+                if body:  # Calculate new locations
+                    if result is None:
+                        replacements: Sequence[ast.AST] = []
+                    elif isinstance(result, ast.AST):
+                        replacements = [result]
+                    else:
+                        replacements = result
+                    *loc, index = self._current_loc
+                    for offset, node in enumerate(replacements):
+                        self._post_visit_hook(
+                            node,
+                            ancestors + [node],
+                            loc + [cast(int, index) + offset],
+                        )
+                elif result is not None:
+                    node = cast(ast.AST, result)
+                    self._post_visit_hook(
+                        node, ancestors + [node], self._current_loc,
+                    )
+            else:
+                self._post_visit_hook(
+                    node, self._node_stack, self._current_loc,
+                )
+        finally:
+            self._node_stack.pop()
         return result
 
     def _visit_generic_child(

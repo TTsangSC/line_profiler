@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import (
-    Callable, Collection, Mapping, MutableSequence, Sequence,
-)
+from collections.abc import Callable, Collection, Mapping, Sequence
 from os import PathLike
 from types import MappingProxyType
 from typing import Any, Protocol, TypeVar, cast, get_args
@@ -14,6 +12,7 @@ from ..toml_config import ConfigSource
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ._single_pass_transformer import (
     _CompoundNodeChecker, CompoundNodeType, CompoundStatement,
+    ContextAwareVisitor,
     ast_create_profile_node, ast_create_star_import_node,
 )
 from .profmod_extractor import _should_profile_star_imports
@@ -173,7 +172,7 @@ class _LegacyDuplicateChecker:
         self._profiled_imports.add(target.name)
 
 
-class AstProfileTransformer(ast.NodeTransformer):
+class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
     """
     Transform an abstract syntax tree adding profiling to all of its
     objects, by:
@@ -243,6 +242,8 @@ class AstProfileTransformer(ast.NodeTransformer):
                 for each of the compound-statement node type, whether to
                 profile import statements residing therein.
         """
+        super().__init__()
+
         self._profile_imports = bool(profile_imports)
         if profiled_imports is None:
             self._duplicate_checker: _DuplicateChecker
@@ -271,12 +272,13 @@ class AstProfileTransformer(ast.NodeTransformer):
                 '`Mapping[Sequence[str | int], Sequence[ImportTarget]]`, '
                 'or `None`',
             )
+
         self._profiler_name = profiler_name
         self._profile_star_imports = profile_star_imports
-        self._should_visit_imports = dict(profile_imports_in)
+        self._should_visit_imports = (
+            _CompoundNodeChecker(profile_imports_in).check
+        )
         self._dropped_star_imports: set[ImportTarget] = set()
-        self._current_loc: list[str | int] = []
-        self._current_node_ancestry: list[str] = []
 
     def _visit_func_def(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -347,12 +349,9 @@ class AstProfileTransformer(ast.NodeTransformer):
         else:
             # Check if this node is nested inside compound statements
             # that we shouldn't look for imports in
-            *ancestry, _ = self._current_node_ancestry
-            svi = self._should_visit_imports
-            should_profile = all(
-                svi.get(cast(CompoundNodeType, a_type), True)
-                for a_type in ancestry
-            )
+            *ancestry, _ = self._node_stack
+            check = self._should_visit_imports
+            should_profile = all(check(ancestor) for ancestor in ancestry)
 
         if not should_profile:
             # No need for further descent, no other node of interest can
@@ -422,69 +421,6 @@ class AstProfileTransformer(ast.NodeTransformer):
                     profiling node(s)
         """
         return self._visit_import(node, ImportTarget._from_import_from_node)
-
-    def visit(self, node: ast.AST) -> ast.AST | list[ast.AST]:
-        """
-        :py:meth:`ast.NodeTransformer.visit` with extra bookkeeping.
-        """
-        anc = self._current_node_ancestry
-        anc.append(type(node).__name__)
-        try:
-            return super().visit(node)
-        finally:
-            anc.pop()
-
-    def generic_visit(self, node: ast.AST) -> ast.AST:
-        """
-        :py:meth:`ast.NodeTransformer.generic_visit` with extra
-        bookkeeping.
-        """
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, ast.AST):
-                self._visit_generic_child(node, field, value)
-            elif isinstance(value, MutableSequence):  # Compound node
-                if not all(isinstance(item, ast.AST) for item in value):
-                    continue
-                self._visit_generic_children(
-                    node, field, cast(MutableSequence[ast.AST], value),
-                )
-        return node
-
-    def _visit_generic_child(
-        self, node: ast.AST, field: str, child: ast.AST,
-    ) -> None:
-        self._current_loc.append(field)
-        try:
-            replacement: ast.AST | list[ast.AST] = self.visit(child)
-            if isinstance(replacement, ast.AST):
-                setattr(node, field, replacement)
-            else:
-                raise RuntimeError(
-                    f'node = {node!r}: invalid field `.{field}` replacement '
-                    f'({child!r} -> {replacement!r})'
-                )
-        finally:
-            self._current_loc.pop()
-
-    def _visit_generic_children(
-        self, node: ast.AST, field: str, children: MutableSequence[ast.AST],
-    ) -> None:
-        self._current_loc.append(field)
-        try:
-            new_children: list[ast.AST] = []
-            for i, item in enumerate(children):
-                self._current_loc.append(i)
-                try:
-                    replacement = self.visit(item)
-                    if isinstance(replacement, ast.AST):
-                        new_children.append(replacement)
-                    else:
-                        new_children.extend(replacement)
-                finally:
-                    self._current_loc.pop()
-            children[:] = new_children
-        finally:
-            self._current_loc.pop()
 
     @staticmethod
     def _get_profile_imports_in(

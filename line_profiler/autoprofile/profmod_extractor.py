@@ -5,7 +5,8 @@ import os
 import sys
 from collections.abc import Callable, Collection, Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING, cast
+from operator import attrgetter
+from typing import TypeVar, cast
 from warnings import warn
 
 from ..toml_config import ConfigSource
@@ -16,29 +17,27 @@ from .util_static import (
 )
 from .. import _diagnostics as diagnostics
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
-from ._single_pass_transformer import _CompoundNodeChecker, CompoundStatement
+from ._single_pass_transformer import (
+    _CompoundNodeChecker, CompoundStatement, ContextAwareVisitor,
+)
 
 
 __all__ = ('ProfmodExtractor',)
 
+_Import = TypeVar('_Import', ast.Import, ast.ImportFrom)
 
-class _ImportFinder(ast.NodeVisitor):
+
+class _ImportFinder(ContextAwareVisitor):
     """
     Locate all the imports inside an AST, including those nested inside
     other nodes.
     """
-    def __init__(
-        self,
-        checker: _CompoundNodeChecker,
-        found_imports: (
-            dict[tuple[str | int, ...], list[ImportTarget]] | None
-        ) = None,
-    ) -> None:
-        self._current_loc: list[str | int] = []
+    def __init__(self, checker: _CompoundNodeChecker) -> None:
+        super().__init__()
         self._checker = checker
-        if found_imports is None:
-            found_imports = {}
-        self.found_imports = found_imports
+        self.found_imports: dict[
+            tuple[str | int, ...], dict[str, ImportTarget]
+        ] = {}
 
     @classmethod
     def find(
@@ -92,44 +91,32 @@ class _ImportFinder(ast.NodeVisitor):
         checker = _CompoundNodeChecker.from_config(config, find_nested_imports)
         visitor = cls(checker)
         visitor.visit(node)
-        return visitor.found_imports
+        return {
+            loc: sorted(targets.values(), key=attrgetter('index'))
+            for loc, targets in visitor.found_imports.items()
+        }
 
-    def generic_visit(self, node: ast.AST) -> None:
-        """
-        For the compound node types, only visit their children if said
-        type is selected via the init args; for other types, visit by
-        default.
-        """
+    def _visit_import(
+        self,
+        node: _Import,
+        get_import_targets: Callable[[int, _Import], Sequence[ImportTarget]],
+    ) -> None:
+        *loc, index = self._current_loc
+        assert isinstance(index, int)
+        for target in get_import_targets(index, node):
+            imports = self.found_imports.setdefault(tuple(loc), {})
+            imports.setdefault(target.name, target)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._visit_import(node, ImportTarget._from_import_node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._visit_import(node, ImportTarget._from_import_from_node)
+
+    def visit(self, node: ast.AST) -> None:
         if not self._checker.check(node):
-            return  # Deselected types
-        for field, value in ast.iter_fields(node):
-            if isinstance(value, ast.AST):
-                self._current_loc.append(field)
-                try:
-                    self.visit(value)
-                finally:
-                    self._current_loc.pop()
-            elif isinstance(value, Sequence):  # Compound node
-                if not all(isinstance(item, ast.AST) for item in value):
-                    continue
-                if TYPE_CHECKING:
-                    value = cast(Sequence[ast.AST], value)
-                self._current_loc.append(field)
-                try:
-                    # Parse import targets
-                    imports = ImportTarget._from_ast_nodes(value)
-                    # Descend into children nodes
-                    if imports:
-                        loc = tuple(self._current_loc)
-                        self.found_imports[loc] = imports
-                    for i, item in enumerate(value):
-                        self._current_loc.append(i)
-                        try:
-                            self.visit(item)
-                        finally:
-                            self._current_loc.pop()
-                finally:
-                    self._current_loc.pop()
+            return  # Don't descend into node types we don't care about
+        super().visit(node)
 
 
 class ProfmodExtractor:
