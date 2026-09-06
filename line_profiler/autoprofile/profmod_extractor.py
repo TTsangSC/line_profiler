@@ -19,6 +19,7 @@ from .. import _diagnostics as diagnostics
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ._single_pass_transformer import (
     _CompoundNodeChecker, CompoundStatement, ContextAwareVisitor,
+    should_profile_regular_import, should_profile_star_import,
 )
 
 
@@ -308,9 +309,9 @@ class ProfmodExtractor:
                 continue
             should_profile: Callable[[Collection[str], str], bool]
             if modname.endswith('.*'):
-                should_profile = _should_profile_star_import
+                should_profile = should_profile_star_import
             else:
-                should_profile = _should_profile_regular_import
+                should_profile = should_profile_regular_import
             if not should_profile(modnames_to_profile, modname):
                 continue
             modname_added_list.append(modname)
@@ -493,34 +494,6 @@ class ProfmodExtractor:
         return frozenset(self._get_modnames_to_profile_from_prof_mod(
             self._script_file, self._prof_mod,
         ))
-
-
-def _should_profile_regular_import(
-    targets: Collection[str], modname: str,
-) -> bool:
-    """
-    Check if either the parent module or submodule are in
-    ``targets``
-    """
-    names = {modname, modname.rsplit('.', 1)[0]}
-    return bool(names.intersection(targets))
-
-
-def _should_profile_star_import(
-    targets: Collection[str], star_modname: str,
-) -> bool:
-    """
-    Check if ``star_modname`` (should end in '.*') would match any of
-    ``targets`` (should they actually exist)
-    """
-    assert star_modname.endswith('.*')
-    modname = star_modname[:-2]
-    if modname in targets:
-        return True
-    return any(
-        target.rpartition('.')[0] == modname
-        for target in targets if '.' in target
-    )
 
 
 def _should_profile_star_imports(config: ConfigSource | None) -> bool:

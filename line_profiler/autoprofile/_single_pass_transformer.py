@@ -12,16 +12,22 @@ from __future__ import annotations
 
 import ast
 import os
-from collections.abc import Collection, Mapping, MutableSequence, Sequence
-from typing import Any, ClassVar, Literal, Self, TypeVar, cast, get_args
+from collections.abc import (
+    Callable, Collection, Mapping, MutableSequence, Sequence,
+)
+from functools import cached_property, partial
+from typing import (
+    Any, ClassVar, Literal, Protocol, Self, TypeVar, cast, get_args,
+)
 
 from ..toml_config import ConfigSource
 from ._import_targets import ImportTarget
 
 
 __all__ = (
-    'ContextAwareVisitor',
+    'ContextAwareVisitor', 'SinglePassTransformer',
     'ast_create_profile_node', 'ast_create_star_import_node',
+    'should_profile_regular_import', 'should_profile_star_import',
 )
 
 # Node types where code blocks can be found
@@ -46,7 +52,11 @@ CompoundStatement = Literal[
     'loops', 'conditionals', 'contexts', 'try_except',
 ]
 ImportStatement = TypeVar('ImportStatement', ast.Import, ast.ImportFrom)
+DefineStatement = TypeVar(
+    'DefineStatement', ast.FunctionDef, ast.AsyncFunctionDef,
+)
 Node = TypeVar('Node', bound=ast.AST)
+T = TypeVar('T')
 
 
 def ast_create_profile_node(
@@ -80,7 +90,7 @@ def ast_create_profile_node(
             name of the method of the :py:class:`LineProfiler` object to
             call on the imported module.
 
-    Returns:
+Returns:
         expr (ast.Expr):
             AST node that adds ``modname`` to profiler.
     """
@@ -158,7 +168,105 @@ def ast_create_star_import_node(
     return expr
 
 
+def should_profile_regular_import(
+    targets: Collection[str], modname: str,
+) -> bool:
+    """
+    Check if either the parent module or submodule are in
+    ``targets``
+    """
+    names = {modname, modname.rsplit('.', 1)[0]}
+    return bool(names.intersection(targets))
+
+
+def should_profile_star_import(
+    targets: Collection[str], star_modname: str,
+) -> bool:
+    """
+    Check if ``star_modname`` (should end in '.*') would match any of
+    ``targets`` (should they actually exist)
+    """
+    assert star_modname.endswith('.*')
+    modname = star_modname[:-2]
+    if modname in targets:
+        return True
+    return any(
+        target.rpartition('.')[0] == modname
+        for target in targets if '.' in target
+    )
+
+
+def _return_value(value: T, /, *_, **__) -> T:
+    return value
+
+
+class _DuplicateImportChecker(Protocol):
+    """
+    Protocol for objects which helps with on-import profiling
+    deduplication.
+    """
+    def should_profile_import(
+        self, target: ImportTarget, context: Sequence[str | int], /,
+    ) -> bool:
+        ...
+
+    def record_profiled_import(
+        self, target: ImportTarget, context: Sequence[str | int], /,
+    ) -> Any:
+        ...
+
+
+class _ConcreteDuplicateImportChecker:
+    """
+    Concrete implementation of :py:class:`~._DuplicateImportChecker`.
+    """
+    def __init__(self) -> None:
+        self._profiled_imports: dict[
+            tuple[str | int, ...], dict[int, list[ImportTarget]]
+        ] = {}
+
+    def should_profile_import(
+        self, target: ImportTarget, context: Sequence[str | int],
+    ) -> bool:
+        # Note: the `index` shouldn't be needed since we're already
+        # going through the import targets in order
+        ctx, _ = self._check_context(context)
+        if ctx not in self._profiled_imports:
+            return True
+        ctx_profiled_names = {
+            imp.name
+            for imports in self._profiled_imports[ctx].values()
+            for imp in imports
+        }
+        return target.name not in ctx_profiled_names
+
+    def record_profiled_import(
+        self, target: ImportTarget, context: Sequence[str | int],
+    ) -> None:
+        ctx, index = self._check_context(context)
+        (
+            self._profiled_imports
+            .setdefault(ctx, {})
+            .setdefault(index, [])
+            .append(target)
+        )
+
+    @staticmethod
+    def _check_context(
+        context: Sequence[str | int],
+    ) -> tuple[tuple[str | int, ...], int]:
+        *ctx, index = context
+        if not isinstance(index, int):
+            raise TypeError(
+                f'context[-1] = {context[-1]!r}: expected an integer',
+            )
+        return tuple(ctx), index
+
+
 class _CompoundNodeChecker:
+    """
+    Helper object for deciding on whether to look into a node.
+    """
     _compound_node_types: ClassVar[set[CompoundNodeType]] = cast(
         set[CompoundNodeType], set(get_args(CompoundNodeType)),
     )
@@ -699,3 +807,300 @@ class ContextAwareVisitor(ast.NodeVisitor):
                 children[:] = new_children
         finally:
             self._current_loc.pop()
+
+
+class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
+    """
+    Transform an abstract syntax tree adding profiling to all of its
+    objects, by:
+
+    - Decorating locally-defined functions/methods that are not already
+      decorated with the profiler.
+
+    - Adding profiler method calls (see
+      :py:func:`line_profiler.autoprofile.line_profiler_utils\
+.add_imported_function_or_module`
+      and
+      :py:func:`line_profiler.autoprofile.line_profiler_utils\
+.add_star_import`)
+      immediately after imports to profile the appropriate import
+      targets.
+
+    Args:
+        profiler_name (str):
+            Name under which the profiler instance should be found
+            (default: ``'profile'``).
+
+        prof_func_defs (bool | None):
+            Whether to add a ``@profile`` decorator to all the
+            locally-defined functions and methods that are not already
+            decorated with the profiler.
+            If :py:const:`None`, it is resolved from the active config's
+            ``[tool.line_profiler.autoprofile]::prof_func_defs``.
+
+        prof_explicit_imports (Collection[str] | bool | None):
+            Which explicit-import targets (``import x.y`` or
+            ``from x import y``) to profile;
+            can also be a global boolean toggle.
+            If :py:const:`None`, it is resolved from the active config's
+            ``[tool.line_profiler.autoprofile]::prof_explicit_imports``.
+
+        prof_star_imports (Collection[str] | bool | None):
+            Which star-import targets (``from x import *``) to profile;
+            can also be a global boolean toggle.
+            If :py:const:`None`, it is resolved from the active config's
+            ``[tool.line_profiler.autoprofile]::prof_star_imports``.
+
+        prof_imports_in (Mapping[Literal[\
+'Module', 'Interactive',\
+'FunctionDef', 'AsyncFunctionDef',\
+'ClassDef',\
+'For', 'AsyncFor', 'While',\
+'If', 'match_case',\
+'With', 'AsyncWith',\
+'Try', 'TryStar', 'ExceptHandler',\
+], bool]):
+            Which compound-statement types to descend into and look for
+            imports;
+            if :py:const:`None`, it is resolved from the active config's
+            ``[tool.line_profiler.autoprofile]::import_discovery``.
+            This can be used to control import-statement reachability;
+            e.g. to avoid repeatedly calling the aforementioned
+            ``add_imported_function_or_module()`` and
+            ``add_star_import()`` within a function body.
+
+        config (str | os.PathLike[str] | None):
+            Source from which config options are loaded.
+    """
+    def __init__(
+        self,
+        profiler_name: str = 'profile',
+        *,
+        config: str | os.PathLike[str] | None = None,
+        prof_func_defs: bool | None = None,
+        prof_explicit_imports: Collection[str] | bool | None = None,
+        prof_star_imports: Collection[str] | bool | None = None,
+        prof_imports_in: Mapping[CompoundNodeType, bool] | None = None,
+    ) -> None:
+        super().__init__()
+
+        conf = ConfigSource.from_config(config).get_subconfig('autoprofile')
+        if prof_func_defs is None:
+            prof_func_defs = conf.conf_dict['prof_func_defs']
+        if prof_explicit_imports is None:
+            prof_explicit_imports = conf.conf_dict['prof_explicit_imports']
+        if prof_star_imports is None:
+            prof_star_imports = conf.conf_dict['prof_star_imports']
+        if prof_imports_in is None:
+            prof_imports_in = _CompoundNodeChecker.from_config(config).allowed
+
+        try:
+            prof_explicit_imports = frozenset(cast(
+                'Collection[str]', prof_explicit_imports,
+            ))
+        except TypeError:
+            prof_explicit_imports = bool(prof_explicit_imports)
+        try:
+            prof_star_imports = frozenset(cast(
+                'Collection[str]', prof_star_imports,
+            ))
+        except TypeError:
+            prof_star_imports = bool(prof_star_imports)
+
+        self._profiler_name = profiler_name
+        self._prof_func_defs = bool(prof_func_defs)
+        self._prof_explicit_imports = prof_explicit_imports
+        self._prof_star_imports = prof_star_imports
+
+        self._import_ancestry_checker = _CompoundNodeChecker(prof_imports_in)
+        self._duplicate_import_checker: _DuplicateImportChecker
+        self._duplicate_import_checker = _ConcreteDuplicateImportChecker()
+
+    def _visit_import(
+        self,
+        node: ImportStatement,
+        get_import_targets: Callable[
+            [int, ImportStatement], Sequence[ImportTarget]
+        ],
+    ) -> ImportStatement | list[ImportStatement | ast.Expr]:
+        # Should we be looking at this import statement?
+        check_ancestor = self._import_ancestry_checker.check
+        if not all(check_ancestor(node) for node in self._node_stack):
+            return node
+
+        *_, index = self._current_loc
+        assert isinstance(index, int)
+        result: list[ImportStatement | ast.Expr] = [node]
+        dup_checker = self._duplicate_import_checker
+
+        for target in get_import_targets(index, node):
+            # Have we already profiled this import?
+            if not dup_checker.should_profile_import(
+                target, self._current_loc,
+            ):
+                continue
+
+            maybe_expr = self._handle_new_import_target(target)
+            if maybe_expr is not None:
+                result.append(maybe_expr)
+                dup_checker.record_profiled_import(target, self._current_loc)
+        return result
+
+    def _handle_new_import_target(
+        self, target: ImportTarget,
+    ) -> ast.Expr | None:
+        """
+        Returns:
+            maybe_expr (ast.Expr | None):
+                An expression responsible for setting up profiling of
+                the import target, where appropriate.
+        """
+        if target.resolved_name is None:  # Star import
+            create_node, should_profile = self._star_import_handlers
+        else:  # Explicit import
+            create_node, should_profile = self._expl_import_handlers
+
+        if should_profile(target.name):
+            return create_node(target.name)
+        return None
+
+    def visit_Import(
+        self, node: ast.Import,
+    ) -> ast.Import | list[ast.Import | ast.Expr]:
+        """
+        Where appropriate (as determined by ``prof_explicit_imports``
+        and ``prof_imports_in``), add nodes that profile objects
+        imported using the ``import foo`` syntax.
+
+        Args:
+            node (ast.Import):
+                import in the AST
+
+        Returns:
+            nodes (ast.Import | list[ast.Import | ast.Expr]):
+                ``node`` with subsequent profiling expressions inserted
+                for on-import profiling of the appropriate import
+                targets
+        """
+        return self._visit_import(node, ImportTarget._from_import_node)
+
+    def visit_ImportFrom(
+        self, node: ast.ImportFrom
+    ) -> ast.ImportFrom | list[ast.ImportFrom | ast.Expr]:
+        """
+        Where appropriate (as determined by ``prof_explicit_imports``,
+        ``prof_star_imports``, and ``prof_imports_in``), add nodes that
+        profile objects imported using the ``from foo import bar``
+        syntax.
+
+        Args:
+            node (ast.ImportFrom):
+                import in the AST
+
+        Returns:
+            nodes (ast.ImportFrom | list[ast.ImportFrom | ast.Expr]):
+                ``node`` with subsequent profiling expressions inserted
+                for on-import profiling of the appropriate import
+                targets
+        """
+        return self._visit_import(node, ImportTarget._from_import_from_node)
+
+    def _visit_func_def(self, node: DefineStatement) -> DefineStatement:
+        """
+        Where appropriate (as determined by ``prof_func_defs``),
+        decorate functions/methods with the profiler (at
+        ``profiler_name``) if they aren't already decorated therewith.
+
+        Args:
+            node (ast.FunctionDef | ast.AsyncFunctionDef):
+                function/method in the AST
+
+        Returns:
+            node (ast.FunctionDef | ast.AsyncFunctionDef):
+                function/method with profiling decorator
+
+        Notes:
+            The added decorator is appended to decorator list to avoid
+            conflicts with other decorators e.g. ``@staticmethod``.
+        """
+        if self._prof_func_defs:
+            decor_ids: set[str] = {
+                decor.id for decor in node.decorator_list
+                if isinstance(decor, ast.Name)
+            }
+            if self._profiler_name not in decor_ids:
+                node.decorator_list.append(
+                    ast.Name(id=self._profiler_name, ctx=ast.Load())
+                )
+        self.generic_visit(node)
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = _visit_func_def
+
+    @staticmethod
+    def _create_star_import_node(
+        target_name: str, /, *args, **kwargs
+    ) -> ast.Expr:
+        """
+        Wrapper around :py:func:`ast_create_star_import_node` which
+        directly takes the :py:attr:`ImportTarget.name` of a
+        star-import.
+        """
+        if target_name.endswith('.*'):
+            target_name = target_name[:-2]
+        return ast_create_star_import_node(target_name, *args, **kwargs)
+
+    @cached_property
+    def _expl_import_handlers(self) -> tuple[
+        Callable[[str], ast.Expr], Callable[[str], bool],
+    ]:
+        """
+        Returns:
+            (create_node, should_profile) \
+(tuple[Callable[[str], ast.Expr], Callable[[str], bool]]):
+                create_node()
+                    Callable taking the :py:attr:`ImportTarget.name` and
+                    returning an AST node responsible for setting up
+                    profiling therefrom
+                should_profile()
+                    Callable taking the :py:attr:`ImportTarget.name` and
+                    returning whether it should be profiled
+        """
+        profiled_imports = self._prof_explicit_imports
+        should_profile: Callable[[str], bool]
+        if profiled_imports in (True, False):
+            should_profile = partial(_return_value, bool(profiled_imports))
+        else:
+            should_profile = partial(
+                should_profile_regular_import,
+                cast(Collection[str], profiled_imports),
+            )
+        create_node: Callable[[str], ast.Expr] = partial(
+            ast_create_profile_node, profiler_name=self._profiler_name,
+        )
+        return create_node, should_profile
+
+    @cached_property
+    def _star_import_handlers(self) -> tuple[
+        Callable[[str], ast.Expr], Callable[[str], bool],
+    ]:
+        """
+        Returns:
+            See :py:attr:`._expl_import_handlers`.
+        """
+        profiled_imports = self._prof_star_imports
+        should_profile: Callable[[str], bool]
+        if profiled_imports in (True, False):
+            star_import_targets: Collection[str] | None = None
+            should_profile = partial(_return_value, bool(profiled_imports))
+        else:
+            star_import_targets = cast(Collection[str], profiled_imports)
+            should_profile = partial(
+                should_profile_star_import, star_import_targets,
+            )
+        create_node: Callable[[str], ast.Expr] = partial(
+            self._create_star_import_node,
+            targets=star_import_targets,
+            profiler_name=self._profiler_name,
+        )
+        return create_node, should_profile

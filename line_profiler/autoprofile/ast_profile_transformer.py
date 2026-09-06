@@ -4,14 +4,18 @@ import ast
 from collections.abc import Callable, Collection, Mapping, Sequence
 from os import PathLike
 from types import MappingProxyType
-from typing import Any, Protocol, TypeVar, cast, get_args
+from typing import TypeVar, cast, get_args
 from warnings import warn
 
 from .. import _diagnostics as diagnostics
 from ..toml_config import ConfigSource
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ._single_pass_transformer import (
-    _CompoundNodeChecker, CompoundNodeType, CompoundStatement,
+    _CompoundNodeChecker,
+    _ConcreteDuplicateImportChecker,
+    _DuplicateImportChecker,
+    CompoundNodeType,
+    CompoundStatement,
     ContextAwareVisitor,
     ast_create_profile_node, ast_create_star_import_node,
 )
@@ -46,22 +50,7 @@ def _ast_create_node_from_import_target(
     return ast_create_profile_node(target.resolved_name)
 
 
-class _DuplicateChecker(Protocol):
-    """
-    Protocol for objects which helps with deduplication.
-    """
-    def should_profile_import(
-        self, target: ImportTarget, context: Sequence[str | int], /,
-    ) -> bool:
-        ...
-
-    def record_profiled_import(
-        self, target: ImportTarget, context: Sequence[str | int], /,
-    ) -> Any:
-        ...
-
-
-class _ContextAwareDuplicateChecker:
+class _ContextAwareDuplicateChecker(_ConcreteDuplicateImportChecker):
     """
     This checker is context-aware and only deduplicates imports of the
     same object in the same scope.
@@ -72,50 +61,11 @@ class _ContextAwareDuplicateChecker:
             Mapping[Sequence[str | int], Sequence[ImportTarget]] | None
         ) = None,
     ) -> None:
-        pi: dict[
-            tuple[str | int, ...], dict[int, list[ImportTarget]]
-        ]
-        self._profiled_imports = pi = {}
+        super().__init__()
+        pi = self._profiled_imports
         for context, imports in (profiled_imports or {}).items():
             ctx, index = self._check_context(context)
             pi.setdefault(ctx, {})[index] = list(imports)
-
-    def should_profile_import(
-        self, target: ImportTarget, context: Sequence[str | int],
-    ) -> bool:
-        # Note: the `index` shouldn't be needed since we're already
-        # going through the import targets in order
-        ctx, _ = self._check_context(context)
-        if ctx not in self._profiled_imports:
-            return True
-        ctx_profiled_names = {
-            imp.name
-            for imports in self._profiled_imports[ctx].values()
-            for imp in imports
-        }
-        return target.name not in ctx_profiled_names
-
-    def record_profiled_import(
-        self, target: ImportTarget, context: Sequence[str | int],
-    ) -> None:
-        ctx, index = self._check_context(context)
-        (
-            self._profiled_imports
-            .setdefault(ctx, {})
-            .setdefault(index, [])
-            .append(target)
-        )
-
-    @staticmethod
-    def _check_context(
-        context: Sequence[str | int],
-    ) -> tuple[tuple[str | int, ...], int]:
-        *ctx, index = context
-        if not isinstance(index, int):
-            raise TypeError(
-                f'context[-1] = {context[-1]!r}: expected an integer',
-            )
-        return tuple(ctx), index
 
 
 class _LegacyDuplicateChecker:
@@ -246,7 +196,7 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
 
         self._profile_imports = bool(profile_imports)
         if profiled_imports is None:
-            self._duplicate_checker: _DuplicateChecker
+            self._duplicate_checker: _DuplicateImportChecker
             self._duplicate_checker = _ContextAwareDuplicateChecker()
         elif (
             isinstance(profiled_imports, Mapping)
