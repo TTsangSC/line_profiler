@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
+from functools import partial, wraps
 from os import PathLike
 from types import MappingProxyType
 from typing import TypeVar, cast, get_args
@@ -13,10 +14,9 @@ from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ._single_pass_transformer import (
     _CompoundNodeChecker,
     _ConcreteDuplicateImportChecker,
-    _DuplicateImportChecker,
     CompoundNodeType,
     CompoundStatement,
-    ContextAwareVisitor,
+    SinglePassTransformer,
     ast_create_profile_node, ast_create_star_import_node,
 )
 from .profmod_extractor import _should_profile_star_imports
@@ -48,6 +48,11 @@ def _ast_create_node_from_import_target(
             target.name[:-2], modnames_to_profile,
         )
     return ast_create_profile_node(target.resolved_name)
+
+
+_wrap_sig = partial(
+    wraps, assigned=('__annotations__', '__type_params__'),
+)
 
 
 class _ContextAwareDuplicateChecker(_ConcreteDuplicateImportChecker):
@@ -122,7 +127,7 @@ class _LegacyDuplicateChecker:
         self._profiled_imports.add(target.name)
 
 
-class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
+class AstProfileTransformer(SinglePassTransformer):
     """
     Transform an abstract syntax tree adding profiling to all of its
     objects, by:
@@ -137,7 +142,6 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
 .add_star_import`)
       is added to all imports immediately after the import.
     """
-
     def __init__(
         self,
         profile_imports: bool = False,
@@ -192,12 +196,16 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
                 for each of the compound-statement node type, whether to
                 profile import statements residing therein.
         """
-        super().__init__()
+        super().__init__(
+            profiler_name=profiler_name,
+            prof_func_defs=True,
+            prof_explicit_imports=profile_imports,
+            prof_star_imports=profile_imports and profile_star_imports,
+            prof_imports_in=profile_imports_in,
+        )
 
-        self._profile_imports = bool(profile_imports)
         if profiled_imports is None:
-            self._duplicate_checker: _DuplicateImportChecker
-            self._duplicate_checker = _ContextAwareDuplicateChecker()
+            pass
         elif (
             isinstance(profiled_imports, Mapping)
             and all(
@@ -205,16 +213,19 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
                 for imports in profiled_imports.values()
             )
         ):
-            self._duplicate_checker = _ContextAwareDuplicateChecker(cast(
-                Mapping[Sequence[str | int], Sequence[ImportTarget]],
-                profiled_imports,
-            ))
+            self._duplicate_import_checker = _ContextAwareDuplicateChecker(
+                cast(
+                    Mapping[Sequence[str | int], Sequence[ImportTarget]],
+                    profiled_imports,
+                ),
+            )
         elif (
             isinstance(profiled_imports, Collection)
             and all(isinstance(imp, str) for imp in profiled_imports)
         ):
-            profiled_imports = cast(Collection[str], profiled_imports)
-            self._duplicate_checker = _LegacyDuplicateChecker(profiled_imports)
+            self._duplicate_import_checker = _LegacyDuplicateChecker(
+                cast(Collection[str], profiled_imports),
+            )
         else:  # nocover
             raise TypeError(
                 f'profiled_imports = {profiled_imports!r}: '
@@ -223,49 +234,11 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
                 'or `None`',
             )
 
-        self._profiler_name = profiler_name
-        self._profile_star_imports = profile_star_imports
-        self._should_visit_imports = (
-            _CompoundNodeChecker(profile_imports_in).check
-        )
         self._dropped_star_imports: set[ImportTarget] = set()
 
-    def _visit_func_def(
-        self, node: ast.FunctionDef | ast.AsyncFunctionDef
-    ) -> ast.FunctionDef | ast.AsyncFunctionDef:
-        """Decorate functions/methods with profiler.
-
-        Checks if the function/method already has a profile_name decorator, if not, it will append
-        profile_name to the end of the node's decorator list.
-        The decorator is added to the end of the list to avoid conflicts with other decorators
-        e.g. @staticmethod.
-
-        Args:
-            node (_ast.FunctionDef | _ast.AsyncFunctionDef):
-                function/method in the AST
-
-        Returns:
-            node (_ast.FunctionDef | _ast.AsyncFunctionDef):
-                function/method with profiling decorator
-        """
-        decor_ids = set()
-        for decor in node.decorator_list:
-            if isinstance(decor, ast.Name):
-                decor_ids.add(decor.id)
-        if self._profiler_name not in decor_ids:
-            node.decorator_list.append(
-                ast.Name(id=self._profiler_name, ctx=ast.Load())
-            )
-        self.generic_visit(node)
-        return node
-
-    visit_FunctionDef = visit_AsyncFunctionDef = _visit_func_def
-
-    def _visit_import(
-        self,
-        node: _Import,
-        get_import_targets: Callable[[int, _Import], Sequence[ImportTarget]],
-    ) -> _Import | list[_Import | ast.Expr]:
+    def _handle_new_import_target(
+        self, target: ImportTarget,
+    ) -> ast.Expr | None:
         """
         Add a node that profiles an import. If:
 
@@ -278,69 +251,19 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
 
         a node which calls the profiler method adding the object to the
         profiler is added immediately after the import.
-
-        Args:
-            node (_Import):
-                import[-from] node in the AST
-            get_import_targets \
-(Callable[[int, _Import], Sequence[ImportTarget]]):
-                helper callable for analyzing the node
-
-        Returns:
-            node (_Import | list[_Import | _ast.Expr]):
-                if ``profile_imports`` is False:
-                    the import node
-                if ``profile_imports`` is True:
-                    a list containing the import node and the profiling
-                    node(s)
         """
-        if not self._profile_imports:
-            should_profile = False
-        else:
-            # Check if this node is nested inside compound statements
-            # that we shouldn't look for imports in
-            *ancestry, _ = self._node_stack
-            check = self._should_visit_imports
-            should_profile = all(check(ancestor) for ancestor in ancestry)
+        if not (self._prof_star_imports or self._prof_explicit_imports):
+            return None
+        maybe_expr = _ast_create_node_from_import_target(
+            target, profile_star_imports=bool(self._prof_star_imports),
+        )
+        if maybe_expr is None and target.resolved_name is None:
+            self._dropped_star_imports.add(target)
+        return maybe_expr
 
-        if not should_profile:
-            # No need for further descent, no other node of interest can
-            # reside import[-from] nodes
-            return node
-
-        result: list[_Import | ast.Expr] = [node]
-        *_, index = self._current_loc
-        assert isinstance(index, int)
-        duplicate_checker = self._duplicate_checker
-
-        for target in get_import_targets(index, node):
-            if not duplicate_checker.should_profile_import(
-                target, self._current_loc,
-            ):
-                continue
-            expr = _ast_create_node_from_import_target(
-                target, profile_star_imports=self._profile_star_imports,
-            )
-            if expr is None:  # Bookkeeping
-                self._dropped_star_imports.add(target)
-            else:
-                duplicate_checker.record_profiled_import(
-                    target, self._current_loc,
-                )
-                result.append(expr)
-        return result
-
-    def visit_Import(
-        self, node: ast.Import,
-    ) -> ast.Import | list[ast.Import | ast.Expr]:
+    @_wrap_sig(SinglePassTransformer.visit_Import)
+    def visit_Import(self, /, *args, **kwargs):
         """
-        Add nodes that profile objects imported using the
-        ``import foo`` syntax.
-
-        Args:
-            node (_ast.Import):
-                import in the AST
-
         Returns:
             node (_ast.Import | list[_ast.Import | _ast.Expr]):
                 if ``profile_imports`` is False:
@@ -349,19 +272,12 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
                     a list containing the import node and the
                     profiling node(s)
         """
-        return self._visit_import(node, ImportTarget._from_import_node)
+        # Thin wrapper; we just want to override the docstring
+        return super().visit_Import(*args, **kwargs)
 
-    def visit_ImportFrom(
-        self, node: ast.ImportFrom
-    ) -> ast.ImportFrom | list[ast.ImportFrom | ast.Expr]:
+    @_wrap_sig(SinglePassTransformer.visit_Import)
+    def visit_ImportFrom(self, /, *args, **kwargs):
         """
-        Add nodes that profile objects imported using the
-        ``from foo import bar`` syntax.
-
-        Args:
-            node (_ast.ImportFrom):
-                import in the AST
-
         Returns:
             node (_ast.Import | list[_ast.Import | _ast.Expr]):
                 if ``profile_imports`` is False:
@@ -370,7 +286,8 @@ class AstProfileTransformer(ContextAwareVisitor, ast.NodeTransformer):
                     a list containing the import node and the
                     profiling node(s)
         """
-        return self._visit_import(node, ImportTarget._from_import_from_node)
+        # Thin wrapper; we just want to override the docstring
+        return super().visit_ImportFrom(*args, **kwargs)
 
     @staticmethod
     def _get_profile_imports_in(
