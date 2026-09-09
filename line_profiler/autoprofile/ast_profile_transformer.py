@@ -3,14 +3,14 @@ from __future__ import annotations
 import ast
 from collections.abc import Collection, Mapping, Sequence
 from functools import partial, wraps
-from os import PathLike
 from types import MappingProxyType
 from typing import TypeVar, cast, get_args
+from typing_extensions import Self
 from warnings import warn
 
 from .. import _diagnostics as diagnostics
 from ..toml_config import ConfigSource
-from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
+from ._import_targets import ImportTarget
 from ._single_pass_transformer import (
     _CompoundNodeChecker,
     _ConcreteDuplicateImportChecker,
@@ -33,22 +33,6 @@ _PROFILE_IMPORTS_IN_DEFAULT: MappingProxyType[CompoundNodeType, bool]
 _PROFILE_IMPORTS_IN_DEFAULT = MappingProxyType(dict.fromkeys(
     get_args(CompoundNodeType), True,
 ))
-
-
-def _ast_create_node_from_import_target(
-    target: ImportTarget,
-    modnames_to_profile: Collection[str] | None = None,
-    profile_star_imports: bool = False,
-) -> ast.Expr | None:
-    if target.resolved_name is None:  # Star-imports
-        if not profile_star_imports:
-            return None
-        assert target.name.endswith('.*')
-        return ast_create_star_import_node(
-            target.name[:-2], modnames_to_profile,
-        )
-    return ast_create_profile_node(target.resolved_name)
-
 
 _wrap_sig = partial(
     wraps, assigned=('__annotations__', '__type_params__'),
@@ -234,8 +218,6 @@ class AstProfileTransformer(SinglePassTransformer):
                 'or `None`',
             )
 
-        self._dropped_star_imports: set[ImportTarget] = set()
-
     def _handle_new_import_target(
         self, target: ImportTarget,
     ) -> ast.Expr | None:
@@ -253,13 +235,9 @@ class AstProfileTransformer(SinglePassTransformer):
         profiler is added immediately after the import.
         """
         if not (self._prof_star_imports or self._prof_explicit_imports):
+            # No on-import profiling to be done to begin with
             return None
-        maybe_expr = _ast_create_node_from_import_target(
-            target, profile_star_imports=bool(self._prof_star_imports),
-        )
-        if maybe_expr is None and target.resolved_name is None:
-            self._dropped_star_imports.add(target)
-        return maybe_expr
+        return super()._handle_new_import_target(target)
 
     @_wrap_sig(SinglePassTransformer.visit_Import)
     def visit_Import(self, /, *args, **kwargs):
@@ -300,28 +278,20 @@ class AstProfileTransformer(SinglePassTransformer):
         return dict(checker.allowed)
 
     @classmethod
-    def _transform(
+    def _get_ast_transformer(
         cls,
-        node: ast.Module,
-        filename: PathLike[str] | str | None = None,
         *,
         config: ConfigSource | None = None,
         profile_star_imports: bool | None = None,
         profile_nested_imports: Collection[CompoundStatement] | None = None,
-        _known_dropped_star_imports: Collection[ImportTarget] | None = None,
         **kwargs,
-    ) -> ast.Module:
+    ) -> Self:
         """
-        Wrapper around ``<instance>.visit()`` with extra bookkeeping and
-        convenience args.
+        Helper constructor method for use by
+        :py:class:`line_profiler.autoprofile.ast_tree_profiler.\
+AstTreeProfiler`.
 
         Args:
-            node (ast.Module):
-                AST module node
-
-            filename (PathLike[str] | str | None):
-                Optional filename to be used in error/warning messages
-
             config (ConfigSource | None):
                 Optional :py:class:`.ConfigSource` to load options from,
                 controlling whether an import should be profiled
@@ -343,8 +313,8 @@ class AstProfileTransformer(SinglePassTransformer):
                 Passed to the initializer
 
         Returns:
-            node (ast.Module):
-                Input module node
+            transformer (Self):
+                New instance
         """
         if profile_star_imports is None:
             profile_star_imports = _should_profile_star_imports(config)
@@ -352,27 +322,4 @@ class AstProfileTransformer(SinglePassTransformer):
             'profile_imports_in',
             cls._get_profile_imports_in(config, profile_nested_imports),
         )
-        transformer = cls(
-            profile_star_imports=profile_star_imports, **kwargs,
-        )
-        dropped_star_imports = transformer._dropped_star_imports
-        if filename is None:
-            filename = '???'
-        try:
-            return cast(ast.Module, transformer.visit(node))
-        finally:
-            if _known_dropped_star_imports:
-                # Don't double-warn on import targets that we already
-                # know should be dropped
-                dropped_star_imports.difference_update(
-                    _known_dropped_star_imports,
-                )
-            ImportTarget._check_and_warn_dropped_imports(
-                dropped_star_imports,
-                _DROPPED_STAR_IMPORTS_MSG_TEMPLATE.format(
-                    action='profiled',
-                    argname='profile_star_imports',
-                ),
-                filename,
-                stacklevel=2,  # Attribute warning to the caller
-            )
+        return cls(profile_star_imports=profile_star_imports, **kwargs)

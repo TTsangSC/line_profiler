@@ -1,58 +1,22 @@
 from __future__ import annotations
 
 import ast
-import os
 from collections.abc import Sequence
 from typing import cast
 
+from ._single_pass_transformer import _ProfModHelper, SinglePassTransformer
 from .ast_tree_profiler import AstTreeProfiler
-from .util_static import modname_to_modpath, modpath_to_modname
+from .util_static import modpath_to_modname
 
 
-def get_module_from_importfrom(node: ast.ImportFrom, module: str) -> str:
-    r"""Resolve the full path of a relative import.
+__all__ = (
+    'ImportFromTransformer',
+    'AstTreeModuleProfiler',
+    'get_module_from_importfrom',
+)
 
-    Args:
-        node (ast.ImportFrom)
-            ImportFrom node
-        module (str)
-            Full dotted path relative to which the import is to occur
-
-    Return:
-        modname (str)
-            Full path of the module from which the names are to be
-            imported
-
-    Example:
-        >>> import ast
-        >>> import functools
-        >>> import textwrap
-        >>>
-        >>>
-        >>> abs_import, *rel_imports = ast.parse(textwrap.dedent('''
-        ... from a import b
-        ... from . import b
-        ... from .. import b
-        ... from .baz import b
-        ... from ..baz import b
-        ... '''.strip('\n'))).body
-        >>>
-        >>>
-        >>> get_module = functools.partial(
-        ...     get_module_from_importfrom, module='foo.bar.foobar')
-        >>> assert get_module(abs_import) == 'a'
-        >>> assert get_module(rel_imports[0]) == 'foo.bar'
-        >>> assert get_module(rel_imports[1]) == 'foo'
-        >>> assert get_module(rel_imports[2]) == 'foo.bar.baz'
-        >>> assert get_module(rel_imports[3]) == 'foo.baz'
-    """
-    level = node.level
-    if not level:
-        return node.module or ''
-    chunks = module.split('.')[:-level]
-    if node.module:
-        chunks.append(node.module)
-    return '.'.join(chunks)
+get_module_from_importfrom = SinglePassTransformer._resolve_importfrom_module
+_consolidate = SinglePassTransformer._consolidate_relative_import
 
 
 class ImportFromTransformer(ast.NodeTransformer):
@@ -62,23 +26,18 @@ class ImportFromTransformer(ast.NodeTransformer):
         self.module = module
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
-        level = node.level
-        if not level:
-            self.generic_visit(node)
-            return node
-        module = get_module_from_importfrom(node, self.module)
-        new_node = ast.ImportFrom(module=module, names=node.names, level=0)
-        visited = self.generic_visit(ast.copy_location(new_node, node))
-        return cast(ast.ImportFrom, visited)
+        node = _consolidate(node, self.module)
+        return cast(ast.ImportFrom, self.generic_visit(node))
 
 
 class AstTreeModuleProfiler(AstTreeProfiler):
     """Create an abstract syntax tree of an executable module and add
     profiling to it.
 
-    Reads the module code and generates an abstract syntax tree, then adds nodes
-    and/or decorators to the AST that adds the specified functions/methods,
-    classes & modules in prof_mod to the profiler to be profiled.
+    Read the module code and generate an abstract syntax tree, then add
+    nodes and/or decorators to the AST that add the specified
+    functions/methods, classes & modules in ``prof_mod`` to the profiler
+    to be profiled.
     """
 
     @classmethod
@@ -87,25 +46,13 @@ class AstTreeModuleProfiler(AstTreeProfiler):
         # Note: don't drop the `.__init__` or `.__main__` suffix, lest
         # the relative imports fail
         module = modpath_to_modname(
-            script_file, hide_main=False, hide_init=False
+            script_file, hide_main=False, hide_init=False,
         )
         return ImportFromTransformer(module).visit(tree)
 
     @staticmethod
-    def _is_main(fname: str) -> bool:
-        return os.path.basename(fname) == '__main__.py'
-
-    @classmethod
     def _check_profile_full_script(
-        cls, script_file: str, prof_mod: Sequence[str],
+        script_file: str, prof_mod: Sequence[str],
     ) -> bool:
-        rp = os.path.realpath
-        paths_to_check = {rp(script_file)}
-        if cls._is_main(script_file):
-            paths_to_check.add(rp(os.path.dirname(script_file)))
-        paths_to_profile = {rp(mod) for mod in prof_mod}
-        for mod in prof_mod:
-            as_path = modname_to_modpath(mod)
-            if as_path:
-                paths_to_profile.add(rp(as_path))
-        return bool(paths_to_check & paths_to_profile)
+        helper = _ProfModHelper(script_file, prof_mod)
+        return helper.script_file_is_included(match_mode='module')

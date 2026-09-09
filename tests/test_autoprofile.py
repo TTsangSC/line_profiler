@@ -2232,13 +2232,12 @@ def test_import_discovery_in_all_compound_statements(
                 profile_nested_imports=profile_nested_imports,
             )
         else:
-            module_ast = AstProfileTransformer._transform(
-                ast.parse(test_case),
-                case_fname,
+            apt = AstProfileTransformer._get_ast_transformer(
                 profile_imports=True,
                 config=config,
                 profile_nested_imports=profile_nested_imports,
             )
+            module_ast = apt._transform(ast.parse(test_case), case_fname)
         output = ast.unparse(module_ast)
 
     for label, module_text in [
@@ -2347,12 +2346,10 @@ def test_nested_imports_correct_deduplication_across_scopes(
                 config=config,
             ).profile()
         else:  # `ast_profile_transformer`
-            mod_ast = AstProfileTransformer._transform(
-                ast.parse(test_module),
-                mod_fname,
-                profile_imports=True,
-                config=config,
+            apt = AstProfileTransformer._get_ast_transformer(
+                profile_imports=True, config=config,
             )
+            mod_ast = apt._transform(ast.parse(test_module), mod_fname)
             # We need this to actually compile and exec the code
             mod_ast = ast.fix_missing_locations(mod_ast)
         print(ast.unparse(mod_ast))
@@ -2440,14 +2437,12 @@ def test_ast_profile_transformer_deprecated_profiled_imports(
             )
         ))
 
-        config = ConfigSource.from_config(cfg_fname)
-        mod_ast = AstProfileTransformer._transform(
-            ast.parse(test_module),
-            mod_fname,
+        apt = AstProfileTransformer._get_ast_transformer(
             profile_imports=True,
             profiled_imports=[],  # This triggers legacy behavior
-            config=config,
+            config=ConfigSource.from_config(cfg_fname),
         )
+        mod_ast = apt._transform(ast.parse(test_module), mod_fname)
         output = ast.unparse(mod_ast)
         print(output)
 

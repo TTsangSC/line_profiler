@@ -2,24 +2,22 @@ from __future__ import annotations
 
 import ast
 import os
-import sys
 from collections.abc import Callable, Collection, Sequence
 from functools import cached_property
 from operator import attrgetter
-from typing import TypeVar, cast
+from typing import TypeVar
 from warnings import warn
 
 from ..toml_config import ConfigSource
-from .util_static import (
-    modname_to_modpath,
-    modpath_to_modname,
-    package_modpaths,
-)
 from .. import _diagnostics as diagnostics
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
 from ._single_pass_transformer import (
-    _CompoundNodeChecker, CompoundStatement, ContextAwareVisitor,
-    should_profile_regular_import, should_profile_star_import,
+    _CompoundNodeChecker,
+    CompoundStatement,
+    ContextAwareVisitor,
+    _ProfModHelper,
+    should_profile_regular_import,
+    should_profile_star_import,
 )
 
 
@@ -162,104 +160,6 @@ class ProfmodExtractor:
         if config is None:
             config = ConfigSource.from_default()
         self._config = config
-
-    @staticmethod
-    def _is_path(text: str) -> bool:
-        """Check whether a string is a path.
-
-        Checks if a string contains a slash or ends with .py indicating it is a path.
-
-        Args:
-            text (str):
-                string to check whether it is a path or not
-
-        Returns:
-            ret (bool):
-                bool indicating whether the string is a path or not
-        """
-        ret = ('/' in text.replace('\\', '/')) or text.endswith('.py')
-        return ret
-
-    @classmethod
-    def _get_modnames_to_profile_from_prof_mod(
-        cls, script_file: str, prof_mod: Sequence[str]
-    ) -> list[str]:
-        """Grab the valid paths and all dotted paths in prof_mod and their subpackages
-        and submodules, in the form of dotted paths.
-
-        First all items in prof_mod are converted to a valid path. if unable to convert,
-        check if the item is an invalid path and skip it, else assume it is an installed package.
-        The valid paths are then converted to dotted paths.
-        The converted dotted paths along with the items assumed to be installed packages
-        are added a list of modnames_to_profile.
-        Then all subpackages and submodules under each valid path is fetched, converted to
-        dotted path and also added to the list.
-        if script_file is in prof_mod it is skipped to avoid name collision with othe imports,
-        it will be processed elsewhere in the autoprofile pipeline.
-
-        Args:
-            script_file (str):
-                path to script being profiled.
-
-            prof_mod (Sequence[str]):
-                list of imports to profile in script.
-                passing the path to script will profile the whole script.
-                the objects can be specified using its dotted path or full path (if applicable).
-
-        Returns:
-            modnames_to_profile (list[str]):
-                list of dotted paths to profile.
-        """
-        script_directory = os.path.realpath(os.path.dirname(script_file))
-        """add script folder to modname_to_modpath sys_path to allow it to resolve modpaths"""
-        new_sys_path = [script_directory] + sys.path
-        script_file_realpath = os.path.realpath(script_file)
-
-        modnames_to_profile = []
-        for mod in prof_mod:
-            if script_file_realpath == os.path.realpath(mod):
-                """
-                skip script_file as it will add the script's name without its extension which
-                could have the same name as another import or function leading to unwanted profiling
-                """
-                continue
-            """
-            convert the item in prof_mod into a valid path.
-            if it fails, the item may point to an installed module rather than local script
-            so we check if the item is path and whether that path exists, else skip the item.
-            """
-            modpath = modname_to_modpath(
-                mod, sys_path=cast('list[str | os.PathLike]', new_sys_path)
-            )
-            if modpath is None:
-                """if cannot convert to modpath, check if already path and if invalid"""
-                if not os.path.exists(mod):
-                    if cls._is_path(mod):
-                        """modpath does not exist, so skip"""
-                        continue
-                    modnames_to_profile.append(mod)
-                    continue
-                """assume item is and installed package. modpath_to_modname will have no effect"""
-                modpath = mod
-
-            """convert path to dotted path and add it to list to be profiled"""
-            try:
-                modname = modpath_to_modname(modpath)
-            except ValueError:
-                continue
-            if modname not in modnames_to_profile:
-                modnames_to_profile.append(modname)
-
-            """
-            recursively fetch all subpackages and submodules, convert them to dotted paths
-            and add them to list to be profiled
-            """
-            for submod_path in package_modpaths(modpath):
-                submod_name = modpath_to_modname(submod_path)
-                if submod_name not in modnames_to_profile:
-                    modnames_to_profile.append(submod_name)
-
-        return modnames_to_profile
 
     @staticmethod
     def _ast_get_imports_from_tree(
@@ -491,9 +391,11 @@ class ProfmodExtractor:
 
     @cached_property
     def _modnames_to_profile(self) -> frozenset[str]:
-        return frozenset(self._get_modnames_to_profile_from_prof_mod(
-            self._script_file, self._prof_mod,
-        ))
+        # Skip `script_file` itself, in case it gets normalized to a
+        # clashing with another import or function, leading to unwanted
+        # profiling
+        helper = _ProfModHelper(self._script_file, self._prof_mod)
+        return frozenset(helper.to_dotted_paths(exclude_script_file=True))
 
 
 def _should_profile_star_imports(config: ConfigSource | None) -> bool:

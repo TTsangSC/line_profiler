@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import os
 from collections.abc import Collection, Mapping, MutableSequence, Sequence
+from operator import methodcaller
 from typing import Any, cast
 
 from ..toml_config import ConfigSource
 from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
-from ._single_pass_transformer import CompoundStatement
+from ._single_pass_transformer import _ProfModHelper, CompoundStatement
 from .ast_profile_transformer import (  # noqa: F401
     AstProfileTransformer,
-    _ast_create_node_from_import_target,
-    # Keep import below for compatibility
     ast_create_profile_node,
+    ast_create_star_import_node,
 )
 from .profmod_extractor import ProfmodExtractor, _should_profile_star_imports
 
@@ -21,6 +20,8 @@ __docstubs__ = """
 from .ast_profile_transformer import AstProfileTransformer
 from .profmod_extractor import ProfmodExtractor
 """
+
+__all__ = ('AstTreeProfiler',)
 
 
 class AstTreeProfiler:
@@ -98,11 +99,8 @@ class AstTreeProfiler:
             profile_full_script (bool):
                 if True, profile whole script.
         """
-        script_file_realpath = os.path.realpath(script_file)
-        profile_full_script = script_file_realpath in map(
-            os.path.realpath, prof_mod
-        )
-        return profile_full_script
+        helper = _ProfModHelper(script_file, prof_mod)
+        return helper.script_file_is_included(match_mode='filename')
 
     @staticmethod
     def _get_script_ast_tree(script_file: str) -> ast.Module:
@@ -208,7 +206,7 @@ class AstTreeProfiler:
             for imp in reversed(imports):
                 # Reversing keeps the order of the inserted nodes
                 # consistent with the imports
-                expr = _ast_create_node_from_import_target(
+                expr = self._ast_create_node_from_import_target(
                     imp, modnames_to_profile, profile_star_imports,
                 )
                 if expr is None:
@@ -237,19 +235,39 @@ class AstTreeProfiler:
             stacklevel=2,  # Attribute warning to the caller
         )
         if profile_full_script:
-            tree = self._ast_transformer_class_handler._transform(
-                tree, self._script_file,
+            get_tr = self._ast_transformer_class_handler._get_ast_transformer
+            transformer = get_tr(
                 profile_imports=profile_imports,
                 profiled_imports=profiled_imports,
                 profile_star_imports=profile_star_imports,
                 profile_nested_imports=profile_nested_imports,
-                # Don't double-warn on import targets that we already
-                # know should be dropped
-                _known_dropped_star_imports=dropped_star_imports,
                 config=self._config,
+            )
+            # Don't double-warn on import targets that we already know
+            # should be dropped
+            filter_si = methodcaller('difference', dropped_star_imports)
+            tree = transformer._transform(
+                tree, self._script_file,
+                warn_dropped_star_imports=filter_si,
+                stacklevel=2,  # Attribute warning to the caller
             )
         ast.fix_missing_locations(tree)
         return tree
+
+    @staticmethod
+    def _ast_create_node_from_import_target(
+        target: ImportTarget,
+        modnames_to_profile: Collection[str] | None = None,
+        profile_star_imports: bool = False,
+    ) -> ast.Expr | None:
+        if target.resolved_name is None:  # Star-imports
+            if not profile_star_imports:
+                return None
+            assert target.name.endswith('.*')
+            return ast_create_star_import_node(
+                target.name[:-2], modnames_to_profile,
+            )
+        return ast_create_profile_node(target.resolved_name)
 
     def profile(
         self,

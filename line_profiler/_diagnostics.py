@@ -102,5 +102,10 @@ USE_LEGACY_TRACE = _MUST_USE_LEGACY_TRACE or _boolean_environ(
     falsy={'new', 'sys.monitoring', 'sysmon'},
     default=_MUST_USE_LEGACY_TRACE,
 )
+USE_LEGACY_AUTOPROF = _boolean_environ(
+    'LINE_PROFILER_AUTOPROFILE_CORE',
+    truey={'old', 'legacy', 'multipass'},
+    falsy={'new', 'single-pass', 'one-pass'},
+)
 
 log = _logger.Logger('line_profiler', backend='auto')

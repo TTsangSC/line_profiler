@@ -12,16 +12,22 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
 from collections.abc import (
-    Callable, Collection, Mapping, MutableSequence, Sequence,
+    Callable, Collection, Mapping, MutableSequence, Sequence, Set,
 )
+from dataclasses import dataclass
 from functools import cached_property, partial
+from operator import attrgetter
 from typing import (
-    Any, ClassVar, Literal, Protocol, Self, TypeVar, cast, get_args,
+    Any, ClassVar, Literal, ParamSpec, Protocol, Self, TypeVar, cast, get_args,
 )
 
 from ..toml_config import ConfigSource
-from ._import_targets import ImportTarget
+from ._import_targets import _DROPPED_STAR_IMPORTS_MSG_TEMPLATE, ImportTarget
+from .util_static import (
+    modname_to_modpath, modpath_to_modname, package_modpaths,
+)
 
 
 __all__ = (
@@ -51,12 +57,16 @@ CompoundStatement = Literal[
     'func_defs', 'class_defs',
     'loops', 'conditionals', 'contexts', 'try_except',
 ]
+
 ImportStatement = TypeVar('ImportStatement', ast.Import, ast.ImportFrom)
 DefineStatement = TypeVar(
     'DefineStatement', ast.FunctionDef, ast.AsyncFunctionDef,
 )
 Node = TypeVar('Node', bound=ast.AST)
+PS = ParamSpec('PS')
 T = TypeVar('T')
+T1 = TypeVar('T1')
+T2 = TypeVar('T2')
 
 
 def ast_create_profile_node(
@@ -200,6 +210,15 @@ def _return_value(value: T, /, *_, **__) -> T:
     return value
 
 
+def _chain_callables(
+    func1: Callable[PS, T1], func2: Callable[[T1], T2],
+) -> Callable[PS, T2]:
+    def chained(*args: PS.args, **kwargs: PS.kwargs) -> T2:
+        return func2(func1(*args, **kwargs))
+
+    return chained
+
+
 class _DuplicateImportChecker(Protocol):
     """
     Protocol for objects which helps with on-import profiling
@@ -270,6 +289,16 @@ class _CompoundNodeChecker:
     _compound_node_types: ClassVar[set[CompoundNodeType]] = cast(
         set[CompoundNodeType], set(get_args(CompoundNodeType)),
     )
+    _toggles_to_node_types: ClassVar[
+        dict[CompoundStatement, set[CompoundNodeType]]
+    ] = {
+        'conditionals': {'If', 'match_case'},
+        'try_except': {'Try', 'TryStar', 'ExceptHandler'},
+        'contexts': {'AsyncWith', 'With'},
+        'loops': {'AsyncFor', 'For', 'While'},
+        'func_defs': {'AsyncFunctionDef', 'FunctionDef'},
+        'class_defs': {'ClassDef'},
+    }
 
     def __init__(self, allowed: Mapping[CompoundNodeType, bool]) -> None:
         self.allowed = {
@@ -280,6 +309,35 @@ class _CompoundNodeChecker:
     def check(self, node: ast.AST) -> bool:
         node_type = cast(CompoundNodeType, type(node).__name__)
         return self.allowed.get(node_type, True)
+
+    @classmethod
+    def _normalize_toggles_to_node_types(
+        cls, toggles: Collection[CompoundStatement],
+    ) -> set[CompoundNodeType]:
+        normalized: set[CompoundNodeType] = {'Module', 'Interactive'}
+        toggles = set(toggles)
+        for toggle, node_types in cls._toggles_to_node_types.items():
+            if toggle in toggles:
+                normalized.update(node_types)
+        return normalized
+
+    @classmethod
+    def _normalize_mixed_toggle_mapping(
+        cls, toggles: Mapping[CompoundStatement | CompoundNodeType, bool],
+    ) -> dict[CompoundNodeType, bool]:
+        result: dict[CompoundNodeType, bool] = dict.fromkeys(
+            cls._compound_node_types, False,
+        )
+        result['Module'] = result['Interactive'] = True
+        # Groups of node types
+        for toggle, node_types in cls._toggles_to_node_types.items():
+            if toggle in toggles:
+                result.update(dict.fromkeys(node_types, toggles[toggle]))
+        # Specific node types
+        for node_type in cls._compound_node_types:
+            if node_type in toggles:
+                result[node_type] = toggles[node_type]
+        return result
 
     @classmethod
     def from_toggles(
@@ -317,20 +375,9 @@ class _CompoundNodeChecker:
         else:
             toggles = cast(dict[CompoundStatement, bool], optional_toggles)
 
-        allowed: set[CompoundNodeType] = {'Module', 'Interactive'}
-        if toggles['conditionals']:
-            allowed.update({'If', 'match_case'})
-        if toggles['try_except']:
-            allowed.update({'Try', 'TryStar', 'ExceptHandler'})
-        if toggles['contexts']:
-            allowed.update({'AsyncWith', 'With'})
-        if toggles['loops']:
-            allowed.update({'AsyncFor', 'For', 'While'})
-        if toggles['func_defs']:
-            allowed.update({'AsyncFunctionDef', 'FunctionDef'})
-        if toggles['class_defs']:
-            allowed.update({'ClassDef'})
-
+        allowed = cls._normalize_toggles_to_node_types({
+            toggle for toggle, value in toggles.items() if value
+        })
         return cls({
             node_type: node_type in allowed
             for node_type in cls._compound_node_types
@@ -358,6 +405,110 @@ class _CompoundNodeChecker:
             .get_subconfig('autoprofile', 'import_discovery')
             .conf_dict,
         )
+
+
+@dataclass
+class _ProfModHelper:
+    """
+    Helper object handling the ``--prof-mod`` supplied by
+    :py:mod:`kernprof`.
+    """
+    script_file: str | os.PathLike[str]
+    prof_mod: Sequence[str]
+
+    def to_dotted_paths(
+        self, exclude_script_file: bool = False,
+    ) -> list[str]:
+        """
+        Returns:
+            dotted_paths (list[str]):
+                Dotted paths to the profiling targets.
+
+        Notes:
+            Refactored from the old
+            `ProfmodExtractor._get_modnames_to_profile_from_prof_mod()`
+            contributed by ta946.
+        """
+        script_dir = os.path.realpath(os.path.dirname(self.script_file))
+        script_file_realpath = os.path.realpath(self.script_file)
+
+        dotted_paths: dict[str, None] = {}
+        add_dotted_path = dotted_paths.setdefault
+        for target in set(self.prof_mod):
+            if (
+                exclude_script_file
+                and script_file_realpath == os.path.realpath(target)
+            ):
+                continue
+            # Try to normalize target names to file paths (if modules),
+            # extending `sys.path` to allow `modname_to_modpath()` to
+            # resolve "modules" local to the script's directory
+            modpath = modname_to_modpath(
+                target, sys_path=[script_dir, *sys.path],
+            )
+            if modpath is None:
+                # Can't convert info a file path
+                # -> check if it's already one
+                if not os.path.exists(target):
+                    # *May* be some module that will otherwise become
+                    # available, so let it be
+                    if all(chunk.isidentifier() for chunk in target.split('.')):
+                        add_dotted_path(target)
+                    continue
+                # The target is probably an installed package
+                modpath = target
+
+            # Convert file paths back to dotted paths
+            try:
+                modname = modpath_to_modname(modpath)
+            except ValueError:
+                continue
+            add_dotted_path(modname)
+
+            # Recursively fetch all subpackages and submodules and also add
+            # their dotted paths
+            for submod_path in package_modpaths(modpath):
+                submod_name = modpath_to_modname(submod_path)
+                add_dotted_path(submod_name)
+
+        return list(dotted_paths)
+
+    def script_file_is_included(
+        self, match_mode: Literal['filename', 'module'] = 'filename',
+    ) -> bool:
+        """
+        Returns:
+            script_file_is_included (bool):
+                Whether :py:attr:`.script_file` should be counted as
+                being present in :py:attr:`.prof_mod`.
+
+        Notes:
+            Refactored from the old
+            `AstTreeProfiler._check_profile_full_script()` contributed
+            by ta946.
+        """
+        rp = os.path.realpath
+        prof_mod = set(self.prof_mod)
+
+        if match_mode == 'filename':
+            script_file_realpath = rp(self.script_file)
+            real_paths = {rp(target) for target in prof_mod}
+            return script_file_realpath in real_paths
+
+        if match_mode == 'module':
+            paths_to_check = {rp(self.script_file)}
+            if os.path.basename(self.script_file) == '__main__.py':
+                # If the `-m` entry point of a package, check for the
+                # package dir itself
+                paths_to_check.add(rp(os.path.dirname(self.script_file)))
+            paths_to_profile = {rp(target) for target in prof_mod}
+            paths_to_profile.update(
+                rp(path)
+                for target in prof_mod if (path := modname_to_modpath(target))
+            )
+            return bool(paths_to_check & paths_to_profile)
+
+        raise ValueError(f"{match_mode=!r}: expected 'filename' or 'module'")
 
 
 class ContextAwareVisitor(ast.NodeVisitor):
@@ -831,6 +982,13 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
             Name under which the profiler instance should be found
             (default: ``'profile'``).
 
+        config (str | os.PathLike[str] | ConfigSource | None):
+            Source from which config options are loaded.
+
+        module (str | None):
+            If provided, assume relative imports to be relative to this
+            module.
+
         prof_func_defs (bool | None):
             Whether to add a ``@profile`` decorator to all the
             locally-defined functions and methods that are not already
@@ -859,7 +1017,9 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
 'If', 'match_case',\
 'With', 'AsyncWith',\
 'Try', 'TryStar', 'ExceptHandler',\
-], bool]):
+'func_defs', 'class_defs',\
+'loops', 'conditionals', 'contexts', 'try_except',\
+], bool] | None):
             Which compound-statement types to descend into and look for
             imports;
             if :py:const:`None`, it is resolved from the active config's
@@ -868,23 +1028,28 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
             e.g. to avoid repeatedly calling the aforementioned
             ``add_imported_function_or_module()`` and
             ``add_star_import()`` within a function body.
-
-        config (str | os.PathLike[str] | None):
-            Source from which config options are loaded.
     """
     def __init__(
         self,
         profiler_name: str = 'profile',
         *,
-        config: str | os.PathLike[str] | None = None,
+        config: str | os.PathLike[str] | ConfigSource | None = None,
+        module: str | None = None,
         prof_func_defs: bool | None = None,
         prof_explicit_imports: Collection[str] | bool | None = None,
         prof_star_imports: Collection[str] | bool | None = None,
-        prof_imports_in: Mapping[CompoundNodeType, bool] | None = None,
+        prof_imports_in: (
+            Mapping[CompoundNodeType, bool]
+            | Mapping[CompoundStatement, bool]
+            | Mapping[CompoundNodeType | CompoundStatement, bool]
+            | None
+        ) = None,
     ) -> None:
         super().__init__()
 
-        conf = ConfigSource.from_config(config).get_subconfig('autoprofile')
+        if not isinstance(config, ConfigSource):
+            config = ConfigSource.from_config(config)
+        conf = config.get_subconfig('autoprofile')
         if prof_func_defs is None:
             prof_func_defs = conf.conf_dict['prof_func_defs']
         if prof_explicit_imports is None:
@@ -892,7 +1057,13 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
         if prof_star_imports is None:
             prof_star_imports = conf.conf_dict['prof_star_imports']
         if prof_imports_in is None:
-            prof_imports_in = _CompoundNodeChecker.from_config(config).allowed
+            node_type_checker = _CompoundNodeChecker.from_config(config)
+        else:
+            pii = _CompoundNodeChecker._normalize_mixed_toggle_mapping(cast(
+                Mapping[CompoundNodeType | CompoundStatement, bool],
+                prof_imports_in,
+            ))
+            node_type_checker = _CompoundNodeChecker(pii)
 
         try:
             prof_explicit_imports = frozenset(cast(
@@ -907,14 +1078,17 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
         except TypeError:
             prof_star_imports = bool(prof_star_imports)
 
+        self._module = module
         self._profiler_name = profiler_name
         self._prof_func_defs = bool(prof_func_defs)
         self._prof_explicit_imports = prof_explicit_imports
         self._prof_star_imports = prof_star_imports
 
-        self._import_ancestry_checker = _CompoundNodeChecker(prof_imports_in)
+        self._import_ancestry_checker = node_type_checker
         self._duplicate_import_checker: _DuplicateImportChecker
         self._duplicate_import_checker = _ConcreteDuplicateImportChecker()
+
+        self._dropped_imports: set[ImportTarget] = set()
 
     def _visit_import(
         self,
@@ -942,7 +1116,10 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
 
             maybe_expr = self._handle_new_import_target(target)
             if maybe_expr is not None:
-                result.append(maybe_expr)
+                # In case things go south during on-import profiling,
+                # make sure that the errors are attributed to the import
+                # line
+                result.append(ast.copy_location(maybe_expr, node))
                 dup_checker.record_profiled_import(target, self._current_loc)
         return result
 
@@ -960,9 +1137,75 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
         else:  # Explicit import
             create_node, should_profile = self._expl_import_handlers
 
-        if should_profile(target.name):
-            return create_node(target.name)
+        if should_profile(target):
+            return create_node(target)
+        else:
+            self._dropped_imports.add(target)
         return None
+
+    @staticmethod
+    def _resolve_importfrom_module(node: ast.ImportFrom, module: str) -> str:
+        r"""
+        Resolve the full path of a relative import.
+
+        Args:
+            node (ast.ImportFrom)
+                :py:class:`ast.ImportFrom` node
+            module (str)
+                Full dotted path relative to which the import is to occur
+
+        Return:
+            modname (str)
+                Full path of the module from which the names are to be
+                imported
+
+        Example:
+            >>> import ast
+            >>> import functools
+            >>> import textwrap
+            >>>
+            >>>
+            >>> abs_import, *rel_imports = ast.parse(textwrap.dedent('''
+            ... from a import b
+            ... from . import b
+            ... from .. import b
+            ... from .baz import b
+            ... from ..baz import b
+            ... '''.strip('\n'))).body
+            >>>
+            >>>
+            >>> get_module = functools.partial(
+            ...     SinglePassTransformer._resolve_importfrom_module,
+            ...     module='foo.bar.foobar',
+            ... )
+            >>> assert get_module(abs_import) == 'a'
+            >>> assert get_module(rel_imports[0]) == 'foo.bar'
+            >>> assert get_module(rel_imports[1]) == 'foo'
+            >>> assert get_module(rel_imports[2]) == 'foo.bar.baz'
+            >>> assert get_module(rel_imports[3]) == 'foo.baz'
+        """
+        level = node.level
+        if not level:
+            return node.module or ''
+        chunks = module.split('.')[:-level]
+        if node.module:
+            chunks.append(node.module)
+        return '.'.join(chunks)
+
+    @classmethod
+    def _consolidate_relative_import(
+        cls, node: ast.ImportFrom, module: str | None = None,
+    ) -> ast.ImportFrom:
+        if not node.level:  # Absoluteimport
+            return node
+        if not module:  # nocover
+            raise RuntimeError(
+                f'{node=!r}, {module=!r}: '
+                'cannot resolve relative imports with no ``module`` provided',
+            )
+        module = cls._resolve_importfrom_module(node, module)
+        new_node = ast.ImportFrom(module=module, names=node.names, level=0)
+        return ast.copy_location(new_node, node)
 
     def visit_Import(
         self, node: ast.Import,
@@ -985,13 +1228,14 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
         return self._visit_import(node, ImportTarget._from_import_node)
 
     def visit_ImportFrom(
-        self, node: ast.ImportFrom
+        self, node: ast.ImportFrom,
     ) -> ast.ImportFrom | list[ast.ImportFrom | ast.Expr]:
         """
         Where appropriate (as determined by ``prof_explicit_imports``,
         ``prof_star_imports``, and ``prof_imports_in``), add nodes that
         profile objects imported using the ``from foo import bar``
-        syntax.
+        syntax. If ``module`` has been provided, relative imports are
+        resolved to absolute imports therewith.
 
         Args:
             node (ast.ImportFrom):
@@ -1003,6 +1247,7 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
                 for on-import profiling of the appropriate import
                 targets
         """
+        node = self._consolidate_relative_import(node, self._module)
         return self._visit_import(node, ImportTarget._from_import_from_node)
 
     def _visit_func_def(self, node: DefineStatement) -> DefineStatement:
@@ -1037,6 +1282,79 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
 
     visit_FunctionDef = visit_AsyncFunctionDef = _visit_func_def
 
+    def _transform(
+        self,
+        node: ast.Module,
+        filename: os.PathLike[str] | str | None = None,
+        warn_dropped_star_imports: (
+            bool
+            | Callable[[Set[ImportTarget]], Collection[ImportTarget]]
+        ) = False,
+        *,
+        stacklevel: int = 1,
+        **warning_kwargs,
+    ) -> ast.Module:
+        """
+        Wrapper around :py:meth:`.visit` with extra bookkeeping.
+
+        Args:
+            node (ast.Module):
+                AST module node
+
+            filename (os.PathLike[str] | str | None):
+                Optional filename to be used in error/warning messages
+
+            warn_dropped_star_imports \
+(bool | Callable[[Set[ImportTarget]], Collection[ImportTarget]]):
+                If a boolean, whether to report dropped star-imports;
+                if a callable taking a set of :py:class:`ImportTarget`s
+                and returning a collection thereof, it is used to filter
+                the reported dropped star-imports
+
+            stacklevel (int):
+            **warning_kwargs:
+                Optional keyword arguments to pass to
+                :py:func:`warnings.warn` should there be any dropped
+                star-imports to be reported
+
+        Returns:
+            node (ast.Module):
+                Input module node
+
+        Notes:
+            The default ``stacklevel`` means that any warning raised
+            will be attributed to where this method is called.
+        """
+        filter_dropped: Callable[[Set[ImportTarget]], Collection[ImportTarget]]
+        if callable(warn_dropped_star_imports):
+            filter_dropped = warn_dropped_star_imports
+        elif warn_dropped_star_imports:
+            filter_dropped = set
+        else:
+            filter_dropped = partial(_return_value, ())
+
+        if filename is None:
+            filename = '???'
+
+        try:
+            return cast(ast.Module, self.visit(node))
+        finally:
+            dropped_star_imports = filter_dropped({
+                target for target in self._dropped_imports
+                if target.resolved_name is None
+            })
+            ImportTarget._check_and_warn_dropped_imports(
+                dropped_star_imports,
+                _DROPPED_STAR_IMPORTS_MSG_TEMPLATE.format(
+                    action='profiled',
+                    argname='profile_star_imports',
+                ),
+                filename,
+                # Warning level relative to this method
+                stacklevel=stacklevel + 1,
+                **warning_kwargs
+            )
+
     @staticmethod
     def _create_star_import_node(
         target_name: str, /, *args, **kwargs
@@ -1052,55 +1370,69 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
 
     @cached_property
     def _expl_import_handlers(self) -> tuple[
-        Callable[[str], ast.Expr], Callable[[str], bool],
+        Callable[[ImportTarget], ast.Expr], Callable[[ImportTarget], bool],
     ]:
         """
         Returns:
             (create_node, should_profile) \
-(tuple[Callable[[str], ast.Expr], Callable[[str], bool]]):
+(tuple[Callable[[ImportTarget], ast.Expr], \
+Callable[[ImportTarget], bool]]):
                 create_node()
-                    Callable taking the :py:attr:`ImportTarget.name` and
-                    returning an AST node responsible for setting up
-                    profiling therefrom
+                    Callable taking the import target and returning an
+                    AST node responsible for setting up profiling
+                    thereof
                 should_profile()
-                    Callable taking the :py:attr:`ImportTarget.name` and
-                    returning whether it should be profiled
+                    Callable taking the import target and returning
+                    whether it should be profiled
         """
         profiled_imports = self._prof_explicit_imports
-        should_profile: Callable[[str], bool]
+        should_profile: Callable[[ImportTarget], bool]
         if profiled_imports in (True, False):
             should_profile = partial(_return_value, bool(profiled_imports))
         else:
-            should_profile = partial(
-                should_profile_regular_import,
-                cast(Collection[str], profiled_imports),
+            should_profile = _chain_callables(
+                cast(Callable[[ImportTarget], str], attrgetter('name')),
+                partial(
+                    should_profile_regular_import,
+                    cast(Collection[str], profiled_imports),
+                ),
             )
-        create_node: Callable[[str], ast.Expr] = partial(
-            ast_create_profile_node, profiler_name=self._profiler_name,
+        create_node: Callable[[ImportTarget], ast.Expr] = _chain_callables(
+            cast(Callable[[ImportTarget], str], attrgetter('resolved_name')),
+            partial(
+                ast_create_profile_node, profiler_name=self._profiler_name,
+            ),
         )
         return create_node, should_profile
 
     @cached_property
     def _star_import_handlers(self) -> tuple[
-        Callable[[str], ast.Expr], Callable[[str], bool],
+        Callable[[ImportTarget], ast.Expr], Callable[[ImportTarget], bool],
     ]:
         """
         Returns:
             See :py:attr:`._expl_import_handlers`.
         """
         profiled_imports = self._prof_star_imports
-        should_profile: Callable[[str], bool]
+        should_profile: Callable[[ImportTarget], bool]
         if profiled_imports in (True, False):
             star_import_targets: Collection[str] | None = None
             should_profile = partial(_return_value, bool(profiled_imports))
         else:
             star_import_targets = cast(Collection[str], profiled_imports)
-            should_profile = partial(
-                should_profile_star_import, star_import_targets,
+            should_profile = _chain_callables(
+                cast(Callable[[ImportTarget], str], attrgetter('name')),
+                partial(
+                    should_profile_star_import,
+                    cast(Collection[str], profiled_imports),
+                ),
             )
-        create_node: Callable[[str], ast.Expr] = partial(
-            self._create_star_import_node,
-            targets=star_import_targets,
-            profiler_name=self._profiler_name,
+        create_node: Callable[[ImportTarget], ast.Expr] = _chain_callables(
+            cast(Callable[[ImportTarget], str], attrgetter('name')),
+            partial(
+                self._create_star_import_node,
+                targets=star_import_targets,
+                profiler_name=self._profiler_name,
+            ),
         )
         return create_node, should_profile
