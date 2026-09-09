@@ -219,6 +219,60 @@ def _chain_callables(
     return chained
 
 
+def _get_conf_table(
+    config: ConfigSource,
+    table: Sequence[str],
+    _seen_prefixes: set[tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
+    """
+    Examples:
+        Normal use:
+
+        >>> default_config = ConfigSource.from_default()
+        >>> assert _get_conf_table(
+        ...     default_config,
+        ...     ['tool', 'line_profiler', 'autoprofile'],
+        ... ) == default_config.get_subconfig('autoprofile').conf_dict
+
+        If we're beginning from a different subtable, the target
+        subtable can be recovered from reloading the config from source:
+
+        >>> subconfig = default_config.get_subconfig('kernprof')
+        >>> assert _get_conf_table(
+        ...     subconfig,
+        ...     ['tool', 'line_profiler', 'autoprofile'],
+        ... ) == default_config.get_subconfig('autoprofile').conf_dict
+
+        However, reloading doesn't necessarily help sometimes:
+
+        >>> _get_conf_table(  # doctest: +NORMALIZE_WHITESPACE
+        ...     default_config, ['tool', 'something_else'],
+        ... )
+        Traceback (most recent call last):
+          ...
+        RuntimeError: Cannot recover table=['tool', 'something_else']
+        from config=ConfigSource(...)
+    """
+    target_keys = tuple(table)
+    conf_keys = tuple(config.subtable)
+    if _seen_prefixes is None:
+        _seen_prefixes = set()
+
+    if conf_keys in _seen_prefixes:
+        # We've already tried reloading (see below); didn't work
+        raise RuntimeError(f'Cannot recover {table=!r} from {config=!r}')
+
+    if target_keys[:len(conf_keys)] == conf_keys:
+        subtable = target_keys[len(conf_keys):]
+        return dict(config.get_subconfig(*subtable).conf_dict)
+
+    # Maybe we're in a subtable and have to go up by reloading the
+    # config from source...
+    _seen_prefixes.add(conf_keys)
+    config = config.from_config(config.path)
+    return _get_conf_table(config, table, _seen_prefixes)
+
+
 class _DuplicateImportChecker(Protocol):
     """
     Protocol for objects which helps with on-import profiling
@@ -401,9 +455,10 @@ class _CompoundNodeChecker:
             config = ConfigSource.from_config(config)
         return cast(
             dict[CompoundStatement, bool],
-            config
-            .get_subconfig('autoprofile', 'import_discovery')
-            .conf_dict,
+            _get_conf_table(
+                config,
+                ['tool', 'line_profiler', 'autoprofile', 'import_discovery'],
+            ),
         )
 
 
@@ -1049,13 +1104,15 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
 
         if not isinstance(config, ConfigSource):
             config = ConfigSource.from_config(config)
-        conf = config.get_subconfig('autoprofile')
+        conf = _get_conf_table(
+            config, ['tool', 'line_profiler', 'autoprofile'],
+        )
         if prof_func_defs is None:
-            prof_func_defs = conf.conf_dict['prof_func_defs']
+            prof_func_defs = conf['prof_func_defs']
         if prof_explicit_imports is None:
-            prof_explicit_imports = conf.conf_dict['prof_explicit_imports']
+            prof_explicit_imports = conf['prof_explicit_imports']
         if prof_star_imports is None:
-            prof_star_imports = conf.conf_dict['prof_star_imports']
+            prof_star_imports = conf['prof_star_imports']
         if prof_imports_in is None:
             node_type_checker = _CompoundNodeChecker.from_config(config)
         else:
