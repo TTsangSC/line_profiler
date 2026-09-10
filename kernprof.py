@@ -877,10 +877,12 @@ def _normalize_prof_nested_imports(parsed):
     :py:func:`line_profiler.autoprofile.autoprofile.run`.
     """
     from typing import get_args
-    from line_profiler.autoprofile.profmod_extractor import _CompoundStatement
+    from line_profiler.autoprofile._single_pass_transformer import (
+        CompoundStatement,
+    )
 
     result = set()
-    valid = list(get_args(_CompoundStatement))
+    valid = list(get_args(CompoundStatement))
     invalid = set()
     for chunk in parsed:
         if not chunk:

@@ -1,6 +1,6 @@
 import ast
 import dataclasses
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from itertools import groupby
 from operator import attrgetter
 from typing import Any
@@ -74,49 +74,6 @@ class ImportTarget:
             raise TypeError(
                 f'.lineno = {self.lineno!r}: expected an int or None',
             )
-
-    @classmethod
-    def _from_ast_nodes(cls, nodes: Sequence[ast.AST]) -> list[Self]:
-        """
-        Get all imports in the body of an AST node.
-
-        Args:
-            nodes (Sequence[ast.AST]):
-                AST nodes to scan for imports;
-                examples: :py:attr:`ast.Module.body`,
-                :py:attr:`ast.If.orelse`.
-
-        Returns:
-            import_targets (list[Self]):
-                List of all imports amond the nodes.
-
-        Notes:
-            Imports nested inside the ``nodes`` are not as yet
-            handled, e.g. in
-
-            >>> # doctest: +SKIP
-            >>> from spam import ham
-            >>> try:
-            ...     from some_foo import bar
-            ... except ImportError:
-            ...     from other_foo import ersatz_bar as bar
-
-            Only ``ham`` is extracted but not ``bar``.
-        """
-        targets: list[Self] = []
-        modnames: set[str] = set()
-        for index, node in enumerate(nodes):
-            if isinstance(node, ast.Import):
-                new_targets: list[Self] = cls._from_import_node(index, node)
-            elif isinstance(node, ast.ImportFrom):
-                new_targets = cls._from_import_from_node(index, node)
-            else:  # TODO: descend into other bodied nodes
-                new_targets = []
-            for target in new_targets:
-                if target.name not in modnames:
-                    targets.append(target)
-                    modnames.add(target.name)
-        return targets
 
     @classmethod
     def _from_import_node(cls, index: int, node: ast.Import) -> list[Self]:

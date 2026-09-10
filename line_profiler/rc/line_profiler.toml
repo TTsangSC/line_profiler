@@ -217,7 +217,7 @@ time = 12
 perhit = 8
 percent = 8
 
-# `line_profiler.autoprofile` import-profiling options
+# `line_profiler.autoprofile` profiling options
 
 # Note:
 # 1. When using `preimports = true`, the `prof-mod` names are always
@@ -247,9 +247,21 @@ percent = 8
 
 [tool.line_profiler.autoprofile]
 
-# - `prof_star_imports` (bool):
+# - `prof_func_defs` (bool):
+#   Whether to profile locally-defined functions and methods via adding
+#   the `@profile` decorator thereto
+prof_func_defs = true
+
+# - `prof_explicit_imports` (list[str] | bool):
+#   Whether to profile targets explicitly imported via
+#   `import ...` and `from ... import ...` statements; if a list of
+#   targets, only profile imports which involve such targets
+prof_explicit_imports = false
+
+# - `prof_star_imports` (list[str] | bool):
 #   Whether to profile targets implicitly imported via
-#   `from ... import *` statements
+#   `from ... import *` statements; if a list of targets, only profile
+#   star-imports which involve such targets
 prof_star_imports = false
 
 [tool.line_profiler.autoprofile.import_discovery]

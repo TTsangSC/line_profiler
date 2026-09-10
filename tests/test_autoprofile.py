@@ -19,6 +19,9 @@ from warnings import catch_warnings, WarningMessage
 import pytest
 import ubelt as ub
 from line_profiler.toml_config import ConfigSource
+from line_profiler.autoprofile._single_pass_transformer import (
+    SinglePassTransformer,
+)
 from line_profiler.autoprofile.ast_profile_transformer import (
     AstProfileTransformer,
 )
@@ -1240,6 +1243,7 @@ def test_autoprofile_callable_wrapper_objects(prof_mod, profiled_funcs):
         (['bad_module'], False, [],
          '1. a\n2. b\n3. c', False, ['-n', 'a', 'b', 'c']),
     ])
+@pytest.mark.parametrize('autoprofile_core', ['old', 'new'])
 def test_autoprofile_star_imports(
     prof_mod: Sequence[str],
     prof_imports: bool,
@@ -1249,6 +1253,7 @@ def test_autoprofile_star_imports(
     expected_output: str,
     expect_warning: bool,
     script_args: Sequence[str],
+    autoprofile_core: Literal['old', 'new'],
 ) -> None:
     """
     Test that the ``--prof-star-imports`` CLI flag in :py:mod:`kernprof`
@@ -1324,6 +1329,10 @@ def test_autoprofile_star_imports(
 
         mp = stack.enter_context(pytest.MonkeyPatch.context())
         mp.setenv('PYTHONPATH', str(python_path), prepend=os.pathsep)
+        if autoprofile_core in ('old', 'new'):
+            mp.setenv('LINE_PROFILER_AUTOPROFILE_CORE', autoprofile_core)
+        else:
+            raise RuntimeError(f'{autoprofile_core=!r}')
 
         # For convenience, instead of using parametrization for the
         # presence of the `--prof-star-imports` flag, just test both
@@ -1396,6 +1405,7 @@ def test_autoprofile_star_imports(
         (['argparse.ArgumentParser', 'textwrap.dedent'], False,
          ['try-except'], [], None),
     ])
+@pytest.mark.parametrize('autoprofile_core', ['old', 'new'])
 def test_autoprofile_nested_imports(
     prof_mod: Sequence[str],
     prof_imports: bool,
@@ -1406,6 +1416,7 @@ def test_autoprofile_nested_imports(
     expected_output: str,
     expect_warning: str | None,
     script_args: Sequence[str],
+    autoprofile_core: Literal['old', 'new'],
 ) -> None:
     """
     Test that the ``--prof-nested-imports`` CLI flag in
@@ -1486,9 +1497,14 @@ def test_autoprofile_nested_imports(
             '-c', test_code_template.format(repr(str(toml_path))),
             *script_args
         ]
-
+        env = os.environ.copy()
+        if autoprofile_core in ('old', 'new'):
+            env['LINE_PROFILER_AUTOPROFILE_CORE'] = autoprofile_core
+        else:
+            raise RuntimeError(f'{autoprofile_core=!r}')
         proc = ub.cmd(
-            cmd + kernprof_options + script_options, check=True, verbose=2,
+            cmd + kernprof_options + script_options,
+            check=True, verbose=2, env=env,
         )
         assert isinstance(proc.stdout, str)
         assert expected_output in proc.stdout
@@ -1529,16 +1545,19 @@ def test_autoprofile_nested_imports(
      (['xml.etree.ElementTree.Element', 'xml.etree.ElementTree.XMLParser',
        'xml.dom.minidom'],
       False, True, False, True, False, True)])
+@pytest.mark.parametrize('autoprofile_core', ['old', 'new'])
 def test_multitarget_import_resolution(
     prof_mod: list[str],
     prof_os: bool,
     prof_minidom: bool, prof_pulldom: bool,
     prof_elem: bool, prof_etree: bool, prof_parser: bool,
+    autoprofile_core: Literal['old', 'new'],
 ) -> None:
     """
     Test that (from-)import statements with multiple targets are
-    correctly transformed by :py:class:`.AstTreeProfiler`, resolving to
-    the correct entities being profiled.
+    correctly transformed by :py:class:`SinglePassTransformer` and the
+    legacy :py:class:`.AstTreeProfiler`, resolving to the correct
+    entities being profiled.
 
     See also:
         Issue #433
@@ -1559,7 +1578,17 @@ def test_multitarget_import_resolution(
     with tempfile.TemporaryDirectory() as tmp:
         fpath = ub.Path(tmp) / 'script.py'
         fpath.write_text(input_module)
-        module_ast = AstTreeProfiler(str(fpath), prof_mod, False).profile()
+        if autoprofile_core == 'old':
+            module_ast = AstTreeProfiler(str(fpath), prof_mod, False).profile()
+        elif autoprofile_core == 'new':
+            transformer = SinglePassTransformer(
+                prof_explicit_imports=prof_mod,
+                prof_star_imports=False,
+            )
+            module_ast = ast.parse(input_module)
+            module_ast = transformer._transform(module_ast, fpath)
+        else:
+            raise RuntimeError(f'{autoprofile_core=!r}')
     output_module = ast.unparse(module_ast)
 
     for target, profiled in {
@@ -1760,6 +1789,11 @@ def test_multitarget_import_transformation_executes() -> None:
 
     See also:
         Issue #433
+
+    Notes:
+        We do not need to test :py:class:`.SinglePassTransformer`
+        separately because :py:class:`.AstTreeProfiler` uses
+        :py:class:`.AstProfileTransformer`, which is a subclass thereof.
     """
     from xml.etree.ElementTree import Element, dump, XMLParser
 
@@ -1933,14 +1967,18 @@ def test_drop_and_warn_against_star_imports(
      (['backup_fred', 'operator'], {'__getattr__'},
       {'class_defs'}),
      (['backup_fred', 'operator'], {'fred'}, {'loops'})])
+@pytest.mark.parametrize('autoprofile_core', ['old', 'new'])
 def test_nested_import_discovery(
     prof_mod: list[str],
     expected: set[str],
     options: set[_ImportDiscoveryOption],
+    autoprofile_core: Literal['old', 'new'],
 ) -> None:
     """
-    Check the source code transformed by :py:class:`.AstTreeProfiler` to
-    see if the import-discovery selection options in the TOML file
+    Check the source code transformed by
+    :py:class:`.SinglePassTransformer` and the legacy
+    :py:class:`.AstTreeProfiler` to see if the import-discovery
+    selection options in the TOML file
     (``[tool.line_profiler.autoprofile.import_discovery]``) are handled
     correctly in a real-ish script, with some of the compound statements
     hosting the import statements nested inside other coumpound
@@ -2025,8 +2063,19 @@ def test_nested_import_discovery(
             print(_get_toml_import_discovery_section(options), file=fobj)
 
         config = ConfigSource.from_config(cfg_fname)
-        atp = AstTreeProfiler(mod_fname, prof_mod, False, config=config)
-        output_module = ast.unparse(atp.profile())
+        if autoprofile_core == 'old':
+            atp = AstTreeProfiler(mod_fname, prof_mod, False, config=config)
+            tree = atp.profile()
+        elif autoprofile_core == 'new':
+            transformer = SinglePassTransformer(
+                config=config,
+                prof_explicit_imports=prof_mod,
+                prof_star_imports=False,
+            )
+            tree = transformer._transform(ast.parse(test_module), mod_fname)
+        else:
+            raise RuntimeError(f'{autoprofile_core=!r}')
+    output_module = ast.unparse(tree)
 
     for label, module_text in [
         ('input', test_module), ('output', output_module),
@@ -2038,7 +2087,9 @@ def test_nested_import_discovery(
 
 @pytest.mark.parametrize('inject_options_with', ['config', 'args'])
 @pytest.mark.parametrize('use_component',
-                         ['ast_tree_profiler', 'ast_profile_transformer'])
+                         ['ast_tree_profiler',
+                          'ast_profile_transformer',
+                          'single_pass_transformer'])
 @pytest.mark.parametrize(
     ('compound_statement', 'options', 'should_be_profiled'),
     [('function-def', set(), False),
@@ -2068,7 +2119,11 @@ def test_nested_import_discovery(
 def test_import_discovery_in_all_compound_statements(
     compound_statement: _CompoundStatement,
     options: set[_ImportDiscoveryOption],
-    use_component: Literal['ast_tree_profiler', 'ast_profile_transformer'],
+    use_component: Literal[
+        'ast_tree_profiler',
+        'ast_profile_transformer',
+        'single_pass_transformer',
+    ],
     inject_options_with: Literal['config', 'args'],
     should_be_profiled: bool,
 ) -> None:
@@ -2231,14 +2286,26 @@ def test_import_discovery_in_all_compound_statements(
             module_ast = atp.profile(
                 profile_nested_imports=profile_nested_imports,
             )
-        else:
-            module_ast = AstProfileTransformer._transform(
-                ast.parse(test_case),
-                case_fname,
+        elif use_component == 'ast_profile_transformer':
+            apt = AstProfileTransformer._get_ast_transformer(
                 profile_imports=True,
                 config=config,
                 profile_nested_imports=profile_nested_imports,
             )
+            module_ast = apt._transform(ast.parse(test_case), case_fname)
+        elif use_component == 'single_pass_transformer':
+            if profile_nested_imports is None:
+                prof_imports_in = None
+            else:
+                prof_imports_in = dict.fromkeys(profile_nested_imports, True)
+            spt = SinglePassTransformer(
+                config=config,
+                prof_explicit_imports=True,
+                prof_imports_in=prof_imports_in,
+            )
+            module_ast = spt._transform(ast.parse(test_case), case_fname)
+        else:
+            raise RuntimeError(f'{use_component=!r}')
         output = ast.unparse(module_ast)
 
     for label, module_text in [
@@ -2252,17 +2319,21 @@ def test_import_discovery_in_all_compound_statements(
 
 @pytest.mark.parametrize(
     ('call', 'use_component', 'expected_profiled_objects'),
+    # Nothing special happens when calling `first()` and `second()`,
+    # there's only a single import target (`textwrap.indent`) inside the
+    # function
     [
-        # Nothing special happens when calling `first()` and `second()`,
-        # there's only a single import target (`textwrap.indent`) inside
-        # the function
-        ('first', 'profmod_extractor', ['indent']),
-        ('first', 'ast_tree_profiler', ['indent']),
-        ('first', 'ast_profile_transformer', ['indent']),
-        ('second', 'profmod_extractor', ['indent']),
-        ('second', 'ast_tree_profiler', ['indent']),
-        ('second', 'ast_profile_transformer', ['indent']),
-        # With `third()`, because `textwrap.dedent()` is also imported:
+        (call, component, ['indent'])
+        for call in ('first', 'second')
+        for component in (
+            'profmod_extractor',
+            'ast_tree_profiler',
+            'ast_profile_transformer',
+            'single_pass_transformer',
+        )
+    ]
+    # With `third()`, because `textwrap.dedent()` is also imported:
+    + [
         ('third', 'profmod_extractor', ['indent']),
         # - When using `AstTreeProfiler`, `ProfmodExtractor` first
         #   inserts a profiling node for `indent()`, then followed by
@@ -2271,14 +2342,19 @@ def test_import_discovery_in_all_compound_statements(
         #   is inserted bewteen the import statement and the profiling
         #   node for `indent()`, and is hence executed first
         ('third', 'ast_tree_profiler', ['dedent', 'indent']),
-        # - When using `AstProfileTransformer`, profiling nodes are
-        #   inserted for both `indent()` and `dedent()` in one go
+        # - When using `SinglePassTransformer` or
+        #   `AstProfileTransformer`, profiling nodes are inserted for
+        #   both `indent()` and `dedent()` in one go
         ('third', 'ast_profile_transformer', ['indent', 'dedent']),
+        ('third', 'single_pass_transformer', ['indent', 'dedent']),
     ])
 def test_nested_imports_correct_deduplication_across_scopes(
     call: Literal['first', 'second', 'third'],
     use_component: Literal[
-        'profmod_extractor', 'ast_tree_profiler', 'ast_profile_transformer',
+        'profmod_extractor',
+        'ast_tree_profiler',
+        'ast_profile_transformer',
+        'single_pass_transformer',
     ],
     expected_profiled_objects: Sequence[Literal['indent', 'dedent']],
 ) -> None:
@@ -2346,15 +2422,23 @@ def test_nested_imports_correct_deduplication_across_scopes(
                 mod_fname, ['textwrap.indent', str(mod_fname)], True,
                 config=config,
             ).profile()
-        else:  # `ast_profile_transformer`
-            mod_ast = AstProfileTransformer._transform(
-                ast.parse(test_module),
-                mod_fname,
-                profile_imports=True,
-                config=config,
-            )
+        elif use_component in (
+            'ast_profile_transformer', 'single_pass_transformer',
+        ):
+            transformer: SinglePassTransformer
+            if use_component.startswith('ast_'):
+                transformer = AstProfileTransformer._get_ast_transformer(
+                    profile_imports=True, config=config,
+                )
+            else:
+                transformer = SinglePassTransformer(
+                    prof_explicit_imports=True, config=config,
+                )
+            mod_ast = transformer._transform(ast.parse(test_module), mod_fname)
             # We need this to actually compile and exec the code
             mod_ast = ast.fix_missing_locations(mod_ast)
+        else:
+            raise RuntimeError(f'{use_component=!r}')
         print(ast.unparse(mod_ast))
 
         namespace: dict[str, Any] = {'profile': mock_prof}
@@ -2440,14 +2524,12 @@ def test_ast_profile_transformer_deprecated_profiled_imports(
             )
         ))
 
-        config = ConfigSource.from_config(cfg_fname)
-        mod_ast = AstProfileTransformer._transform(
-            ast.parse(test_module),
-            mod_fname,
+        apt = AstProfileTransformer._get_ast_transformer(
             profile_imports=True,
             profiled_imports=[],  # This triggers legacy behavior
-            config=config,
+            config=ConfigSource.from_config(cfg_fname),
         )
+        mod_ast = apt._transform(ast.parse(test_module), mod_fname)
         output = ast.unparse(mod_ast)
         print(output)
 
