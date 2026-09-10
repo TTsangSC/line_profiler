@@ -1379,8 +1379,14 @@ class SinglePassTransformer(ContextAwareVisitor, ast.NodeTransformer):
                 Input module node
 
         Notes:
-            The default ``stacklevel`` means that any warning raised
-            will be attributed to where this method is called.
+            - The default ``stacklevel`` means that any warning raised
+              will be attributed to where this method is called.
+
+            - This method should be used only once per instance; in
+              general, an instance should not be used to
+              :py:meth:`.visit` more than one ASTs because of internal
+              states (esp. :py:attr:`._duplicate_import_checker` and
+              :py:attr:`._dropped_imports`).
         """
         filter_dropped: Callable[[Set[ImportTarget]], Collection[ImportTarget]]
         if callable(warn_dropped_star_imports):
