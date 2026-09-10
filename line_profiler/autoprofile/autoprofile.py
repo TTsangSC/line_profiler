@@ -52,14 +52,17 @@ import importlib.util
 import os
 import sys
 import types
-from collections.abc import Collection, MutableMapping
+from collections.abc import Callable, Collection, MutableMapping
+from functools import partial
 from typing import Any, cast, get_args
 
 from .._diagnostics import USE_LEGACY_AUTOPROF
 from ..toml_config import ConfigSource
 from ..line_profiler_utils import restore
+from ._import_targets import ImportTarget
 from ._single_pass_transformer import (
     _ProfModHelper, CompoundStatement, SinglePassTransformer,
+    should_profile_star_import,
 )
 from .ast_tree_profiler import AstTreeProfiler
 from .run_module import AstTreeModuleProfiler
@@ -140,10 +143,18 @@ def _rewrite_ast_single_pass(
     """
     Use :py:class:`.SinglePassTransformer` to rewrite the AST of
     ``script_file``.
+
+    Notes:
+        As of now we prioritize functional parity with the existing
+        behavior; this may change in the future for e.g. a more
+        streamlined interface or more intuitive behaviors..
     """
     helper = _ProfModHelper(script_file, prof_mod)
     conf = ConfigSource.from_config(config)
     explicit_targets = helper.to_dotted_paths(exclude_script_file=True)
+    profile_entire_script = helper.script_file_is_included(
+        match_mode='module' if module_name else 'filename',
+    )
     if profile_star_imports is None:
         profile_star_imports = bool(
             conf.get_subconfig('autoprofile').conf_dict['prof_star_imports'],
@@ -152,16 +163,34 @@ def _rewrite_ast_single_pass(
     # If `script_file` is included among the `prof_mod`:
     # - All imports are to be rewritten
     # - All local functions/methods are to be decorated
-    profile_entire_script = helper.script_file_is_included(
-        match_mode='module' if module_name else 'filename',
-    )
-    if profile_entire_script and profile_imports:
-        prof_explicit_imports: list[str] | bool = True
+    prof_func_defs: bool
+    prof_explicit_imports: list[str] | bool
+    if profile_entire_script:
+        prof_func_defs = True
+        prof_explicit_imports = profile_imports or explicit_targets
     else:
+        prof_func_defs = False
         prof_explicit_imports = explicit_targets
 
     prof_star_imports: list[str] | bool
-    prof_star_imports = profile_star_imports and prof_explicit_imports
+    warn_dropped_star_imports: Callable[[Collection[Any]], set[Any]] | bool
+    if profile_star_imports:
+        # If we are profiling star-imports as indicated by the boolean,
+        # the non-profiled star-imports are only a result of their not
+        # being selected and therefore should not be reported in
+        # warnings
+        prof_star_imports = prof_explicit_imports
+        warn_dropped_star_imports = False
+    else:
+        # Otherwise, we only report a dropped star-import if it was ever
+        # intended to be profiled at all
+        prof_star_imports = False
+        if profile_entire_script and profile_imports:
+            warn_dropped_star_imports = True
+        else:
+            warn_dropped_star_imports = partial(
+                _filter_dropped_star_imports, explicit_targets,
+            )
 
     if profile_nested_imports is None:
         prof_imports_in: dict[CompoundStatement, bool] | None = None
@@ -174,7 +203,7 @@ def _rewrite_ast_single_pass(
     transformer = SinglePassTransformer(
         config=conf,
         module=module_name,
-        prof_func_defs=profile_entire_script,
+        prof_func_defs=prof_func_defs,
         prof_explicit_imports=prof_explicit_imports,
         prof_star_imports=prof_star_imports,
         prof_imports_in=prof_imports_in,
@@ -182,16 +211,19 @@ def _rewrite_ast_single_pass(
     with open(script_file) as fobj:
         tree: ast.Module = ast.parse(fobj.read(), filename=script_file)
     tree = transformer._transform(
-        tree, script_file,
-        # If we are profiling star-imports as indicated by the boolean,
-        # the non-profiled star-imports are only a result of their not
-        # being selected and therefore should not be reported in
-        # warnings
-        # FIXME: behavior not entirely consistent with legacy backend
-        warn_dropped_star_imports=not profile_star_imports,
+        tree, script_file, warn_dropped_star_imports=warn_dropped_star_imports,
     )
     ast.fix_missing_locations(tree)
     return tree
+
+
+def _filter_dropped_star_imports(
+    should_profile: Collection[str], dropped: Collection[ImportTarget],
+) -> set[ImportTarget]:
+    return {
+        target for target in dropped
+        if should_profile_star_import(should_profile, target.name)
+    }
 
 
 def run(
