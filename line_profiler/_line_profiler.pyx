@@ -25,21 +25,29 @@ from cpython.version cimport PY_VERSION_HEX
 from libc.stdint cimport int64_t
 
 from libcpp.unordered_map cimport unordered_map
+import dis
 import functools
 import threading
 import opcode
 import os
 import types
+from math import ceil
 from warnings import warn
 
 from line_profiler._diagnostics import (
     WRAP_TRACE, SET_FRAME_LOCAL_TRACE, USE_LEGACY_TRACE
 )
 
+from ._common_types_and_ops cimport (
+    compute_line_hash,
+    PyObject, PyCodeObject, PyFrameObject,
+    Py_hash_t, PY_LONG_LONG, int64, uint64,
+)
 from ._map_helpers cimport (
     last_erase_if_present, line_ensure_entry, LastTime, LastTimeMap,
-    LineTime, LineTimeMap
+    LineTime, LineTimeMap,
 )
+from ._process_opcodes cimport process_opcodes
 
 
 NOP_VALUE: int = opcode.opmap['NOP']
@@ -69,16 +77,7 @@ if not (USE_LEGACY_TRACE or _CAN_USE_SYS_MONITORING):
          f"in Python {sys.version}; falling back to the legacy trace system")
     USE_LEGACY_TRACE = True
 
-# long long int is at least 64 bytes assuming c99
-ctypedef unsigned long long int uint64
-ctypedef long long int int64
-
 cdef extern from "Python_wrapper.h":
-    ctypedef struct PyObject
-    ctypedef struct PyCodeObject
-    ctypedef struct PyFrameObject
-    ctypedef Py_ssize_t Py_hash_t
-    ctypedef long long PY_LONG_LONG
     ctypedef int (*Py_tracefunc)(
         object self, PyFrameObject *py_frame, int what, PyObject *arg)
 
@@ -138,18 +137,6 @@ cdef extern from "timers.c":
 #cdef struct LastTime:
 #    int f_lineno
 #    PY_LONG_LONG time
-
-
-cdef inline int64 compute_line_hash(uint64 block_hash, uint64 linenum) noexcept:
-    """
-    Compute the hash used to store each line timing in an unordered_map.
-    This is fairly simple, and could use some improvement since linenum
-    isn't technically random, however it seems to be good enough and
-    fast enough for any practical purposes.
-    """
-    # linenum doesn't need to be int64 but it's really a temporary value
-    # so it doesn't matter
-    return block_hash ^ linenum
 
 
 cdef inline object multibyte_rstrip(bytes bytecode):
@@ -338,7 +325,7 @@ class LineStats(object):
 
     Attributes:
 
-        timings (dict[tuple[str, int, str], \
+        timings (Mapping[tuple[str, int, str], \
 list[tuple[int, int, int]]]):
             Mapping from ``(filename, first_lineno, function_name)`` of
             the profiled function to a list of
@@ -348,10 +335,58 @@ list[tuple[int, int, int]]]):
 
         unit (float):
             The number of seconds per timer unit.
+
+        adjustment_factors \
+(Mapping[tuple[tuple[str, int, str], int], int] | None):
+            Optional mapping from
+            ``((filename, first_lineno, function_name), lineno)`` of a
+            line in the profiled function to an adjustment factor
+            (duplicity) of line events recorded thereon, used for
+            calculating the :py:attr:`.adjusted_timings`.
     """
-    def __init__(self, timings, unit):
+    def __init__(self, timings, unit, adjustment_factors=None):
         self.timings = timings
         self.unit = unit
+        if adjustment_factors is not None:
+            # Note: older iteration of this object doesn't have this
+            # attribute, so (1) only set it when supplied, and (2) write
+            # the code so that attribute itself is optional
+            self._adjustment_factors = adjustment_factors
+
+    @property
+    def adjusted_timings(
+        self,
+    ):  # type: dict[tuple[str, int, str], list[tuple[int, int, int]]]
+        """
+        Adjusted stats based on the raw :py:attr:`.timings`, where the
+        ``nhits`` are scaled (inversely) according to the supplied
+        ``adjustment_factors``.
+
+        Notes:
+            This adjustment is heuristic, relying on post-processing;
+            as such, accuracy is not guaranteed. E.g. in cases where the
+            code errored out executing a part of, but not all,
+            instructions resulting in line events on the same line, the
+            scaled ``nhits`` may not cleanly correspond to the expected
+            value.
+        """
+        try:
+            factors = self._adjustment_factors
+        except AttributeError:
+            factors = {}
+        # Note: always round up the `nhits` unless it <= 0
+        result = {}
+        for key, entries in self.timings.items():
+            new_entries = result[key] = []
+            for lineno, nhits, total_time in entries:
+                if nhits > 0:
+                    adj_nhits = int(ceil(
+                        nhits / factors.get((key, lineno), 1)
+                    ))
+                else:
+                    adj_nhits = 0
+                new_entries.append((lineno, adj_nhits, total_time))
+        return result
 
 
 cdef class _SysMonitoringState:
@@ -1049,7 +1084,7 @@ cdef class LineProfiler:
     # Mapping between thread-id and map of LastTime
     cdef unordered_map[int64, LastTimeMap] _c_last_time
     cdef public list functions
-    cdef public dict code_hash_map, dupes_map
+    cdef public dict code_hash_map, dupes_map, _line_event_dup_factors
     cdef public double timer_unit
     cdef public object threaddata
 
@@ -1070,8 +1105,10 @@ cdef class LineProfiler:
     def __init__(self, *functions,
                  wrap_trace=None, set_frame_local_trace=None):
         self.functions = []
-        self.code_hash_map = {}
-        self.dupes_map = {}
+        self.code_hash_map = {}  # type: dict[types.CodeType, list[int]]
+        self.dupes_map = {}  # type: dict[bytes, list[types.CodeType]]
+        self._line_event_dup_factors = {
+        }  # type: dict[types.CodeType, dict[int, int]]
         self.timer_unit = hpTimerUnit()
         # Create a data store for thread-local objects
         # https://docs.python.org/3/library/threading.html#thread-local-data
@@ -1133,6 +1170,7 @@ datamodel.html#user-defined-functions
         # XXX: tests for the above assertion if necessary
         co_code: bytes = code.co_code
         code_hashes = []
+        code_local_nhits: dict
         if any(co_code):  # Normal Python functions
             # Figure out how much padding we need and strip the bytecode
             # Notes:
@@ -1166,15 +1204,17 @@ datamodel.html#user-defined-functions
                 self.dupes_map[base_co_code].append(code)
             except KeyError:
                 self.dupes_map[base_co_code] = [code]
-            # TODO: Since each line can be many bytecodes, this is kinda
-            # inefficient
-            # See if this can be sped up by not needing to iterate over
-            # every byte
-            for offset, _ in enumerate(co_code):
-                code_hashes.append(
-                    compute_line_hash(
-                        hash(co_code),
-                        PyCode_Addr2Line(<PyCodeObject*>code, offset)))
+            # Do per-instruction bookkeeping, keeping track of duplicate
+            # line events which arises from e.g. multiline func calls
+            # (see issue #441)
+            # Note: we're (re-)scanning over the entire list of opcodes
+            # to count for line hits anyway, so keeping any potential
+            # old values for `code_local_nhits` will result in wrong
+            # counts after incrementing
+            code_local_nhits = self._line_event_dup_factors[code] = {}
+            process_opcodes(
+                code_hashes, code_local_nhits, <PyCodeObject*>code, co_code,
+            )
         else:  # Cython functions have empty/zero bytecodes
             if CANNOT_LINE_TRACE_CYTHON:
                 return
@@ -1368,8 +1408,11 @@ datamodel.html#user-defined-functions
         cdef dict cmap = self._c_code_map
 
         all_entries = {}
+        dup_factors = {
+        }  # type: dict[tuple[tuple[str, int, str], int], int]
         for code in self.code_hash_map:
             entries = []
+
             for entry in self.code_hash_map[code]:
                 entries.extend(cmap[entry].values())
             key = label(code)
@@ -1385,12 +1428,18 @@ datamodel.html#user-defined-functions
                  entries_by_lineno[lineno] = (orig_nhits + nhits,
                                               orig_total_time + total_time)
 
+            # Keep track of the number of "duplicate" line events
+            for lineno, count in (
+                self._line_event_dup_factors.get(code, {}).items()
+            ):
+                dup_factors[key, lineno] = count
+
         # Aggregate the timing data
         stats = {
             key: sorted((line, nhits, time)
                         for line, (nhits, time) in entries_by_lineno.items())
             for key, entries_by_lineno in all_entries.items()}
-        return LineStats(stats, self.timer_unit)
+        return LineStats(stats, self.timer_unit, dup_factors)
 
 
 @cython.boundscheck(False)

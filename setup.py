@@ -242,7 +242,9 @@ if __name__ == '__main__':
                     ],
                     # force a recompile if this changes
                     depends=[
+                        'line_profiler/_common_types_and_ops.pxd',
                         'line_profiler/_map_helpers.pxd',
+                        'line_profiler/_process_opcodes.pxd',
                     ],
                     language='c++',
                     define_macros=[
@@ -262,7 +264,9 @@ if __name__ == '__main__':
                 },
                 include_path=[
                     'line_profiler/python25.pxd',
+                    'line_profiler/_common_types.pxd',
                     'line_profiler/_map_helpers.pxd',
+                    'line_profiler/_process_opcodes.pxd',
                 ],
                 force=force,
                 nthreads=multiprocessing.cpu_count(),
