@@ -88,6 +88,9 @@ skip-zero = false
 #   - `summarize` (bool):
 #     `--summarize` (true) or `--no-summarize` (false)
 summarize = false
+# - `adjusted-timings` (bool):
+#   `-a`/`--adjusted-timings` (true) or `--no-adjusted-timings` (false)
+adjusted-timings = false
 #   - `preimports` (bool):
 #     `--preimports` (true) or `--no-preimports` (false)
 preimports = true
@@ -144,6 +147,9 @@ sort = false
 # - `summarize` (bool):
 #   `-m`/`--summarize` (true) or `--no-summarize` (false)
 summarize = false
+# - `adjusted-timings` (bool):
+#   `-a`/`--adjusted-timings` (true) or `--no-adjusted-timings` (false)
+adjusted-timings = false
 
 # `line_profiler.GlobalProfiler` options
 
@@ -193,6 +199,7 @@ stripzeros = true
 rich = true
 details = false
 summarize = true
+adjusted_timings = false
 
 # `line_profiler.line_profiler.show_text()` column widths
 # (Note: the values below are also the minima; it is only possible to

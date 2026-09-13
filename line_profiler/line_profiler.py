@@ -25,13 +25,13 @@ from typing import (
     TYPE_CHECKING,
     IO,
     Callable,
+    Collection,
     Literal,
     Mapping,
     Protocol,
     Sequence,
     TypeVar,
     cast,
-    Tuple,
 )
 
 try:
@@ -62,7 +62,10 @@ if TYPE_CHECKING:  # pragma: no cover
         def register_magics(self, magics: type) -> None: ...
 
     PS = ParamSpec('PS')
-    _TimingsMap = Mapping[Tuple[str, int, str], list[Tuple[int, int, int]]]
+    _TimingKey = tuple[str, int, str]  # (fname, first_lineno, func)
+    _TimingEntry = tuple[int, int, int]  # (lineno, nhits, total_time)
+    _TimingsMap = Mapping[_TimingKey, list[_TimingEntry]]
+    _TimingAdjustments = Mapping[tuple[_TimingKey, int], int]
     T = TypeVar('T')
     T_co = TypeVar('T_co', covariant=True)
 
@@ -75,11 +78,11 @@ __version__ = '5.0.2'
 
 @functools.lru_cache()
 def get_column_widths(
-    config: bool | str | None = False,
+    config: bool | str | os.PathLike[str] | None = False,
 ) -> Mapping[ColumnLiterals, int]:
     """
     Arguments
-        config (bool | str | None)
+        config (bool | str | os.PathLike[str] | None)
             Passed to :py:meth:`.ConfigSource.from_config`.
     Note:
         * Results are cached.
@@ -250,9 +253,15 @@ class _StatsLike(Protocol):
 class LineStats(CLineStats):
     timings: _TimingsMap
     unit: float
+    _adjustment_factors: _TimingAdjustments
 
-    def __init__(self, timings: _TimingsMap, unit: float) -> None:
-        super().__init__(timings, unit)
+    def __init__(
+        self,
+        timings: _TimingsMap,
+        unit: float,
+        adjustment_factors: _TimingAdjustments | None = None,
+    ) -> None:
+        super().__init__(timings, unit, adjustment_factors)
 
     def __repr__(self) -> str:
         return '{}({}, {:.2G})'.format(
@@ -307,8 +316,8 @@ class LineStats(CLineStats):
             ...     1E-6)
             >>> assert stats1 + stats2 == stats2 + stats1 == stats_sum
         """
-        timings, unit = self._get_aggregated_timings([self, other])
-        return type(self)(timings, unit)
+        timings, unit, adj = self._get_aggregated_timings([self, other])
+        return type(self)(timings, unit, adj)
 
     def __iadd__(self, other: _StatsLike) -> Self:
         """
@@ -334,7 +343,11 @@ class LineStats(CLineStats):
             >>> assert id(stats2) == address
             >>> assert stats2 == stats_sum
         """
-        self.timings, self.unit = self._get_aggregated_timings([self, other])
+        self.timings, self.unit, adj = (
+            self._get_aggregated_timings([self, other])
+        )
+        if adj:
+            self._adjustment_factors = adj
         return self
 
     def print(
@@ -347,10 +360,11 @@ class LineStats(CLineStats):
         sort: bool = False,
         rich: bool = False,
         *,
+        adjusted_timings: bool = False,
         config: str | PathLike[str] | bool | None = None,
     ) -> None:
         show_text(
-            self.timings,
+            self.adjusted_timings if adjusted_timings else self.timings,
             self.unit,
             output_unit=output_unit,
             stream=stream,
@@ -390,7 +404,8 @@ class LineStats(CLineStats):
             ...     {('foo', 1, 'spam.py'): [(2, 10, 300)],
             ...      ('bar', 10, 'spam.py'):
             ...      [(11, 2, 1000), (12, 1, 500)]},
-            ...     1E-6)
+            ...     1E-6,
+            ...     {(('bar', 10, 'spam.py'), 11): 2})
             >>> stats2 = LineStats(
             ...     {('bar', 10, 'spam.py'):
             ...      [(11, 10, 20000), (12, 5, 1000)],
@@ -404,12 +419,25 @@ class LineStats(CLineStats):
             ...     ('bar', 10, 'spam.py'):
             ...     [(11, 12, 3000), (12, 6, 600)],
             ...     ('baz', 5, 'eggs.py'): [(5, 2, 500)]}
+            >>> assert stats_combined.adjusted_timings == {
+            ...     ('foo', 1, 'spam.py'): [(2, 10, 300)],
+            ...     ('bar', 10, 'spam.py'):
+            ...     [(11, 6, 3000), (12, 6, 600)],
+            ...     ('baz', 5, 'eggs.py'): [(5, 2, 500)]}
         """
-        timings, unit = cls._get_aggregated_timings([stats, *more_stats])
-        return cls(timings, unit)
+        timings, unit, adj = cls._get_aggregated_timings([stats, *more_stats])
+        return cls(timings, unit, adj)
 
     @staticmethod
-    def _get_aggregated_timings(stats_objs):
+    def _get_aggregated_timings(stats_objs: Collection[_StatsLike]) -> tuple[
+        dict[_TimingKey, list[_TimingEntry]],
+        float,
+        dict[tuple[_TimingKey, int], int] | None,
+    ]:
+        timings: dict[_TimingKey, list[_TimingEntry]]
+        unit: float
+        adj: dict[tuple[_TimingKey, int], int] = {}
+
         if not stats_objs:
             raise ValueError(f'stats_objs = {stats_objs!r}: empty')
         try:
@@ -419,7 +447,7 @@ class LineStats(CLineStats):
             # rounding errors
             stats_objs = sorted(stats_objs, key=operator.attrgetter('unit'))
             unit = stats_objs[-1].unit
-            timing_dict = {}
+            timing_dict: dict[_TimingKey, dict[int, tuple[int, float]]] = {}
             for stats in stats_objs:
                 factor = stats.unit / unit
                 for key, entries in stats.timings.items():
@@ -430,6 +458,7 @@ class LineStats(CLineStats):
                             prev_nhits + nhits,
                             prev_time + factor * time,
                         )
+                adj.update(getattr(stats, '_adjustment_factors', {}))
             timings = {
                 key: [
                     (lineno, nhits, int(round(time, 0)))
@@ -442,7 +471,8 @@ class LineStats(CLineStats):
                 key: entries.copy() for key, entries in stats.timings.items()
             }
             unit = stats.unit
-        return timings, unit
+            adj.update(getattr(stats, '_adjustment_factors', {}))
+        return timings, unit, (adj or None)
 
 
 class LineProfiler(CLineProfiler, ByCountProfilerMixin):
@@ -581,6 +611,7 @@ class LineProfiler(CLineProfiler, ByCountProfilerMixin):
         sort: bool = False,
         rich: bool = False,
         *,
+        adjusted_timings: bool = False,
         config: str | PathLike[str] | bool | None = None,
     ) -> None:
         """Show the gathered statistics."""
@@ -592,6 +623,7 @@ class LineProfiler(CLineProfiler, ByCountProfilerMixin):
             summarize=summarize,
             sort=sort,
             rich=rich,
+            adjusted_timings=adjusted_timings,
             config=config,
         )
 
@@ -840,7 +872,7 @@ def show_func(
 
         func_name (str): name of profiled function
 
-        timings (List[Tuple[int, int, float]]):
+        timings (list[tuple[int, int, float]]):
             Measurements for each line (lineno, nhits, time).
 
         unit (float):
@@ -947,9 +979,9 @@ def show_func(
         sublines = [''] * nlines
 
     # Define minimum column sizes so text fits and usually looks consistent
-    if isinstance(config, os.PathLike):
-        config = os.fspath(config)
-    conf_column_sizes = get_column_widths(config)
+    if not (config in (True, False, None) or isinstance(config, str)):
+        config = os.fspath(cast(os.PathLike[str], config))
+    conf_column_sizes = get_column_widths(cast(str | bool | None, config))
     default_column_sizes = {
         col: max(width, conf_column_sizes.get(col, width))
         for col, width in get_column_widths().items()
@@ -1262,6 +1294,18 @@ def main() -> None:
     )
     add_argument(
         parser,
+        '-a',
+        '--adjusted-timings',
+        action='store_true',
+        help='Whether to use adjusted (true) or raw (false) timings; '
+        'with adjusted timings, '
+        'try to correct apparent "duplicate" line hits '
+        'resulting from e.g. multi-line function calls '
+        'or other similar constructions. '
+        f'(Default: {default.conf_dict["adjusted_timings"]})',
+    )
+    add_argument(
+        parser,
         'profile_output',
         nargs='+',
         help="'*.lprof' file(s) created by `kernprof`",
@@ -1276,15 +1320,14 @@ def main() -> None:
             setattr(args, key, default)
 
     lstats = LineStats.from_files(*args.profile_output)
-    show_text(
-        lstats.timings,
-        lstats.unit,
+    lstats.print(
         output_unit=args.unit,
         stripzeros=args.skip_zero,
         rich=args.rich,
         sort=args.sort,
         summarize=args.summarize,
         config=args.config,
+        adjusted_timings=args.adjusted_timings,
     )
 
 

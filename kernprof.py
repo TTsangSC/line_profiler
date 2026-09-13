@@ -161,6 +161,10 @@ which displays:
                             short form: -z)
       --summarize [Y[es] | N[o] | T[rue] | F[alse] | on | off | 1 | 0]
                             Print a summary of total function time. (Default: False)
+      --adjusted-timings [Y[es] | N[o] | T[rue] | F[alse] | on | off | 1 | 0]
+                            Display adjusted timings: try to correct apparent "duplicate"
+                            line hits resulting from e.g. multi-line function calls or
+                            other similar constructions. (Default: False; short form: -a)
       -i, --output-interval [OUTPUT_INTERVAL]
                             Enables outputting of cumulative profiling results to OUTFILE
                             every OUTPUT_INTERVAL seconds. Uses the threading module.
@@ -642,6 +646,17 @@ def _add_core_parser_arguments(parser):
         action='store_true',
         help='Print a summary of total function time. '
         f'(Default: {default.conf_dict["summarize"]})',
+    )
+    add_argument(
+        out_opts,
+        '-a',
+        '--adjusted-timings',
+        action='store_true',
+        help='Display adjusted timings: '
+        'try to correct apparent "duplicate" line hits '
+        'resulting from e.g. multi-line function calls '
+        'or other similar constructions. '
+        f'(Default: {default.conf_dict["adjusted_timings"]})',
     )
     if default.conf_dict['output_interval']:
         def_out_int = f'{default.conf_dict["output_interval"]} s'
@@ -1303,6 +1318,7 @@ def _post_profile(options, prof):
                 rich=options.rich,
                 stream=options.original_stdout,
                 config=options.config,
+                adjusted_timings=options.adjusted_timings,
             )
         _call_with_diagnostics(options, prof.print_stats, **kwargs)
     else:
