@@ -7,6 +7,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from functools import wraps
+from types import MethodType
 from typing import TYPE_CHECKING, Any, TypeVar
 from typing_extensions import ParamSpec, Concatenate
 
@@ -61,34 +62,35 @@ def make_syncing_wrapper(
     return wrapper
 
 
-def make_thread_init_wrapper(
+def make_thread_start_wrapper(
     prof: LineProfiler,
-    vanilla_impl: Callable[
-        Concatenate[threading.Thread, None, Callable[..., Any] | None, PS],
-        None
-    ],
-) -> Callable[
-    Concatenate[threading.Thread, None, Callable[..., Any] | None, PS], None
-]:
+    vanilla_impl: Callable[Concatenate[threading.Thread, PS], None],
+) -> Callable[Concatenate[threading.Thread, PS], None]:
     """
-    Wrap the initializer of :py:class:`threading.Thread` so that the
-    profiler's :py:attr:`LineProfiler.enable_count` is synced up on
-    newly spun-up threads.
+    Wrap :py:meth:`threading.Thread.start` so that the profiler's
+    :py:attr:`LineProfiler.enable_count` is synced up on newly spun-up
+    threads.
     """
     @wraps(vanilla_impl)
     def wrapper(
-        self: threading.Thread,
-        group: None = None,
-        target: Callable[..., Any] | None = None,
-        *args: PS.args,
-        **kwargs: PS.kwargs
+        self: threading.Thread, *args: PS.args, **kwargs: PS.kwargs
     ) -> None:
+        if TYPE_CHECKING:
+            assert hasattr(self, '_bootstrap')
         enable_count: int | None = getattr(prof, 'enable_count', None)
-        if target is not None and enable_count:
-            if TYPE_CHECKING:
-                assert prof is not None
-            target = make_syncing_wrapper(target, prof, enable_count)
-        vanilla_impl(self, group, target, *args, **kwargs)
+        bootstrap: Callable[..., Any] | MethodType = self._bootstrap
+        if enable_count:
+            if isinstance(bootstrap, MethodType):
+                unbound_wrapper = make_syncing_wrapper(
+                    bootstrap.__func__, prof, enable_count,
+                )
+                bootstrap = MethodType(unbound_wrapper, bootstrap.__self__)
+            else:
+                bootstrap = make_syncing_wrapper(bootstrap, prof, enable_count)
+            # `.start()` passes `._bootstrap()` to some lower-level
+            # function to spin up the new thread.
+            self._bootstrap = bootstrap  # type: ignore
+        vanilla_impl(self, *args, **kwargs)
 
     return wrapper
 
@@ -107,7 +109,7 @@ def apply(cleanup: Cleanup, prof: LineProfiler) -> None:
 
         - The following methods and functions patched:
 
-          - :py:meth:`threading.Thread.__init__`
+          - :py:meth:`threading.Thread.start`
 
         - Cleanup callbacks registered via ``cleanup.add_cleanup()``
 
@@ -119,6 +121,6 @@ def apply(cleanup: Cleanup, prof: LineProfiler) -> None:
         return
     if getattr(threading, _PATCHED_MARKER, False):
         return
-    init_wrapper = make_thread_init_wrapper(prof, threading.Thread.__init__)
-    cleanup.patch(threading.Thread, '__init__', init_wrapper)
+    start_wrapper = make_thread_start_wrapper(prof, threading.Thread.start)
+    cleanup.patch(threading.Thread, 'start', start_wrapper)
     cleanup.patch(threading, _PATCHED_MARKER, True)
