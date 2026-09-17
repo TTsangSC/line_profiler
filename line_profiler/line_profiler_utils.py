@@ -11,18 +11,20 @@ from collections.abc import (
     Callable, Collection, Mapping, MutableMapping, MutableSequence, Sequence,
 )
 from functools import partial, wraps
+from importlib.util import find_spec
 from operator import methodcaller
 from pathlib import Path
 from reprlib import Repr
 from tempfile import mkstemp
 from textwrap import indent
-from types import MethodType
+from types import MethodType, ModuleType
 from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar, final
 from typing_extensions import Self, ParamSpec, Unpack
 
 
 __all__ = (
-    'StringEnum', 'restore', 'CallbackRepr', 'block_indent', 'make_tempfile',
+    'StringEnum', 'restore', 'CallbackRepr',
+    'block_indent', 'clone_single_module', 'make_tempfile',
 )
 
 # Note: `typing.AnyStr` deprecated since 3.13
@@ -520,6 +522,52 @@ def block_indent(string: str, prefix: str, fill_char: str = ' ') -> str:
     """
     width = len(prefix)
     return prefix + indent(string, fill_char * width)[width:]
+
+
+def clone_single_module(module: str | ModuleType) -> ModuleType:
+    r"""
+    Returns:
+        module_clone (ModuleType):
+            Module object, which is a fresh copy of the module (named)
+            ``module``
+
+    Example:
+        >>> import sys
+        >>> import textwrap
+
+        >>> textwrap_clone = clone_single_module(textwrap)
+        >>> assert (
+        ...     sys.modules['textwrap']
+        ...     is textwrap
+        ...     is not textwrap_clone
+        ... )
+        >>> assert textwrap.indent is not textwrap_clone.indent
+        >>> assert (
+        ...     textwrap.indent('x\n\ny', '  ')
+        ...     == textwrap_clone.indent('x\n\ny', '  ')
+        ...     == '  x\n\n  y'
+        ... )
+    """
+    if isinstance(module, ModuleType):
+        module = module.__name__
+    spec = find_spec(module)
+    if spec is None:
+        raise ModuleNotFoundError(module)
+    assert spec.loader
+    assert callable(getattr(spec.loader, 'exec_module', None))
+
+    module = ModuleType(spec.name)
+    for attr, value in {
+        '__spec__': spec,
+        '__name__': spec.name,
+        '__file__': spec.origin,
+        '__path__': spec.submodule_search_locations,
+    }.items():
+        if value is not None:
+            setattr(module, attr, value)
+
+    spec.loader.exec_module(module)
+    return module
 
 
 def make_tempfile(**kwargs) -> Path:
