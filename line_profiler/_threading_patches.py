@@ -8,17 +8,14 @@ import threading
 from collections.abc import Callable
 from functools import wraps
 from types import MethodType
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from typing_extensions import ParamSpec, Concatenate
 
-from ._line_profiler import (  # type: ignore
-    USE_LEGACY_TRACE as SHOULD_PATCH_THREADING,
-)
 from .line_profiler import LineProfiler
 from .cleanup import Cleanup
 
 
-__all__ = ('apply', 'SHOULD_PATCH_THREADING')
+__all__ = ('apply',)
 
 
 T = TypeVar('T')
@@ -46,17 +43,16 @@ def make_syncing_wrapper(
         if TYPE_CHECKING:
             assert hasattr(prof, 'enable_count')
             assert isinstance(prof.enable_count, int)
-        # Note: `prof.enable_count` is most likely to be zero on the new
+        # Note: `prof.enable_count` should be zero on the new
         # thread
-        thread_enable_count: int = prof.enable_count
-        for _ in range(enable_count - thread_enable_count):
+        for _ in range(enable_count):
             prof.enable_by_count()
         try:
             return func(*args, **kwargs)
         finally:
-            # Reset enable counts to avoid problems if the thread id is
-            # ever reused
-            for _ in range(prof.enable_count - thread_enable_count):
+            # Reset enable counts to avoid problems if the "physical"
+            # thread id is ever reused
+            for _ in range(prof.enable_count):
                 prof.disable_by_count()
 
     return wrapper
@@ -78,7 +74,7 @@ def make_thread_start_wrapper(
         if TYPE_CHECKING:
             assert hasattr(self, '_bootstrap')
         enable_count: int | None = getattr(prof, 'enable_count', None)
-        bootstrap: Callable[..., Any] | MethodType = self._bootstrap
+        bootstrap: Callable[..., Any] | MethodType = cast(Any, self._bootstrap)
         if enable_count:
             if isinstance(bootstrap, MethodType):
                 unbound_wrapper = make_syncing_wrapper(
@@ -112,13 +108,7 @@ def apply(cleanup: Cleanup, prof: LineProfiler) -> None:
           - :py:meth:`threading.Thread.start`
 
         - Cleanup callbacks registered via ``cleanup.add_cleanup()``
-
-    Note:
-        This is a no-op when using :py:mod:`sys.monitoring`-based
-        profiling.
     """
-    if not SHOULD_PATCH_THREADING:
-        return
     if getattr(threading, _PATCHED_MARKER, False):
         return
     start_wrapper = make_thread_start_wrapper(prof, threading.Thread.start)
