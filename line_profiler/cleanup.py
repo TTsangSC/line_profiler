@@ -31,7 +31,7 @@ _CALLBACK_REPR_HELPER = CallbackRepr(maxother=cast(int, float('inf')))
 _CALLBACK_REPR = _CALLBACK_REPR_HELPER.repr
 
 
-class _LoggingCallback(Protocol):
+class _LoggingCallback(Protocol):  # nocover
     @overload
     def __call__(self, msg: str, /) -> Any:
         ...
@@ -140,6 +140,103 @@ class Cleanup:
     def _cleanup(
         log: _LoggingCallback, stacks: _Stacks, reason: str | None,
     ) -> None:
+        r"""
+        Example:
+            >>> import re
+            >>> from collections.abc import Callable
+            >>> from dataclasses import dataclass
+            >>> from typing import Any
+            >>> from typing_extensions import Self
+
+            >>> @dataclass
+            ... class LogEntry:
+            ...     level: str
+            ...     msg: str
+            ...
+            ...     def compare(
+            ...         self,
+            ...         *,
+            ...         level: str | None = None,
+            ...         msg: str | None = None,
+            ...         regex: bool = False,
+            ...     ) -> bool:
+            ...         for field, pat in [
+            ...             ('level', level), ('msg', msg),
+            ...         ]:
+            ...             if pat is None:
+            ...                 continue
+            ...             value = getattr(self, field)
+            ...             if regex:
+            ...                 if not re.search(pat, value):
+            ...                     return False
+            ...             elif value != pat:
+            ...                 return False
+            ...         return True
+
+            >>> class MyCleanup(Cleanup):
+            ...     def __init__(self, *args, **kwargs) -> None:
+            ...         super().__init__(*args, **kwargs)
+            ...         self.debug_log: list[LogEntry] = []
+            ...
+            ...     def _debug_output(
+            ...         self, msg: str, level: str = 'debug',
+            ...     ) -> None:
+            ...         self.debug_log.append(LogEntry(level, msg))
+
+            >>> def good_callback(msg: Any) -> None:
+            ...     print(msg)
+
+            >>> def bad_callback(msg: Any) -> None:
+            ...     raise RuntimeError(msg)
+
+            >>> with MyCleanup() as cleanup:
+            ...     cleanup.add_cleanup(good_callback, 1)
+            ...     cleanup.add_cleanup(bad_callback, 2)
+            ...     cleanup.add_cleanup(good_callback, 3)
+            3
+            1
+
+            >>> log = cleanup.debug_log
+            >>> assert len(log) >= 5, f'{log=!r}; {len(log)=!r}'
+
+            >>> assert log[-5].compare(
+            ...     level='debug',
+            ...     msg='Starting cleanup '
+            ...     '(context exit; 3 callback(s))...',
+            ... ), f'{log[-5]=!r}'
+            >>> assert log[-4].compare(
+            ...     level='debug',
+            ...     msg=r'- Cleanup succeeded \(1/3\): '
+            ...     '.*good_callback.*3',
+            ...     regex=True,
+            ... ), f'{log[-4]=!r}'
+            >>> assert log[-3].compare(
+            ...     level='warning',
+            ...     msg=r'- Cleanup failed \(2/3\): '
+            ...     '.*bad_callback.*2.*: RuntimeError: 2',
+            ...     regex=True,
+            ... ), f'{log[-3]=!r}'
+            >>> assert log[-2].compare(
+            ...     level='debug',
+            ...     msg=r'- Cleanup succeeded \(3/3\): '
+            ...     '.*good_callback.*1.*',
+            ...     regex=True,
+            ... ), f'{log[-2]=!r}'
+            >>> assert log[-1].compare(
+            ...     level='debug',
+            ...     msg='... cleanup completed '
+            ...     '(context exit; 3 callback(s))',
+            ... ), f'{log[-1]=!r}'
+
+            >>> with MyCleanup() as cleanup:
+            ...     pass
+            >>> log = cleanup.debug_log
+            >>> assert len(log) == 1, f'{log=!r}; {len(log)=!r}'
+            >>> assert log[-1].compare(
+            ...     msg='Cleanup aborted (context exit; 0 callback(s))',
+            ... ), f'{log[-1]=!r}'
+        """
+        # Note: the doctest is mainly here for coverage purposes.
         ncallbacks_total = sum(len(stack) for stack in stacks.values())
         note = f'{ncallbacks_total} callback(s)'
         if reason:
@@ -353,11 +450,14 @@ class Cleanup:
             >>> with Cleanup() as cleanup:
             ...     cleanup.patch(obj, 'foo', 2)
             ...     cleanup.patch(obj, 'bar', 3)
+            ...     cleanup.patch(obj, 'baz', 4, cleanup=False)
             ...     assert obj.foo == 2
             ...     assert obj.bar == 3
+            ...     assert obj.baz == 4  # Not restored
             ...
             >>> assert obj.foo == 1
             >>> assert not hasattr(obj, 'bar')
+            >>> assert obj.baz == 4
         """
         if cleanup:
             add_cleanup: Callable[

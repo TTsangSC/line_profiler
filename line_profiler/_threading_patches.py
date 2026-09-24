@@ -47,7 +47,34 @@ def make_syncing_wrapper(
     :py:attr:`line_profiler.line_profiler.LineProfiler.enable_count`  of
     the active profiler (stored at the cache instance loaded from
     :py:meth:`LineProfilingCache.load`) with ``enable_count``.
+
+    Example:
+        >>> class Cls:
+        ...     @classmethod
+        ...     def method(cls) -> int:
+        ...         print(cls.__name__, prof.enable_count)
+
+        >>> prof = LineProfiler(Cls.method)
+        >>> Cls.method()
+        Cls 0
+        >>> assert not any(
+        ...     (stats := prof.get_stats()).timings.values()
+        ... ), stats
+
+        >>> func_wrapper = make_syncing_wrapper(Cls.method, prof, 2)
+        >>> prof.enable_count
+        0
+        >>> func_wrapper()
+        Cls 2
+        >>> prof.enable_count
+        0
+        >>> assert any(
+        ...     (stats := prof.get_stats()).timings.values()
+        ... ), stats
     """
+    # Note: the above doctest is mainly here for coverage purposes,
+    # since this function is otherwise only called on a thread in a part
+    # inaccessible to `coverage`.
     if isinstance(func, MethodType):
         impl = make_syncing_wrapper(func.__func__, prof, enable_count)
         return MethodType(impl, func.__self__)
@@ -153,7 +180,10 @@ def wrap_thread_bootstrap(
     @wraps(vanilla_impl)
     def wrapper(
         self: threading.Thread, *args: PS.args, **kwargs: PS.kwargs
-    ) -> None:
+    ) -> None:  # nocover
+        # Note: this CANNOT be covered because `coverage` uses
+        # `threading.settrace()` to set up shop on the new thread, but
+        # that is only called INSIDE `._bootstrap_inner()`
         with Cleanup() as cleanup:
             run = make_syncing_wrapper(self.run, prof, enable_count)
             cleanup.patch(self, 'run', run)

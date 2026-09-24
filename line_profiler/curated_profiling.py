@@ -36,7 +36,7 @@ __all__ = ('ClassifiedPreimportTargets', 'CuratedProfilerContext')
 class ClassifiedPreimportTargets:
     """
     Pre-import targets classified into three bins: ``regular`` targets,
-    targets to ``recurse`` into, and ``invalid`` targets
+    targets to ``recurse`` into, and ``invalid`` targets.
     """
     regular: list[str] = dataclasses.field(default_factory=list)
     recurse: list[str] = dataclasses.field(default_factory=list)
@@ -48,7 +48,7 @@ class ClassifiedPreimportTargets:
     def write_preimport_module(
         self, fobj: TextIO, *, debug: bool | None = None, **kwargs
     ) -> None:
-        """
+        r"""
         Convenience interface with
         :py:func:`~.write_eager_import_module`, writing a module which
         when imported sets up profiling of the targets.
@@ -60,6 +60,40 @@ class ClassifiedPreimportTargets:
                 Whether to generate debugging outputs.
             kwargs:
                 Passed to :py:func:`~.write_eager_import_module`.
+
+        Example:
+            >>> from pathlib import Path
+            >>> from contextlib import ExitStack, redirect_stdout
+            >>> from os import devnull
+            >>> from tempfile import TemporaryDirectory
+
+            >>> import pytest
+
+            >>> with TemporaryDirectory() as tmpdir_:
+            ...     tmpdir = Path(tmpdir_)
+            ...     file = tmpdir / 'preimports.py'
+            ...     targets = ClassifiedPreimportTargets.from_targets([
+            ...         'inspect.getdoc',
+            ...         str(tmpdir / 'nonexistent.py'),
+            ...     ])
+            ...     with ExitStack() as stack:
+            ...         enter = stack.enter_context
+            ...         _ = enter(pytest.warns(
+            ...             match='1 .* target cannot be converted .*'
+            ...             r'nonexistent\.py',
+            ...         ))
+            ...         fobj = enter(file.open('w'))
+            ...         _ = enter(
+            ...             redirect_stdout(enter(open(devnull, 'a'))),
+            ...         )
+            ...         targets.write_preimport_module(fobj)
+            ...     line_matcher = pytest.LineMatcher(
+            ...         file.read_text().splitlines(),
+            ...     )
+
+            >>> line_matcher.re_match_lines([
+            ...     r'\s*import inspect', r'\s*add\(.*\bgetdoc\)',
+            ... ])
         """
         if self.invalid:
             invalid_targets = sorted(set(self.invalid))
@@ -77,7 +111,7 @@ class ClassifiedPreimportTargets:
 
         if not self:
             return None
-        # Note: `ty` (but not `mypy`) keeps complaining about the our
+        # Note: `ty` (but not `mypy`) keeps complaining about our
         # splatting this dict; explicitly use `Any` to tell it to shut
         # up.
         write_module_kwargs: dict[str, Any] = {
@@ -85,11 +119,11 @@ class ClassifiedPreimportTargets:
             'recurse': self.recurse,
             **kwargs,
         }
-        if diagnostics.DEBUG if debug is None else debug:
+        if diagnostics.DEBUG if debug is None else debug:  # nocover
             with StringIO() as sio:
                 write_eager_import_module(stream=sio, **write_module_kwargs)
                 code = sio.getvalue()
-            print(code, file=fobj)
+            print(code, end='', file=fobj)
             if hasattr(fobj, 'name'):
                 fobj_repr = repr(short_string_path(str(fobj.name)))
             else:
@@ -120,6 +154,71 @@ class ClassifiedPreimportTargets:
 
         Return:
             New instance.
+
+        Example:
+            >>> import multiprocessing
+            >>> import os.path
+            >>> import textwrap
+            >>> import xml
+            >>> from importlib.util import find_spec
+            >>> from tempfile import TemporaryDirectory
+
+            >>> get_targets = ClassifiedPreimportTargets.from_targets
+            >>> invalid_module = 'textwrapppppp'
+            >>> assert find_spec(invalid_module) is None
+            >>> nonexistent_target = textwrap.__file__.replace(
+            ...     'textwrap', invalid_module,
+            ... )
+
+            >>> with TemporaryDirectory() as tmpdir:
+            ...     malformed_target = os.path.join(tmpdir, 'b-a-r.py')
+            ...     with open(malformed_target, mode='w'):
+            ...         pass  # touch
+            ...     excluded_target = os.path.join(tmpdir, 'excl.py')
+            ...     with open(excluded_target, mode='w'):
+            ...         pass  # touch
+            ...
+            ...     raw_targets = [
+            ...         'sys',
+            ...         # Could be invalid, but we don't know ATP
+            ...         'foo',
+            ...         # Resolved to `'textwrap'`
+            ...         textwrap.__file__,
+            ...         # Invalid targets
+            ...         nonexistent_target, malformed_target,
+            ...         # This is valid, but will be excluded
+            ...         excluded_target,
+            ...         # Resolved to `'xml'` (non-recursed)
+            ...         xml.__file__,
+            ...         # Resolved to `'multiprocessing'` (recursed)
+            ...         os.path.dirname(multiprocessing.__file__),
+            ...     ]
+            ...     tar = get_targets(
+            ...         raw_targets, exclude=[excluded_target],
+            ...     )
+
+            >>> all_targets = set().union(tar.regular, tar.recurse)
+            >>> assert {
+            ...     'sys', 'foo', 'textwrap', 'multiprocessing',
+            ... } <= all_targets, f'{all_targets=!r}'
+            >>> assert 'xml' in tar.regular, f'{tar.regular=!r}'
+            >>> assert 'excl' not in all_targets
+            >>> assert {
+            ...     nonexistent_target, malformed_target,
+            ... } == set(tar.invalid), f'{tar=!r}; {tar.invalid=!r}'
+
+        Notes:
+            The distinction between :py:attr:`.regular` and
+            :py:attr:`.recurse` is that packages in the former are
+            guaranteed to NOT be recursed into, while those in the
+            latter can be recursed into where appropriate (see
+            :py:func:`line_profiler.autoprofile.eager_preimports.\
+resolve_profiling_targets`).
+            Hence, modules and packages are classified into
+            :py:attr:`.recurse` by default; recursion into packages is
+            stopped (i.e. target classified into :py:attr:`.regular`) by
+            supplying a dotted path suffixed with ``.__init__`` or a
+            file path to the package's ``__init__.py``.
         """
         filtered_targets = []
         recurse_targets = []
@@ -141,9 +240,9 @@ class ClassifiedPreimportTargets:
                     # will handle it)
                     continue
                 modname = modpath_to_modname(target, hide_init=False)
-            if modname is None:  # Not import-able
-                invalid_targets.append(target)
-                continue
+                if not is_dotted_path(modname):
+                    invalid_targets.append(target)
+                    continue
             if modname.endswith('.__init__'):
                 modname = modname.rpartition('.')[0]
                 filtered_targets.append(modname)
