@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-This module defines the core :class:`LineProfiler` class as well as methods to
-inspect its output. This depends on the :py:mod:`line_profiler._line_profiler`
-Cython backend.
+This module defines the core :py:class:`LineProfiler` class as well as
+methods to inspect its output.  This depends on the
+:py:mod:`line_profiler._line_profiler` Cython backend.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from .scoping_policy import ScopingPolicy, ScopingPolicyDict
 from .toml_config import ConfigSource
 
 if TYPE_CHECKING:  # pragma: no cover
-    import inspect
+    import inspect as _inspect_patched
     from typing_extensions import ParamSpec, Self
 
     class _IPythonLike(Protocol):
@@ -58,7 +58,7 @@ if TYPE_CHECKING:  # pragma: no cover
     T = TypeVar('T')
     T_co = TypeVar('T_co', covariant=True)
 else:
-    inspect = clone_single_module('inspect')
+    _inspect_patched = clone_single_module('inspect')
 
 ColumnLiterals = Literal['line', 'hits', 'time', 'perhit', 'percent']
 
@@ -177,12 +177,12 @@ def get_code_block(filename: os.PathLike[str] | str, lineno: int) -> list[str]:
         ...     # - `cython_function()`
         ...     assert get_last_line(fname, 22).endswith('# 24')
     """
-    return inspect.getblock(
+    return _inspect_patched.getblock(
         linecache.getlines(os.fspath(filename))[lineno - 1:],
     )
 
 
-class _CythonBlockFinder(inspect.BlockFinder):
+class _CythonBlockFinder(_inspect_patched.BlockFinder):
     """
     Compatibility layer turning Cython-specific code blocks (``cdef``,
     ``cpdef``, and legacy ``property`` declaration) into something that
@@ -212,8 +212,9 @@ class _CythonBlockFinder(inspect.BlockFinder):
 
 
 # We only need our copy of `inspect` for `get_code_block()`, so just
-# overwrite `BlockFinder` class there
-inspect.BlockFinder = _CythonBlockFinder  # type: ignore
+# directly overwrite the `BlockFinder` class there instaed of using
+# the monkey-patching facilities
+_inspect_patched.BlockFinder = _CythonBlockFinder  # type: ignore
 
 
 class _EmptyFileError(OSError):
