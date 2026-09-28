@@ -31,19 +31,6 @@ _CALLBACK_REPR_HELPER = CallbackRepr(maxother=cast(int, float('inf')))
 _CALLBACK_REPR = _CALLBACK_REPR_HELPER.repr
 
 
-class _LoggingCallback(Protocol):  # nocover
-    @overload
-    def __call__(self, msg: str, /) -> Any:
-        ...
-
-    @overload
-    def __call__(self, msg: str, /, level: LogLevel) -> Any:
-        ...
-
-    def __call__(self, *_, **__):
-        ...
-
-
 class Cleanup:
     """
     Object which holds cleanup callbacks. Also provides convenience
@@ -132,14 +119,10 @@ class Cleanup:
             pop_contexts = pop_all_contexts(self._contexts)
         else:
             pop_contexts = pop_n_levels_of_contexts(self._contexts, levels)
-        cleanup = partial(self._cleanup, self._debug_output, reason=reason)
         for stacks in pop_contexts:
-            cleanup(stacks)
+            self._cleanup(stacks, reason)
 
-    @staticmethod
-    def _cleanup(
-        log: _LoggingCallback, stacks: _Stacks, reason: str | None,
-    ) -> None:
+    def _cleanup(self, stacks: _Stacks, reason: str | None) -> None:
         r"""
         Example:
             >>> import re
@@ -236,6 +219,7 @@ class Cleanup:
             ...     msg='Cleanup aborted (context exit; 0 callback(s))',
             ... ), f'{log[-1]=!r}'
         """
+        log = self._debug_output
         # Note: the doctest is mainly here for coverage purposes.
         ncallbacks_total = sum(len(stack) for stack in stacks.values())
         note = f'{ncallbacks_total} callback(s)'
@@ -323,15 +307,7 @@ class Cleanup:
     # Convenience methods
 
     def update_mapping(
-        self,
-        mapping: MutableMapping[K, V],
-        updates: Mapping[K, V],
-        *,
-        _format_debug_msg: Callable[[Mapping[K, V], K, str], str] = (
-            lambda mapping, key, change: 'Update {}[{!r}]: {}'.format(
-                object.__repr__(mapping), key, change,
-            )
-        ),
+        self, mapping: MutableMapping[K, V], updates: Mapping[K, V],
     ) -> None:
         """
         Update a mapping with another and add cleanup callbacks to
@@ -363,17 +339,12 @@ class Cleanup:
             else:
                 self.add_cleanup(setitem, mapping, key, old)
                 change = f'{old!r} -> {value!r}'
-            self._debug_output(_format_debug_msg(mapping, key, change))
+            msg = self._format_mapping_update_message(mapping, key, change)
+            self._debug_output(msg)
             mapping[key] = value
 
     def make_tempfile(
-        self, *,
-        delete: bool = True,
-        priority: float = 0,
-        _format_debug_msg: Callable[[Path], str] = (
-            'Created tempfile: {}'.format
-        ),
-        **kwargs
+        self, *, delete: bool = True, priority: float = 0, **kwargs
     ) -> Path:
         """
         Create a fresh tempfile with :py:func:`tempfile.mkstemp`.
@@ -404,7 +375,7 @@ class Cleanup:
             >>> assert not path.exists()
         """
         path = make_tempfile(**kwargs)
-        self._debug_output(_format_debug_msg(path))
+        self._debug_output(self._format_tempfile_creation_message(path))
         if delete:
             self.add_cleanup_with_priority(
                 path.unlink, priority, missing_ok=True,
@@ -524,6 +495,25 @@ class Cleanup:
         """
         log_func = getattr(diagnostics.log, level)
         log_func(msg)
+
+    @staticmethod
+    def _format_mapping_update_message(
+        mapping: Mapping[K, Any], key: K, change: str, /,
+    ) -> str:
+        """
+        Helper method used by :py:meth:`.update_mapping` to format debug
+        messages.
+        """
+        mapping_repr = object.__repr__(mapping)
+        return f'Update {mapping_repr}[{key!r}]: {change}'
+
+    @staticmethod
+    def _format_tempfile_creation_message(path: Path) -> str:
+        """
+        Helper method used by :py:meth:`.make_tempfile` to format debug
+        messages.
+        """
+        return f'Created tempfile: {path}'
 
     @property
     def _current_context(self) -> _Stacks:
