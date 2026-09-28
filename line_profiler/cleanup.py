@@ -10,7 +10,7 @@ from functools import partial
 from inspect import getattr_static
 from operator import setitem
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeVar, cast, overload
+from typing import Any, Literal, TypeVar, cast
 from typing_extensions import Concatenate, ParamSpec, Self
 
 from .line_profiler_utils import CallbackRepr, make_tempfile
@@ -412,7 +412,7 @@ class Cleanup:
                 :py:meth:`~.add_cleanup_with_priority`)
 
         Example:
-            >>> class Object(object):
+            >>> class Object:
             ...     pass  # Allow setting arbitrary attributes
             ...
             >>>
@@ -438,14 +438,11 @@ class Cleanup:
             # ... yeah gotta disagree with flake8, a lambda makes
             # perfect sense here
             add_cleanup = lambda *_, **__: None  # noqa: E731
-        get_attribute = getattr_static if static else getattr
-
-        try:
-            old = get_attribute(obj, attr)
-        except AttributeError:
-            add_cleanup(delattr, priority, obj, attr)
+        _, should_be_restored, old_value = self._get_attribute_info(obj, attr)
+        if should_be_restored:
+            add_cleanup(setattr, priority, obj, attr, old_value)
         else:
-            add_cleanup(setattr, priority, obj, attr, old)
+            add_cleanup(delattr, priority, obj, attr)
         setattr(obj, attr, value)
         if name is None:
             name = self._get_name(obj)
@@ -453,6 +450,60 @@ class Cleanup:
         self._debug_output(msg)
 
     # Helper methods
+
+    @staticmethod
+    def _get_attribute_info(obj: Any, attr: str) -> tuple[bool, bool, Any]:
+        """
+        Returns:
+            result (tuple[bool, bool, Any]):
+                3-tuple of the following:
+
+                - Whether the object has the attribute
+
+                - Whether the present attribute value (if any) should be
+                  restored if changed
+
+                - The attribute that should be restored (if any)
+        """
+        try:
+            value = getattr(obj, attr)
+        except AttributeError:
+            return False, False, None
+
+        try:
+            static_value = getattr_static(obj, attr)
+        except AttributeError:
+            has_static = False
+        else:
+            has_static = True
+
+        if isinstance(obj, type) and has_static:
+            # Special-case classes: only restore if value not inherited
+            # from a base class
+            return True, (attr in vars(obj)), static_value
+
+        try:
+            inherited_value = getattr(type(obj), attr)
+        except AttributeError:
+            # Two cases:
+            # - `has_static=True`: `value` is instance-bound (e.g. in
+            #   `vars()`)
+            #   -> Should be restored
+            # - `has_static=False`: `value` is calculated dynamically
+            #   (via `.__getattr[ibute]__()`)
+            return True, has_static, value
+
+        # If it is a settable data descriptor, reset it; else, leave it
+        # alone (i.e. delete the instance-bound override we assign to)
+        InheritedDescriptorType = type(inherited_value)
+        if not callable(getattr(InheritedDescriptorType, '__set__', None)):
+            is_settable = False
+        elif issubclass(InheritedDescriptorType, property):
+            # Special-case properties
+            is_settable = inherited_value.fset is not None
+        else:
+            is_settable = True
+        return True, is_settable, value
 
     @staticmethod
     def _get_name(obj: Any, /) -> str:
