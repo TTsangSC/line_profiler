@@ -1,6 +1,27 @@
 """
 Tools for setting up profiling in a curated environment (e.g. with
 the use of :py:mod:`kernprof`).
+
+The class :py:class:`ClassifiedPreimportTargets` is responsible for
+classifying profiling targets (like those supplied by
+:option:`!--prof-mod`). and feeding them onwards to the machineries of
+:py:mod:`line_profiler.autoprofile.eager_preimports` (see documentation
+therefor), writing a script which ensures that the profiling targets are
+all presented to the session's **main profiler**.
+
+The class :py:class:`CuratedProfilerContext` is used for setting up a
+profiling session, with a single associated
+:py:class:`line_profiler.LineProfiler` instance as the
+**main profiler**.  Said profiler is installed to various global states
+as appropriate, and will be the sole instance in the process for the
+collection of profiling data directly associated with the session.  The
+installation will be torn worn as the session ends.
+
+Notes:
+    The intention is for there to be **at most one** profiling session,
+    **one** curated context, and **one** "main profiler" at any given
+    time in a single process.  Using multiple instances may result in
+    undefined behavior.
 """
 from __future__ import annotations
 
@@ -11,10 +32,10 @@ import warnings
 from collections.abc import Collection
 from io import StringIO
 from textwrap import indent
-from typing import Any, TextIO, cast
+from typing import Any, TextIO
 from typing_extensions import Self
 
-from . import _diagnostics as diagnostics, profile as _global_profiler
+from . import _diagnostics as diagnostics, profile as _GLOBAL_PROFILER
 from ._threading_patches import apply as apply_threading_patches
 from .autoprofile.autoprofile import (
     _extend_line_profiler_for_profiling_imports as upgrade_profiler,
@@ -25,6 +46,7 @@ from .autoprofile.eager_preimports import (
 )
 from .cleanup import Cleanup
 from .cli_utils import short_string_path
+from .explicit_profiler import GlobalProfiler
 from .line_profiler import LineProfiler
 from .profiler_mixin import ByCountProfilerMixin
 
@@ -35,8 +57,9 @@ __all__ = ('ClassifiedPreimportTargets', 'CuratedProfilerContext')
 @dataclasses.dataclass
 class ClassifiedPreimportTargets:
     """
-    Pre-import targets classified into three bins: ``regular`` targets,
-    targets to ``recurse`` into, and ``invalid`` targets.
+    Pre-import targets classified into three bins: :py:attr:`.regular`
+    targets, targets to :py:attr:`.recurse` into, and
+    :py:attr:`.invalid` targets.
     """
     regular: list[str] = dataclasses.field(default_factory=list)
     recurse: list[str] = dataclasses.field(default_factory=list)
@@ -56,7 +79,7 @@ class ClassifiedPreimportTargets:
         Args:
             fobj (TextIO):
                 File object to write said module to.
-            debug (Optional[bool]):
+            debug (bool | None):
                 Whether to generate debugging outputs.
             kwargs:
                 Passed to :py:func:`~.write_eager_import_module`.
@@ -95,6 +118,8 @@ class ClassifiedPreimportTargets:
             ...     r'\s*import inspect', r'\s*add\(.*\bgetdoc\)',
             ... ])
         """
+        if debug is None:
+            debug = diagnostics.DEBUG
         if self.invalid:
             invalid_targets = sorted(set(self.invalid))
             msg = (
@@ -119,7 +144,7 @@ class ClassifiedPreimportTargets:
             'recurse': self.recurse,
             **kwargs,
         }
-        if diagnostics.DEBUG if debug is None else debug:  # nocover
+        if debug:  # nocover
             with StringIO() as sio:
                 write_eager_import_module(stream=sio, **write_module_kwargs)
                 code = sio.getvalue()
@@ -146,9 +171,9 @@ class ClassifiedPreimportTargets:
         (like what is supplied to ``kernprof --prof-mod=...``).
 
         Args:
-            targets (Collection[str])
+            targets (Collection[str]):
                 Collection of dotted paths and filenames to profile.
-            exclude (Collection[str])
+            exclude (Collection[str | os.PathLike[str]]):
                 Collections of filenames which are explicitly excluded
                 from being profiled.
 
@@ -251,15 +276,18 @@ resolve_profiling_targets`).
         return cls(filtered_targets, recurse_targets, invalid_targets)
 
 
-class CuratedProfilerContext(Cleanup):
+class CuratedProfilerContext:
     """
     Context manager for handling various bookkeeping tasks when setting
     up and tearing down profiling:
 
     - Slipping ``prof`` into the builtin namespace (if
-      ``insert_builtin`` is true) and :py::deco:`~.profile`
+      ``insert_builtin`` is true) and the ``global_profiler`` instance
+      (default: :py:deco:`line_profiler.profile`)
+
     - Patch :py:class:`threading.Thread` so that line-profiling is
       enabled on new threads if it is on the spawning threads
+
     - At exit, clearing the ``enable_count`` of ``prof``, properly
       disabling it
 
@@ -269,57 +297,173 @@ class CuratedProfilerContext(Cleanup):
           implementation details, but not its methods and their
           signatures.
 
-        - In contrast to the base class (:py:class:`Cleanup`), while
-          this context manager is still reentrant, reentering in nested
-          `with: ...` statements is a no-op.
+        - This is meant to be a functional singleton; NOT MORE THAN ONE
+          INSTANCE should be used in the process at any single given
+          moment.  (See the module docstring.)
+
+        - Entering the context more than once is undefined behavior.
     """
     def __init__(
         self,
         prof: ByCountProfilerMixin,
+        *,
         insert_builtin: bool = False,
         builtin_loc: str = 'profile',
+        global_profiler: GlobalProfiler | None = None,
     ) -> None:
-        super().__init__()
+        if global_profiler is None:
+            global_profiler = _GLOBAL_PROFILER
         self.prof = prof
         self.insert_builtin = insert_builtin
         self.builtin_loc = builtin_loc
+        self.global_profiler = global_profiler
+        self._cleanup = Cleanup()
         self._installed = False
-        self._kpo = _global_profiler._kernprof_overwrite
 
     def _global_install(self, prof: ByCountProfilerMixin | None) -> None:
-        # Wrapper to convince type-checkers it is okay to pass these
-        # stuff to `._kernprof_overwrite()`. We don't want to patch
-        # that method's signature because passing non `LineProfiler`
-        # objects to it should be the exception, not the norm.
-        self._kpo(cast(LineProfiler, prof))
+        """
+        Overwrite the :py:class:`line_profiler.LineProfiler` instance
+        backing the :py:attr:`.global_profiler` and mark it as being
+        :py:attr:`GlobalProfiler.enabled`.
+
+        Example:
+            >>> from operator import attrgetter
+            >>> from line_profiler import LineProfiler
+            >>> from line_profiler.explicit_profiler import (
+            ...     GlobalProfiler,
+            ... )
+
+            >>> get_prof_state = attrgetter('_profile', 'enabled')
+            >>> gp = GlobalProfiler()
+            >>> lp = LineProfiler()
+            >>> old_state = get_prof_state(gp)
+
+            >>> with CuratedProfilerContext(lp, global_profiler=gp):
+            ...     new_state = get_prof_state(gp)
+            ...     assert (
+            ...         old_state != new_state == (lp, True)
+            ...     ), f'{new_state=!r}, {old_state=!r}'
+            >>> assert (
+            ...     (new_state := get_prof_state(gp))
+            ...     == old_state
+            ... ), f'{new_state=!r}, {old_state=!r}'
+
+        Notes:
+            Since we directly set :py:attr:`GlobalProfiler.enabled`
+            instead of calling :py:meth:`GlobalProfiler.enable`, this
+            doesn't register an :py:mod:`atexit` hook.  This is what we
+            want because :py:mod:`kernprof` either instructs to use
+            another program to read its output file or calls
+            :py:meth:`line_profiler.LineStats.show` directly.
+        """
+        # Note: refactored from the old
+        # `.GlobalProfiler._kernprof_overwrite()`.
+        self._cleanup.patch(self.global_profiler, '_profile', prof)
+        self._cleanup.patch(self.global_profiler, 'enabled', True)
 
     @staticmethod
     def _disable_profiler(prof: ByCountProfilerMixin) -> None:
         for _ in range(getattr(prof, 'enable_count', 0)):
             prof.disable_by_count()
 
-    def install(self) -> None:
+    def _install(self) -> None:
+        """
+        Example:
+            >>> from pytest import raises
+
+            >>> from line_profiler import LineProfiler
+
+            >>> class BuggedContext(CuratedProfilerContext):
+            ...     '''
+            ...     This class bugs out at the end of
+            ...     :py:meth:`.install`, because it attempts to change
+            ...     the value of :py:attr:`._installed`.
+            ...     '''
+            ...     @property
+            ...     def _installed(self) -> bool:
+            ...         return self.__installed
+            ...
+            ...     @_installed.setter
+            ...     def _installed(self, installed: bool) -> None:
+            ...         try:
+            ...             self.__installed
+            ...         except AttributeError:
+            ...             self.__installed = installed
+            ...             return
+            ...         raise AttributeError('_installed')
+
+            >>> prof = LineProfiler()
+
+            Normal execution:
+
+            >>> with CuratedProfilerContext(
+            ...     prof, insert_builtin=True, builtin_loc='foo',
+            ... ):
+            ...     assert foo is prof  # `foo` inserted above
+            >>> with raises(NameError):
+            ...     assert foo is not prof  # `foo` reverted
+
+            Botched installation:
+
+            >>> # Context managed
+            >>> with raises(AttributeError, match='_installed'):
+            ...     with BuggedContext(
+            ...         prof, insert_builtin=True, builtin_loc='foo',
+            ...     ):
+            ...         raise RuntimeError  # Unreachable (setup failed)
+            ... with raises(NameError):
+            ...     assert foo is not prof  # `foo` reverted
+
+            >>> # Explicit invocation
+            >>> ctx = BuggedContext(
+            ...     prof, insert_builtin=True, builtin_loc='foo',
+            ... )
+            >>> with raises(AttributeError, match='_installed'):
+            ...     ctx.install()
+            >>> with raises(NameError):
+            ...     assert foo is not prof  # `foo` reverted
+        """
         if self._installed:
             return
+        cleanup = self._cleanup
         # Equip the profiler instance with the
         # `.add_imported_function_or_module()` pseudo-method
-        upgrade_profiler(self.prof)
+        upgrade_profiler(self.prof, cleanup=cleanup)
         # Overwrite the explicit profiler (`@line_profiler.profile`)
         self._global_install(self.prof)
-        self.add_cleanup(self._global_install, None)
         # Patch `threading`
         if isinstance(self.prof, LineProfiler):
-            apply_threading_patches(self, self.prof)
+            apply_threading_patches(cleanup, self.prof)
         # Set up hooks to deal with inserting `.prof` as a builtin name
         if self.insert_builtin:
-            self.patch(builtins, self.builtin_loc, self.prof)
-        # Disable the profiler
-        self.add_cleanup(self._disable_profiler, self.prof)
+            cleanup.patch(builtins, self.builtin_loc, self.prof)
+        # Disable the profiler at session exit
+        cleanup.add_cleanup(self._disable_profiler, self.prof)
+        # Indicate that we shouldn't redo the installation as a failsafe
+        cleanup.patch(self, '_installed', True)
 
-        self.patch(self, '_installed', True)
+    def install(self) -> None:
+        """
+        Perform setup (see the class docstring).
+        """
+        try:
+            self._install()
+        except BaseException as e:
+            # If anything goes south, immediately roll back all the
+            # installed changes
+            xc = type(e).__name__
+            if (detail := str(xc)):
+                xc = f'{xc}: {detail}'
+            try:  # This shouldn't raise, but just in case...
+                self._cleanup.cleanup(reason=f'installation failed ({xc})')
+            finally:
+                raise e
 
     def uninstall(self) -> None:
-        self.cleanup(reason='uninstalling profiling context')
+        """
+        Tear down all the setup.
+        """
+        self._cleanup.cleanup(reason='uninstalling profiling context')
 
     def __enter__(self) -> Self:
         self.install()
