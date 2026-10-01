@@ -19,6 +19,7 @@ import gc
 import inspect
 import linecache
 import os
+import re
 import subprocess
 import shlex
 import sys
@@ -28,25 +29,33 @@ import textwrap
 import threading
 import weakref
 from ast import literal_eval
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from io import StringIO
-from types import FrameType, FunctionType, ModuleType
+from pathlib import Path
+from types import CodeType, FrameType, FunctionType, ModuleType
 from typing import (
-    TYPE_CHECKING, Any, Callable, Literal, ParamSpec, cast, overload,
+    TYPE_CHECKING, Any, Callable, Literal, ParamSpec, TextIO, cast, overload,
 )
 
 import pytest
 
-from line_profiler import LineProfiler
+from line_profiler import LineProfiler, LineStats
+from line_profiler._diagnostics import USE_LEGACY_TRACE
 from line_profiler._line_profiler import (  # type: ignore
-    _LineProfilerManager,
+    _LineProfilerManager, label as get_line_stats_key,
 )
+from line_profiler.curated_profiling import CuratedProfilerContext
 
 
 # Common utilities
 
 DEBUG = False
-USE_SYS_MONITORING = isinstance(getattr(sys, 'monitoring', None), ModuleType)
+if TYPE_CHECKING:  # Do it in a static-analysis-friendly way
+    USE_SYS_MONITORING = sys.version_info[:2] >= (3, 12)
+else:
+    USE_SYS_MONITORING = isinstance(
+        getattr(sys, 'monitoring', None), ModuleType,
+    )
 
 PS = ParamSpec('PS')
 Event = Literal['call', 'line', 'return', 'exception', 'opcode']
@@ -102,7 +111,9 @@ def isolate_test_in_subproc(
         - Beware of using fixtures for these tests.
     """
     if func is None:
-        return functools.partial(isolate_test_in_subproc, debug=debug)
+        return functools.partial(
+            isolate_test_in_subproc, debug=debug, core=core,
+        )
 
     def message(
         msg: str, header: str, *, short: bool = False, **kwargs
@@ -710,8 +721,11 @@ def test_wrapping_thread_local_callbacks(
 )
 @isolate_test_in_subproc
 def test_python_level_trace_manipulation(
-    stay_in_scope, set_frame_local_trace, n, nhits
-):
+    stay_in_scope: bool,
+    set_frame_local_trace: bool,
+    n: int,
+    nhits: dict[int, int],
+) -> None:
     """
     Test that:
 
@@ -745,6 +759,8 @@ def test_python_level_trace_manipulation(
 
     prof.add_callable(func_no_break)
     expected = n * (n + 1) // 2
+    outer_ctx: AbstractContextManager[Any]
+    inner_ctx: AbstractContextManager[Any]
 
     if stay_in_scope:
         # Do two calls, each with tracing suspended for half of the loop
@@ -774,6 +790,265 @@ def test_python_level_trace_manipulation(
     }
     all_nhits = {lineno: all_nhits.get(lineno, 0) for lineno in nhits}
     assert all_nhits == nhits, f'expected {nhits=}, got {all_nhits=}'
+
+
+@pytest.mark.parametrize(
+    ('use_context', 'label1'),
+    [(True, 'use-context'), (False, 'no-context')])
+@pytest.mark.parametrize(
+    ('enable_during_thread_start', 'label2'),
+    [(True, 'start-enabled'), (False, 'start-disabled')])
+@pytest.mark.parametrize('profile_foo', ['no-foo', 'add-foo', 'wrap-foo'])
+@pytest.mark.parametrize('profile_bar', ['no-bar', 'add-bar', 'wrap-bar'])
+@isolate_test_in_subproc(core='legacy')
+def test_wrapping_threading_trace(
+    use_context: bool,
+    enable_during_thread_start: bool,
+    profile_foo: Literal['no-foo', 'add-foo', 'wrap-foo'],
+    profile_bar: Literal['no-foo', 'add-foo', 'wrap-foo'],
+    label1: str,
+    label2: str,
+) -> None:
+    """
+    Test the interaction between :py:mod:`line_profiler` (esp.
+    :py:mod:`line_profiler.curated_profiling`) and thread-local trace
+    functions set via :py:func:`threading.settrace` when
+    ``wrap_trace=True``; the trace functions are wrapped and invoked by
+    ours.
+    """
+    # All events should remain visible to `threading_trace()`
+    trace_events = [
+        ('call', 'foo'),
+        ('call', 'bar'),
+        ('return', 'bar'),
+        ('return', 'foo'),
+    ]
+
+    # 'no': not profiling the function
+    # 'add': only `.add_callable()`
+    # 'wrap': replace the function with a profiling wrapper
+    profile_map: dict[str, Literal[0, 1, 2]] = {'no': 0, 'add': 1, 'wrap': 2}
+    pf = profile_map[profile_foo.partition('-')[0]]
+    pb = profile_map[profile_bar.partition('-')[0]]
+
+    if use_context and enable_during_thread_start:
+        # Using a `CuratedProfilerContext`, the enabled state of the
+        # profiler persists into the new thread, so profiling of any of
+        # the valid targets continues
+        foo_is_profiled = bool(pf)
+        bar_is_profiled = bool(pb)
+    else:
+        foo_is_profiled = pf > 1
+        # `bar()` is called by `foo()`, so if the profiler is enabled
+        # when calling `foo()`, it will already be when calling `bar()`
+        # too
+        if foo_is_profiled:
+            bar_is_profiled = bool(pb)
+        else:
+            bar_is_profiled = pb > 1
+
+    _test_threading_trace_manipulation_helper(
+        wrap_trace=True,
+        use_context=use_context,
+        enable_during_thread_start=enable_during_thread_start,
+        profile_foo=pf,
+        profile_bar=pb,
+        foo_is_profiled=foo_is_profiled,
+        bar_is_profiled=bar_is_profiled,
+        trace_events=cast(Any, trace_events),
+    )
+
+
+@pytest.mark.parametrize('enable_timing', ['foo', 'bar', 'no'])
+@isolate_test_in_subproc(core='legacy')
+def test_replacing_threading_trace(
+    enable_timing: Literal['foo', 'bar', 'no'],
+) -> None:
+    """
+    Test the interaction between :py:mod:`line_profiler` (esp.
+    :py:mod:`line_profiler.curated_profiling`) and thread-local trace
+    functions set via :py:func:`threading.settrace` when
+    ``wrap_trace=False``; the trace functions are superseded by ours
+    when the profiler is enabled, and restored when it is disabled.
+    """
+    profile_foo: Literal[0, 1, 2]
+    profile_bar: Literal[0, 1, 2]
+    trace_events: list[
+        tuple[Literal['call', 'return'], Literal['foo', 'bar']]
+    ] = []
+
+    assert USE_LEGACY_TRACE
+
+    if enable_timing == 'foo':
+        # Profiler enabled before calling `foo()`
+        # -> `threading_trace()` entirely circumvented
+        pre_enable = True
+        profile_foo = profile_bar = 1
+        foo_is_profiled = bar_is_profiled = True
+    elif enable_timing == 'bar':
+        # Profiler enabled when calling `bar()`
+        # -> `threading_trace()` only captures the `foo()` events
+        pre_enable = False
+        profile_foo = 1
+        profile_bar = 2  # The wrapper enables the profiler
+        foo_is_profiled = False
+        bar_is_profiled = True
+        trace_events.extend([('call', 'foo'), ('return', 'foo')])
+    elif enable_timing == 'no':
+        # Profiler never enabled
+        # -> `threading_trace()` captures all events
+        pre_enable = False
+        profile_foo = profile_bar = 1
+        foo_is_profiled = False
+        bar_is_profiled = False
+        trace_events.extend([
+            ('call', 'foo'),
+            ('call', 'bar'),
+            ('return', 'bar'),
+            ('return', 'foo'),
+        ])
+    else:
+        assert False, f'{enable_timing=!r}'
+
+    _test_threading_trace_manipulation_helper(
+        wrap_trace=False,
+        use_context=pre_enable,
+        enable_during_thread_start=pre_enable,
+        profile_foo=profile_foo,
+        profile_bar=profile_bar,
+        foo_is_profiled=foo_is_profiled,
+        bar_is_profiled=bar_is_profiled,
+        trace_events=trace_events,
+    )
+
+
+def _test_threading_trace_manipulation_helper(
+    # Setup params
+    wrap_trace: bool,
+    use_context: bool,
+    enable_during_thread_start: bool,
+    profile_foo: Literal[0, 1, 2],
+    profile_bar: Literal[0, 1, 2],
+    # Result params
+    foo_is_profiled: bool,
+    bar_is_profiled: bool,
+    trace_events: list[
+        tuple[Literal['call', 'return'], Literal['foo', 'bar']]
+    ],
+    # Misc. params
+    n_foo: int = 7,
+    n_bar: int = 42,
+) -> None:
+    def threading_trace(frame: FrameType, event: str, _) -> TracingFunc | None:
+        code = frame.f_code
+        if code not in traced_codes:
+            return None
+        if event in ('call', 'return'):
+            # Trace local events in the funcs
+            actual_events.append((
+                cast(Literal['call', 'return'], event),
+                get_normalized_name(code),
+            ))
+        return threading_trace
+
+    def foo_(fobj: TextIO | None = None) -> None:
+        bar(fobj)
+        for i in range(n_foo):
+            print('foo:', i, file=fobj)  # LOOP
+
+    def bar_(fobj: TextIO | None = None) -> None:
+        for i in range(n_bar):
+            print('bar:', i, file=fobj)  # LOOP
+
+    def find_pattern_lineno(func: FunctionType, pattern: str) -> int:
+        lines, offset = inspect.getsourcelines(func)
+        source = ''.join(lines)
+        match = re.search(pattern, source, flags=re.MULTILINE)
+        if not match:
+            return 0
+        return offset + source[:match.start()].count('\n')
+
+    def get_nhits(
+        stats: LineStats, func: Callable[..., Any],
+    ) -> dict[int, int]:
+        code = cast(FunctionType, inspect.unwrap(func)).__code__
+        try:
+            entries = stats.timings[get_line_stats_key(code)]
+        except KeyError:
+            return {}
+        return {lineno: nhits for lineno, nhits, _ in entries}
+
+    def get_normalized_name(code: CodeType) -> str:
+        return code.co_name.strip('_')
+
+    foo: Callable[[TextIO | None], None] = foo_
+    bar: Callable[[TextIO | None], None] = bar_
+
+    actual_events: list[tuple[Literal['call', 'return'], str]] = []
+    lineno_loops = {
+        get_normalized_name(cast(FunctionType, func).__code__):
+        find_pattern_lineno(cast(FunctionType, func), '# LOOP$')
+        for func in [foo, bar]
+    }
+
+    # Set up the profiler
+    prof = LineProfiler(wrap_trace=wrap_trace)
+    if profile_foo > 1:
+        foo = prof(foo)
+    elif profile_foo:
+        prof.add_callable(foo)
+    if profile_bar > 1:
+        bar = prof(bar)
+    elif profile_bar:
+        prof.add_callable(bar)
+
+    # Note: passing functions to the profiler may have (1) wrapped them
+    # and/or (2) altered their `.__code__`; so we only assign to
+    # `traced_codes` now, and retrieve the innermost function objects.
+    traced_codes: set[CodeType] = {
+        inspect.unwrap(foo).__code__,
+        inspect.unwrap(bar).__code__,
+    }
+
+    # Run profiling
+    try:
+        old_threading_trace = threading.gettrace()
+        threading.settrace(threading_trace)
+        with ExitStack() as stack:
+            tmpdir = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            if use_context:
+                stack.enter_context(CuratedProfilerContext(prof))
+            if enable_during_thread_start:
+                stack.enter_context(prof)
+            tmp = tmpdir / 'out.txt'
+            with tmp.open(mode='w') as fobj:
+                thread = threading.Thread(target=foo, args=(fobj,))
+                thread.start()
+                thread.join()
+            output = tmp.read_text()
+    finally:
+        threading.settrace(old_threading_trace)
+    stats = prof.get_stats()
+
+    # Check the captured results
+    expected_output = [
+        *(f'bar: {n}' for n in range(n_bar)),
+        *(f'foo: {n}' for n in range(n_foo)),
+    ]
+    assert (
+        output.splitlines() == expected_output
+    ), f'{output=!r}, {expected_output=!r}'
+    assert (
+        actual_events == trace_events
+    ), f'{actual_events=!r}, {trace_events=!r}'
+    foo_nhits = get_nhits(stats, foo)
+    assert (
+        foo_nhits.get(lineno_loops['foo'], 0) == (foo_is_profiled and n_foo)
+    ), f'{stats=!r}, {foo_is_profiled=!r}, {n_foo=!r}'
+    bar_nhits = get_nhits(stats, bar)
+    assert (
+        bar_nhits.get(lineno_loops['bar'], 0) == (bar_is_profiled and n_bar)
+    ), f'{stats=!r}, {bar_is_profiled=!r}, {n_bar=!r}'
 
 
 @pytest.mark.parametrize('disable_line_events', [True, False])
