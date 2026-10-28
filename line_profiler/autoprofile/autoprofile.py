@@ -52,7 +52,7 @@ import sys
 import types
 from collections.abc import Callable, Mapping, MutableMapping
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 from ..cleanup import Cleanup
 from ..line_profiler_utils import restore
@@ -212,7 +212,7 @@ def run(
         Profiler = AstTreeProfiler
         module_obj = types.ModuleType('__main__')
 
-    namespace: MutableMapping[str, Any] = vars(module_obj)
+    namespace: dict[str, Any] = vars(module_obj)
     namespace.update(ns)
 
     profiler = Profiler(script_file, prof_mod, profile_imports)
@@ -225,4 +225,4 @@ def run(
         # then restore it via the context manager, so that the executed
         # code is run as `__main__`
         sys.modules['__main__'] = module_obj
-        exec(code_obj, cast('dict[str, Any]', namespace), namespace)
+        exec(code_obj, namespace, namespace)

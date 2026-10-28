@@ -1,13 +1,18 @@
 Changes
 =======
 
-5.0.3
+5.2.0
 -----
 * FIX: misc. fixes and refactoring (#442):
   
   * Continuity of profiling in multithreaded environments
   * Fix for frame-local trace-function wrapper reference leaks
   * Context-manager-based setup and teardown
+
+5.1.0
+-----
+* FIX: Text output now replaces characters the output stream cannot
+  encode with escape sequences instead of dropping the source line (#289)
 * FIX: Make sure that the profiled code is run in the
   ``sys.modules['__main__']`` namespace to avoid issues w/e.g. pickling
   (#423)
@@ -23,7 +28,11 @@ Changes
   targets if multiple thereof are imported in the same (from-)import
   statement, and (2) crashes when profiling modules containing
   ``from ... import *`` statements (#434)
-
+* FIX: Corrected line timing for recursive Python function calls by
+  tracking timing state per execution frame (recursive Cython calls
+  under ``sys.monitoring`` are still tracked per code block) (#444)
+* ENH: add support for Python 3.15
+* ENH: migrate away from setup.py
 
 5.0.2
 ~~~~~
